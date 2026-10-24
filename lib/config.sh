@@ -153,9 +153,16 @@ _CONFIG_DENIED_KEYS=(
 # A generated file is only ever allowed to set toolkit keys. Accepting any
 # valid identifier would let a tampered config export BASH_ENV or PATH and
 # so regain the code execution that parsing instead of sourcing removed.
+#
+# PVE_CONFIG_* is reserved as well: those name the directories the toolkit
+# reads and writes, so a config that set them could point the driver at a
+# private file and have its contents copied into a world readable one.
+# They remain available as environment overrides, which only someone who
+# can already run the driver can set.
 _config_key_is_loadable() {
   local key=$1 denied
   [[ ${key} =~ ^PVE_[A-Z0-9_]+$ ]] || return 1
+  [[ ${key} == PVE_CONFIG_* ]] && return 1
   for denied in "${_CONFIG_DENIED_KEYS[@]}"; do
     if [[ ${key} == "${denied}" ]]; then
       return 1

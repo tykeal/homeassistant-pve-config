@@ -375,3 +375,18 @@ setup() {
   config_load "${CONFIG}"
   [ "${PVE_BLOCK}" = $'top\n\nbottom' ]
 }
+
+@test "a config cannot redirect the toolkit's own runtime paths" {
+  local key
+  for key in PVE_CONFIG_STATE_DIR PVE_CONFIG_BOOT_ID_PATH PVE_CONFIG_DIR \
+    PVE_CONFIG_LIB_DIR PVE_CONFIG_STAGES_DIR PVE_CONFIG_SECRET_KEYS; do
+    printf "%s='/etc/shadow'\n" "${key}" >"${CONFIG}"
+    run config_load "${CONFIG}"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"${CONFIG}:1"* ]]
+  done
+}
+
+@test "the runtime paths are still honoured from the environment" {
+  [ "$(state_dir)" = "${PVE_CONFIG_STATE_DIR}" ]
+}
