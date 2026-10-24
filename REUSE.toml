@@ -1,0 +1,19 @@
+version = 1
+
+[[annotations]]
+path = [".specify/**", ".github/*/speckit.**", ".vscode/**"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Andrew Grimberg <tykeal@bardicgrove.org>"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = "specs/**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Andrew Grimberg <tykeal@bardicgrove.org>"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = ".aislop/baseline.json"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Andrew Grimberg <tykeal@bardicgrove.org>"
+SPDX-License-Identifier = "Apache-2.0"

@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: 2021 Andrew Grimberg <tykeal@bardicgrove.org>
+#
+# SPDX-License-Identifier: Apache-2.0
+
+__pycache__
+pythonenv*
+.python-version
+.coverage
+venv
+.venv
+dist/
+*.egg-info/
+htmlcov/
+.pytest_cache/
+*.pyc
+*.pyo
+.aislop/history.jsonl
+.aislop/install_id
+.tox/
+*.log
+.DS_Store
+Thumbs.db
+*.tmp
+*.swp
+.idea/
+.worktrees/

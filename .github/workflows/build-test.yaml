@@ -1,0 +1,75 @@
+---
+# SPDX-FileCopyrightText: 2026 Andrew Grimberg <tykeal@bardicgrove.org>
+# SPDX-License-Identifier: Apache-2.0
+
+name: 'Build/Test'
+
+# yamllint disable-line rule:truthy
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+    branches: ['main']
+  push:
+    branches: ['main']
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: '${{ github.workflow }}-${{ github.ref }}'
+  cancel-in-progress: true
+
+jobs:
+  bats:
+    name: 'Bats Tests'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: 'Harden the runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25  # v2.22.1
+        with:
+          egress-policy: 'audit'
+
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      # tests/ does not necessarily exist yet. Running bats over a missing
+      # or empty directory would fail the build for no good reason, so
+      # detect the suite first and say plainly when there is nothing to do.
+      - name: 'Detect bats test suite'
+        id: detect
+        run: |
+          if [ -d tests ] && \
+             find tests -type f -name '*.bats' -print -quit | grep -q .; then
+            echo 'found=true' >> "$GITHUB_OUTPUT"
+            echo 'Found bats tests under tests/; running them.' \
+              >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'found=false' >> "$GITHUB_OUTPUT"
+            echo 'No bats tests found under tests/; nothing to run.' \
+              >> "$GITHUB_STEP_SUMMARY"
+            echo 'No bats tests found under tests/; nothing to run.'
+          fi
+
+      - name: 'Install bats'
+        if: steps.detect.outputs.found == 'true'
+        # yamllint disable-line rule:line-length
+        uses: bats-core/bats-action@77d6fb60505b4d0d1d73e48bd035b55074bbfb43  # 4.0.0
+        with:
+          # Only the bats binary is needed today. The helper libraries are
+          # unused, so installing them is wasted runner time.
+          support-install: false
+          assert-install: false
+          detik-install: false
+          file-install: false
+
+      - name: 'Run bats tests'
+        if: steps.detect.outputs.found == 'true'
+        env:
+          BATS_TEST_DIR: 'tests/'
+        run: |
+          bats --recursive --print-output-on-failure "${BATS_TEST_DIR}"

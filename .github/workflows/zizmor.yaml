@@ -1,0 +1,48 @@
+---
+# SPDX-FileCopyrightText: 2026 Andrew Grimberg <tykeal@bardicgrove.org>
+# SPDX-License-Identifier: Apache-2.0
+
+# GitHub-native caller for the zizmor lane in security-workflows. zizmor
+# audits the workflow files in this repository for unsafe patterns.
+#
+# The lane is advisory: zizmor's SARIF mode exits 0, so findings surface in
+# the job summary and the code-scanning dashboard rather than failing the
+# run. The SARIF publish needs GitHub Advanced Security enabled for the
+# repository (free for public repositories); without it the publish step
+# warns instead of failing.
+#
+# The scheduled run keeps results current, because zizmor gains audits over
+# time and a workflow clean today can acquire findings without changing.
+
+name: 'Security Scans (Workflows)'
+
+# yamllint disable-line rule:truthy
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: ['main']
+  push:
+    branches: ['main']
+  schedule:
+    # Odd minute so GitHub's queue randomises the exact start time
+    - cron: '19 2 * * 6'
+
+permissions: {}
+
+concurrency:
+  group: '${{ github.workflow }}-${{ github.ref }}'
+  cancel-in-progress: true
+
+jobs:
+  zizmor:
+    name: 'Zizmor'
+    permissions:
+      contents: read
+      # The lane's publish job needs these; a called workflow cannot be
+      # granted more than the caller job holds.
+      security-events: write
+      actions: read
+    # yamllint disable-line rule:line-length
+    uses: lfreleng-actions/security-workflows/.github/workflows/zizmor.yaml@ef6c0d9930feedb274067703b50eeebe5ab859b3  # v0.9.5
+    with:
+      upload_sarif: true

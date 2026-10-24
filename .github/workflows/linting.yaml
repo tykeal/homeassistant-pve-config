@@ -1,0 +1,64 @@
+---
+# SPDX-FileCopyrightText: 2026 Andrew Grimberg <tykeal@bardicgrove.org>
+# SPDX-License-Identifier: Apache-2.0
+
+name: 'Linting 🧹'
+
+# yamllint disable-line rule:truthy
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+  push:
+    branches: ['main']
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  # The group name is a literal rather than ${{ github.workflow }} because
+  # that expression resolves to the workflow *name*, which is not unique:
+  # another workflow sharing the name would land in the same group and
+  # cancel this one.
+  #
+  # Queueing (queue: max) with cancel-in-progress disabled keeps a burst of
+  # pushes from leaving a cancelled check run next to a successful one for
+  # the same head SHA. A cancelled run of a required check blocks ruleset
+  # evaluation, so the runs are serialised instead of racing.
+  group: 'linting-${{ github.ref }}'
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  linting:
+    name: 'Linting'
+    permissions:
+      contents: read
+    # No hook selector is passed, so the reusable runs the complete
+    # pre-commit hook set with its default split_hooks behaviour: one job
+    # (and therefore one named check run) per hook.
+    # yamllint disable-line rule:line-length
+    uses: lfreleng-actions/generic-workflows/.github/workflows/linting.yaml@9d4a5d5b7e30bcd26a0abffb5bf263fd11c13852  # v0.5.0
+    with:
+      # no-commit-to-branch is a purely local guard: it stops a developer
+      # from committing straight to main on their workstation. In CI it
+      # means nothing, and on the push-to-main trigger the checkout sits on
+      # main by definition, so the hook would fail every run. Skip it.
+      skip_hooks: 'no-commit-to-branch'
+      # gitlint is a commit-msg stage hook, and prek only reaches that
+      # stage when a commit range is supplied. This workflow is the only
+      # thing running commit-msg checks at all: pre-commit.ci does not run
+      # that stage. gitlint validates the whole commit message - body wrap
+      # at 72, DCO sign-off presence, subject length, trailing punctuation,
+      # conventional-commit type casing - none of which the Semantic Pull
+      # Request check covers, since that one only inspects the PR title.
+      #
+      # The range is deliberately empty on push and workflow_dispatch: the
+      # reusable refuses a range with missing endpoints (github.event.before
+      # is all-zeroes on branch creation) or one selecting no commits, so
+      # commit-message linting is a pull-request-time gate.
+      commit_range: >-
+        ${{ github.event_name == 'pull_request'
+            && format('{0}..{1}',
+                      github.event.pull_request.base.sha,
+                      github.event.pull_request.head.sha)
+            || '' }}

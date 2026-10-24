@@ -1,0 +1,61 @@
+---
+# SPDX-FileCopyrightText: 2026 Andrew Grimberg <tykeal@bardicgrove.org>
+# SPDX-License-Identifier: Apache-2.0
+
+# Publishes aislop results to GitHub code scanning.
+#
+# This workflow deliberately has no pull_request trigger. `aislop ci` runs
+# over the whole tree as a local pre-commit hook, and the linting workflow
+# runs that same hook on every pull request, so a pull_request trigger here
+# would be a third copy of identical work. What this workflow adds over the
+# hook is the SARIF upload to code scanning, which pre-commit cannot do.
+#
+# The scheduled run keeps the code-scanning results current between pushes
+# to main.
+
+name: 'AI Slop Scan'
+
+# yamllint disable-line rule:truthy
+on:
+  push:
+    branches: ['main']
+  schedule:
+    # Odd minute so GitHub's queue randomises the exact start time
+    - cron: '37 5 * * 3'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: '${{ github.workflow }}-${{ github.ref }}'
+  cancel-in-progress: true
+
+jobs:
+  aislop:
+    name: 'AI Slop Scan'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: 'Harden the runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25  # v2.22.1
+        with:
+          egress-policy: 'audit'
+
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      # The action needs Node.js 22.13.0+, jq and python3, all of which
+      # GitHub-hosted runners provide. 'full' scans the whole working tree;
+      # the default 'changes' mode has no diff to work from on these
+      # triggers.
+      - name: 'Run aislop scan'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/aislop-scan-action@2d0c48a326538bda2b602beab36784d517ea30e8  # v0.3.2
+        with:
+          scan-mode: 'full'
+          upload-sarif: 'true'
