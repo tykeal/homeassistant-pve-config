@@ -304,6 +304,14 @@ run_stage() {
   if dry_run_enabled; then
     log_info "dry run: stage ${id} would be marked complete"
   else
+    # The reboot the phase owes is persisted before its completion is
+    # published. Published first, a crash or a failed write here would
+    # leave a complete phase 1 with no recorded boot id, which reads as
+    # "already rebooted" and lets phase 2 start on an unrebooted host.
+    if [[ $(stage_phase_of "${path}") == 1 ]] && ! state_record_boot_id 1; then
+      log_error "unable to record the reboot requirement for phase 1"
+      return 1
+    fi
     # Without a durable marker the run is not actually recorded, so a
     # failure here has to stop the driver rather than be logged over.
     if ! state_mark_done "${id}"; then
@@ -478,16 +486,12 @@ main() {
 
   run_stages "${selected[@]}" || die 'Aborting; fix the failure above and re-run.'
 
-  # Re-running a phase 1 stage applies host settings again, so the reboot
-  # it asks for is owed again and the boot id has to be re-recorded. The
-  # notice, though, belongs to the moment phase 1 first becomes complete
-  # and is not repeated on every later run that touches it.
-  if ! dry_run_enabled && [[ ${phase} == 1 ]] &&
-    [[ ${STAGES_EXECUTED} -gt 0 ]] && phase_is_complete 1; then
-    state_record_boot_id 1
-    if [[ ${phase1_was_complete} == 0 ]]; then
-      reboot_notice
-    fi
+  # Each phase 1 stage records the reboot it owes as it completes, so all
+  # that is left here is the notice, which belongs to the moment phase 1
+  # first becomes complete and is not repeated afterwards.
+  if ! dry_run_enabled && [[ ${phase} == 1 ]] && [[ ${STAGES_EXECUTED} -gt 0 ]] &&
+    [[ ${phase1_was_complete} == 0 ]] && phase_is_complete 1; then
+    reboot_notice
   fi
 }
 

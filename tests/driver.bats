@@ -650,6 +650,8 @@ EOF
   make_stage 1 '10-host.sh' >/dev/null
 
   source_driver
+  # Called by main rather than from here, so shellcheck sees no caller.
+  # shellcheck disable=SC2329
   state_mark_done() { return 1; }
   run main
   [ "$status" -ne 0 ]
@@ -674,4 +676,32 @@ EOF
   run main --phase 2
   [ "$status" -eq 0 ]
   [ -f "${PVE_CONFIG_STATE_DIR}/phase2__10-acme.done" ]
+}
+
+@test "the reboot requirement is recorded before phase 1 completion is" {
+  make_stage 1 '10-host.sh' >/dev/null
+
+  source_driver
+  # Publishing the marker is what a crash would interrupt, so a failure
+  # there must leave a recorded boot id and a pending stage behind. The
+  # override is reached through main, which shellcheck cannot follow.
+  # shellcheck disable=SC2329
+  state_mark_done() { return 1; }
+  run main
+  [ "$status" -ne 0 ]
+  [ -f "${PVE_CONFIG_STATE_DIR}/phase1.bootid" ]
+  [ ! -e "${PVE_CONFIG_STATE_DIR}/phase1__10-host.done" ]
+}
+
+@test "a stage stays pending when the reboot requirement cannot be recorded" {
+  make_stage 1 '10-host.sh' >/dev/null
+
+  source_driver
+  # Called by main rather than from here, so shellcheck sees no caller.
+  # shellcheck disable=SC2329
+  state_record_boot_id() { return 1; }
+  run main
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'unable to record the reboot requirement'* ]]
+  [ ! -e "${PVE_CONFIG_STATE_DIR}/phase1__10-host.done" ]
 }
