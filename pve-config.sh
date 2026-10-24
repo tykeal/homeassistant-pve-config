@@ -24,6 +24,7 @@ source "${PVE_CONFIG_LIB_DIR}/schema.sh"
 : "${ASSUME_YES:=0}"
 : "${FORCE:=0}"
 : "${RECONFIGURE:=0}"
+STAGES_EXECUTED=0
 
 usage() {
   cat <<'EOF'
@@ -281,6 +282,10 @@ run_stage() {
     return 0
   fi
 
+  # Counted rather than inferred from completion: a run that only skipped
+  # finished stages has changed nothing, so it must not make a reboot owed.
+  STAGES_EXECUTED=$((STAGES_EXECUTED + 1))
+
   if dry_run_enabled; then
     log_info "dry run: stage ${id}"
   else
@@ -349,6 +354,7 @@ preflight() {
 
 main() {
   local mode='auto' want_phase='' want_stage='' config_path=''
+  STAGES_EXECUTED=0
 
   while [[ $# -gt 0 ]]; do
     case $1 in
@@ -476,7 +482,8 @@ main() {
   # it asks for is owed again and the boot id has to be re-recorded. The
   # notice, though, belongs to the moment phase 1 first becomes complete
   # and is not repeated on every later run that touches it.
-  if ! dry_run_enabled && [[ ${phase} == 1 ]] && phase_is_complete 1; then
+  if ! dry_run_enabled && [[ ${phase} == 1 ]] &&
+    [[ ${STAGES_EXECUTED} -gt 0 ]] && phase_is_complete 1; then
     state_record_boot_id 1
     if [[ ${phase1_was_complete} == 0 ]]; then
       reboot_notice

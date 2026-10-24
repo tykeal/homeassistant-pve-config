@@ -655,3 +655,23 @@ EOF
   [ "$status" -ne 0 ]
   [[ "$output" == *'unable to record completion'* ]]
 }
+
+@test "re-selecting a completed phase 1 does not make another reboot owed" {
+  make_stage 1 '10-host.sh' >/dev/null
+  make_stage 2 '10-acme.sh' >/dev/null
+
+  source_driver
+  run main
+  [ "$status" -eq 0 ]
+  simulate_reboot
+
+  # Nothing runs here, so nothing can require another reboot.
+  run main --phase 1
+  [ "$status" -eq 0 ]
+  run main --stage 10-host
+  [ "$status" -eq 0 ]
+
+  run main --phase 2
+  [ "$status" -eq 0 ]
+  [ -f "${PVE_CONFIG_STATE_DIR}/phase2__10-acme.done" ]
+}
