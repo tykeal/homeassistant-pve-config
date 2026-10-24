@@ -705,3 +705,21 @@ EOF
   [[ "$output" == *'unable to record the reboot requirement'* ]]
   [ ! -e "${PVE_CONFIG_STATE_DIR}/phase1__10-host.done" ]
 }
+
+@test "a forced stage is not started when its marker will not clear" {
+  make_stage 1 '10-host.sh' >/dev/null
+
+  source_driver
+  run main
+  [ "$status" -eq 0 ]
+
+  : >"${ORDER_LOG}"
+  # Called by main rather than from here, so shellcheck sees no caller.
+  # shellcheck disable=SC2329
+  state_clear() { return 1; }
+  run main --stage 10-host --force
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'unable to clear the completion marker'* ]]
+  run cat "${ORDER_LOG}"
+  [ -z "$output" ]
+}

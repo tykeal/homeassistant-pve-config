@@ -36,8 +36,12 @@ state_mark_done() {
     log_info "would mark stage ${id} complete"
     return 0
   fi
-  mkdir -p -- "$(state_dir)"
-  printf 'completed %s\n' "$(date -Is)" >"${marker}"
+  # Published through write_file so the marker appears only once it is
+  # complete: a half written marker still satisfies state_is_done and
+  # would silently skip the stage on the next run.
+  local content
+  printf -v content 'completed %s\n' "$(date -Is)"
+  write_file "${marker}" "${content}" 0644 >/dev/null
 }
 
 state_clear() {
@@ -108,8 +112,9 @@ state_record_boot_id() {
     log_info "would record the boot id for phase ${phase}"
     return 0
   fi
-  mkdir -p -- "$(state_dir)"
-  printf '%s\n' "${current}" >"${marker}"
+  local content
+  printf -v content '%s\n' "${current}"
+  write_file "${marker}" "${content}" 0644 >/dev/null
 }
 
 state_recorded_boot_id() {

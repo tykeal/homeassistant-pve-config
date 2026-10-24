@@ -292,8 +292,13 @@ run_stage() {
     log_info "running stage ${id}"
     # The marker goes before the run, not after it: a forced stage that
     # fails or is interrupted part way has changed the host and must come
-    # back as pending rather than keep the old claim of completion.
-    state_clear "${id}"
+    # back as pending rather than keep the old claim of completion. A
+    # marker that will not clear would outlive such a failure, so the
+    # child is not started at all.
+    if ! state_clear "${id}"; then
+      log_error "unable to clear the completion marker for ${id}"
+      return 1
+    fi
   fi
 
   if ! bash "${path}"; then

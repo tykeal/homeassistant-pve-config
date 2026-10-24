@@ -143,3 +143,15 @@ setup() {
   [[ "$output" == *'unrecognised marker'* ]]
   [[ "$output" == *'10-host'* ]]
 }
+
+@test "a marker is published whole or not at all" {
+  state_mark_done 'phase1__10-host'
+  local marker="${PVE_CONFIG_STATE_DIR}/phase1__10-host.done"
+  [ -f "${marker}" ]
+  run cat "${marker}"
+  [[ "$output" == completed\ * ]]
+
+  # Nothing partial is left behind in the state directory either.
+  run find "${PVE_CONFIG_STATE_DIR}" -name '.*' -type f
+  [ -z "$output" ]
+}
