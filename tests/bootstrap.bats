@@ -234,3 +234,75 @@ swap_with_failing_install() {
   [[ "$output" != *'Manual recovery required'* ]]
   [ ! -e "${PVE_CONFIG_DIR}" ]
 }
+
+@test "bootstrap answers --help instead of installing" {
+  run env PVE_CONFIG_DIR="${PVE_CONFIG_DIR}" \
+    bash "${BOOTSTRAP}" --help
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'Usage: bootstrap.sh'* ]]
+  [[ "$output" == *'PVE_CONFIG_REF'* ]]
+}
+
+@test "bootstrap rejects an unknown argument before touching anything" {
+  run env PVE_CONFIG_DIR="${PVE_CONFIG_DIR}" \
+    bash "${BOOTSTRAP}" --install-everything
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'Unknown argument'* ]]
+}
+
+@test "the entry point guard survives an unset BASH_SOURCE" {
+  run env PVE_CONFIG_DIR="${PVE_CONFIG_DIR}" \
+    bash -c "$(cat "${BOOTSTRAP}")" bootstrap.sh --help
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'Usage: bootstrap.sh'* ]]
+  [[ "$output" != *'unbound variable'* ]]
+}
+
+@test "a leftover backup stops the install rather than being deleted" {
+  mkdir -p "${PVE_CONFIG_DIR}.old"
+  printf 'the only copy\n' >"${PVE_CONFIG_DIR}.old/pve-config.sh"
+
+  run_bootstrap
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'still exists from an earlier failed install'* ]]
+  run cat "${PVE_CONFIG_DIR}.old/pve-config.sh"
+  [ "$output" = 'the only copy' ]
+}
+
+@test "an upgrade carries the admin key directory across" {
+  mkdir -p "${PVE_CONFIG_DIR}/keys"
+  printf 'ssh-ed25519 AAAAtest admin@example.test\n' \
+    >"${PVE_CONFIG_DIR}/keys/admins.pub"
+
+  run_bootstrap
+  [ "$status" -eq 0 ]
+  run cat "${PVE_CONFIG_DIR}/keys/admins.pub"
+  [ "$output" = 'ssh-ed25519 AAAAtest admin@example.test' ]
+}
+
+@test "a staging copy failure stops before anything is swapped" {
+  printf 'old driver\n' >"${PVE_CONFIG_DIR}/pve-config.sh"
+  mkdir -p "${PVE_CONFIG_DIR}/state"
+  printf 'marker\n' >"${PVE_CONFIG_DIR}/state/phase1__10-host.done"
+
+  run env \
+    PVE_CONFIG_DIR="${PVE_CONFIG_DIR}" \
+    PVE_CONFIG_BOOTSTRAP_ARCHIVE="${ARCHIVE}" \
+    bash -euo pipefail -c "
+      source '${BOOTSTRAP}'
+      # Only the assembly copies fail; fetching the offline archive still
+      # has to work or the test never reaches the staging step.
+      cp() {
+        case "\$*" in
+          *'/new/'*) return 1 ;;
+        esac
+        command cp "\$@"
+      }
+      bootstrap_install
+    "
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'Unable to assemble'* ]]
+  run cat "${PVE_CONFIG_DIR}/pve-config.sh"
+  [ "$output" = 'old driver' ]
+  [ -f "${PVE_CONFIG_DIR}/state/phase1__10-host.done" ]
+}

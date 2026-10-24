@@ -348,3 +348,30 @@ setup() {
   run grep -c "PVE_PARSED='old.net'" "${CONFIG}"
   [ "$output" = '1' ]
 }
+
+@test "secrets_require registers an environment only credential for redaction" {
+  export PVE_TOKEN='tskey-from-env'
+  secrets_require PVE_TOKEN
+  run run_cmd true tskey-from-env
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'<redacted>'* ]]
+  [[ "$output" != *'tskey-from-env'* ]]
+}
+
+@test "whitespace at the end of a line inside a value survives the round trip" {
+  config_set PVE_BLOCK $'first line   \nsecond\t\nthird'
+  config_save "${CONFIG}" >/dev/null
+  config_reset
+  unset PVE_BLOCK
+  config_load "${CONFIG}"
+  [ "${PVE_BLOCK}" = $'first line   \nsecond\t\nthird' ]
+}
+
+@test "a blank line inside a value is preserved" {
+  config_set PVE_BLOCK $'top\n\nbottom'
+  config_save "${CONFIG}" >/dev/null
+  config_reset
+  unset PVE_BLOCK
+  config_load "${CONFIG}"
+  [ "${PVE_BLOCK}" = $'top\n\nbottom' ]
+}

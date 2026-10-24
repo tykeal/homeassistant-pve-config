@@ -19,7 +19,9 @@ PVE_CONFIG_DIR=${PVE_CONFIG_DIR:-/root/pve-config}
 # earlier run produced is carried across untouched.
 BOOTSTRAP_CODE_PATHS=(pve-config.sh bootstrap.sh lib stages examples)
 BOOTSTRAP_REQUIRED_PATHS=(pve-config.sh bootstrap.sh lib/common.sh lib/config.sh lib/detect.sh lib/state.sh lib/schema.sh)
-BOOTSTRAP_PRESERVE_PATHS=(pve-config.conf secrets.env state)
+# keys/ is an operator input the example config points at, so an upgrade
+# must carry it across like any other generated file.
+BOOTSTRAP_PRESERVE_PATHS=(pve-config.conf secrets.env state keys)
 
 bootstrap_log() { printf '[bootstrap] %s\n' "$*" >&2; }
 bootstrap_die() {
@@ -115,29 +117,61 @@ bootstrap_stage() {
     fi
   done
 
+  # Assembly runs with errexit disabled, because the caller tests this
+  # function's status. Every copy is therefore checked by hand: a silently
+  # dropped file would otherwise be swapped in over a good installation.
   for item in "${BOOTSTRAP_CODE_PATHS[@]}"; do
     [[ -e ${staging}/src/${item} ]] || continue
-    mkdir -p -- "$(dirname -- "${staging}/new/${item}")"
-    cp -a -- "${staging}/src/${item}" "${staging}/new/${item}"
+    if ! mkdir -p -- "$(dirname -- "${staging}/new/${item}")" ||
+      ! cp -a -- "${staging}/src/${item}" "${staging}/new/${item}"; then
+      bootstrap_die "Unable to assemble ${item}."
+      return 1
+    fi
   done
 
   for item in "${BOOTSTRAP_PRESERVE_PATHS[@]}"; do
     [[ -e ${PVE_CONFIG_DIR}/${item} ]] || continue
-    cp -a -- "${PVE_CONFIG_DIR}/${item}" "${staging}/new/${item}"
+    if ! cp -a -- "${PVE_CONFIG_DIR}/${item}" "${staging}/new/${item}"; then
+      bootstrap_die "Unable to carry ${item} across from the existing install."
+      return 1
+    fi
   done
 
-  chmod +x "${staging}/new/pve-config.sh" "${staging}/new/bootstrap.sh"
-  if [[ -d ${staging}/new/stages ]]; then
-    find "${staging}/new/stages" -type f -name '*.sh' -exec chmod +x {} +
+  if ! chmod +x "${staging}/new/pve-config.sh" "${staging}/new/bootstrap.sh"; then
+    bootstrap_die 'Unable to make the driver executable.'
+    return 1
   fi
-  mkdir -p -- "${staging}/new/state"
+  if [[ -d ${staging}/new/stages ]] &&
+    ! find "${staging}/new/stages" -type f -name '*.sh' -exec chmod +x {} +; then
+    bootstrap_die 'Unable to make the stages executable.'
+    return 1
+  fi
+  if ! mkdir -p -- "${staging}/new/state"; then
+    bootstrap_die 'Unable to create the state directory.'
+    return 1
+  fi
+
+  # The assembled tree is what actually gets installed, so it is checked
+  # rather than the archive it was built from.
+  for item in "${BOOTSTRAP_REQUIRED_PATHS[@]}"; do
+    if [[ ! -e ${staging}/new/${item} ]]; then
+      bootstrap_die "Assembled tree is missing ${item}; refusing to install."
+      return 1
+    fi
+  done
 }
 
 # Swaps the assembled tree in by rename. The previous install is moved
 # aside rather than deleted so a failed rename can be undone.
 bootstrap_swap() {
   local staging=$1 backup="${PVE_CONFIG_DIR}.old" backed_up=0
-  rm -rf -- "${backup}"
+  # A leftover backup is the only copy of an installation an earlier run
+  # could not put back. Deleting it to make room would destroy the very
+  # thing its recovery message told the operator to go and find.
+  if [[ -e ${backup} ]]; then
+    bootstrap_die "${backup} still exists from an earlier failed install. Move it back to ${PVE_CONFIG_DIR} or delete it, then run this again."
+    return 1
+  fi
   if [[ -e ${PVE_CONFIG_DIR} ]]; then
     if ! mv -- "${PVE_CONFIG_DIR}" "${backup}"; then
       bootstrap_die 'Unable to move the existing install aside.'
@@ -206,7 +240,35 @@ Next steps:
 EOF
 }
 
+bootstrap_usage() {
+  cat <<EOF
+Usage: bootstrap.sh [-h|--help]
+
+Installs the pve-config toolkit into ${PVE_CONFIG_DIR} and stops.
+
+Environment:
+  PVE_CONFIG_REF    Git ref to install (default: main)
+  PVE_CONFIG_DIR    Install directory (default: /root/pve-config)
+  PVE_CONFIG_REPO   Source repository (default: tykeal/homeassistant-pve-config)
+EOF
+}
+
 main() {
+  # Argument handling comes before the privilege check so that --help is
+  # answered rather than refused.
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      -h | --help)
+        bootstrap_usage
+        return 0
+        ;;
+      *)
+        bootstrap_die "Unknown argument: $1"
+        return 1
+        ;;
+    esac
+  done
+
   if [[ ${EUID} -ne 0 ]]; then
     bootstrap_die 'This must be run as root on the Proxmox VE host.'
     return 1
@@ -215,6 +277,9 @@ main() {
   bootstrap_next_steps
 }
 
-if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+# The documented entry point is bash -c "$(curl ...)", where BASH_SOURCE is
+# unset entirely; under set -u that must not be an error. An unset source
+# means "not sourced", so the installer runs.
+if [[ ${BASH_SOURCE[0]:-$0} == "$0" ]]; then
   main "$@"
 fi

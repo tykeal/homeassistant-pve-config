@@ -601,3 +601,57 @@ EOF
   [[ "$output" == *'PVE_HOSTNAME'* ]]
   [[ "$output" != *'PVE_DOMAIN'* ]]
 }
+
+@test "a forced phase 1 rerun makes the reboot owed again" {
+  make_stage 1 '10-host.sh' >/dev/null
+  make_stage 2 '10-acme.sh' >/dev/null
+
+  source_driver
+  run main
+  [ "$status" -eq 0 ]
+  simulate_reboot
+
+  run main --phase 1 --force
+  [ "$status" -eq 0 ]
+  [[ "$output" != *'Phase 1 is complete'* ]]
+
+  run main
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'Reboot the host'* ]]
+}
+
+@test "a forced stage that fails leaves itself pending" {
+  make_stage 1 '10-host.sh' >/dev/null
+
+  source_driver
+  run main
+  [ "$status" -eq 0 ]
+  [ -f "${PVE_CONFIG_STATE_DIR}/phase1__10-host.done" ]
+
+  make_stage 1 '10-host.sh' 1 >/dev/null
+  run main --stage 10-host --force
+  [ "$status" -ne 0 ]
+  [ ! -e "${PVE_CONFIG_STATE_DIR}/phase1__10-host.done" ]
+}
+
+@test "a dry run of a completed forced stage keeps its marker" {
+  make_stage 1 '10-host.sh' >/dev/null
+
+  source_driver
+  run main
+  [ "$status" -eq 0 ]
+
+  run main --stage 10-host --force --dry-run
+  [ "$status" -eq 0 ]
+  [ -f "${PVE_CONFIG_STATE_DIR}/phase1__10-host.done" ]
+}
+
+@test "a stage whose completion cannot be recorded fails the run" {
+  make_stage 1 '10-host.sh' >/dev/null
+
+  source_driver
+  state_mark_done() { return 1; }
+  run main
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'unable to record completion'* ]]
+}

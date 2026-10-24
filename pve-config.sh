@@ -285,6 +285,10 @@ run_stage() {
     log_info "dry run: stage ${id}"
   else
     log_info "running stage ${id}"
+    # The marker goes before the run, not after it: a forced stage that
+    # fails or is interrupted part way has changed the host and must come
+    # back as pending rather than keep the old claim of completion.
+    state_clear "${id}"
   fi
 
   if ! bash "${path}"; then
@@ -295,7 +299,12 @@ run_stage() {
   if dry_run_enabled; then
     log_info "dry run: stage ${id} would be marked complete"
   else
-    state_mark_done "${id}"
+    # Without a durable marker the run is not actually recorded, so a
+    # failure here has to stop the driver rather than be logged over.
+    if ! state_mark_done "${id}"; then
+      log_error "unable to record completion of ${id}"
+      return 1
+    fi
     log_info "stage ${name} complete"
   fi
   return 0
@@ -463,11 +472,15 @@ main() {
 
   run_stages "${selected[@]}" || die 'Aborting; fix the failure above and re-run.'
 
-  # The notice belongs to the moment phase 1 becomes complete, not to every
-  # later run that happens to touch phase 1.
-  if ! dry_run_enabled && [[ ${phase1_was_complete} == 0 ]] && phase_is_complete 1; then
+  # Re-running a phase 1 stage applies host settings again, so the reboot
+  # it asks for is owed again and the boot id has to be re-recorded. The
+  # notice, though, belongs to the moment phase 1 first becomes complete
+  # and is not repeated on every later run that touches it.
+  if ! dry_run_enabled && [[ ${phase} == 1 ]] && phase_is_complete 1; then
     state_record_boot_id 1
-    reboot_notice
+    if [[ ${phase1_was_complete} == 0 ]]; then
+      reboot_notice
+    fi
   fi
 }
 

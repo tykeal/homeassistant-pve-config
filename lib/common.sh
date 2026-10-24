@@ -57,9 +57,13 @@ _redact_init() {
   # Stages are children of the driver and never load the secrets file
   # themselves, so the driver passes the key names along and the registry is
   # rebuilt from the exported environment.
+  # Indirect expansion runs command substitution hidden in a subscript, so
+  # the name has to be proven a plain toolkit identifier before it is used.
   local key
   for key in ${PVE_CONFIG_SECRET_KEYS:-}; do
-    redact_register "${!key:-}"
+    if [[ ${key} =~ ^PVE_[A-Z0-9_]+$ ]]; then
+      redact_register "${!key:-}"
+    fi
   done
 }
 

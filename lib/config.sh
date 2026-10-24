@@ -132,9 +132,13 @@ _config_decode_double() {
   return 0
 }
 
-_config_trim() {
+_config_ltrim() {
   local text=$1
-  text=${text#"${text%%[![:space:]]*}"}
+  printf '%s' "${text#"${text%%[![:space:]]*}"}"
+}
+
+_config_rtrim() {
+  local text=$1
   printf '%s' "${text%"${text##*[![:space:]]}"}"
 }
 
@@ -198,14 +202,17 @@ _config_parse_file() {
     if [[ -n ${buffer} ]]; then
       buffer+=$'\n'"${raw}"
     else
-      trimmed=$(_config_trim "${raw}")
+      # Only the leading whitespace is dropped here. Trailing whitespace is
+      # inside the value once a quote is open, so it is trimmed for the
+      # decode attempt but never removed from the buffer itself.
+      trimmed=$(_config_ltrim "${raw}")
       [[ -z ${trimmed} ]] && continue
       [[ ${trimmed} == '#'* ]] && continue
       buffer=${trimmed}
       start=${lineno}
     fi
 
-    _config_decode_assignment "${buffer}" && rc=0 || rc=$?
+    _config_decode_assignment "$(_config_rtrim "${buffer}")" && rc=0 || rc=$?
     case ${rc} in
       0)
         if [[ -z ${_CONFIG_PARSED[${_CONFIG_DECODED_KEY}]+set} ]]; then
@@ -423,6 +430,9 @@ secrets_require() {
   for key in "$@"; do
     config_mark_secret "${key}"
     [[ -n ${!key:-} ]] || die "${key} is required but unset; add it to secrets.env."
+    # A credential supplied purely through the environment never passed
+    # through secrets_load, so this is the only chance to mask it.
+    redact_register "${!key}"
   done
 }
 

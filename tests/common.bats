@@ -261,3 +261,31 @@ setup() {
   run redact 'nothing secret here'
   [ "$output" = 'nothing secret here' ]
 }
+
+@test "a crafted secret key name is not expanded into a command" {
+  # Built with printf so the literal dollar sign is not written out here.
+  local payload
+  payload=$(printf 'x[\x24(touch %s/pwned)]' "${BATS_TEST_TMPDIR}")
+
+  run env \
+    PVE_CONFIG_SECRET_KEYS="${payload}" \
+    bash -euo pipefail -c "
+      source '${REPO_ROOT}/lib/common.sh'
+      run_cmd true
+    "
+  [ "$status" -eq 0 ]
+  [ ! -e "${BATS_TEST_TMPDIR}/pwned" ]
+}
+
+@test "secret values still rebuild from well formed key names" {
+  run env \
+    PVE_CONFIG_SECRET_KEYS='PVE_TOKEN' \
+    PVE_TOKEN='tskey-secret' \
+    bash -euo pipefail -c "
+      source '${REPO_ROOT}/lib/common.sh'
+      run_cmd true tskey-secret
+    "
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'<redacted>'* ]]
+  [[ "$output" != *'tskey-secret'* ]]
+}
