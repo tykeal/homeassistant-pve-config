@@ -396,11 +396,12 @@ GitHub Actions workflows live under `.github/workflows/`:
 
 Specific things worth knowing:
 
-- **Linting runs every hook.** It calls the lfreleng standalone linting
-  reusable with no hook selector, which splits the run one job per hook.
-  `shellcheck`, `shfmt`, `yamllint`, `reuse`, `actionlint`, and the rest
-  therefore appear as individually named check runs, so a failure points
-  straight at the hook that produced it.
+- **Linting runs every hook as one job.** It calls the lfreleng standalone
+  linting reusable with no hook selector, which runs the complete hook set
+  as a single run-all job rather than one job per hook. `shellcheck`,
+  `shfmt`, `yamllint`, `reuse`, `actionlint`, and the rest therefore
+  surface as one check run named `Lint: lint-all`, so a failure has to be
+  read from the job log rather than from the check name.
 - **`no-commit-to-branch` is skipped in CI.** It is a local-only guard that
   stops a developer committing straight to `main`. In CI it has no meaning,
   and on the `push: main` trigger the checkout sits on `main` by
