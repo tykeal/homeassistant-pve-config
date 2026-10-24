@@ -306,3 +306,30 @@ swap_with_failing_install() {
   [ "$output" = 'old driver' ]
   [ -f "${PVE_CONFIG_DIR}/state/phase1__10-host.done" ]
 }
+
+run_next_steps() {
+  run env \
+    PVE_CONFIG_DIR="${PVE_CONFIG_DIR}" \
+    PVE_CONFIG_BOOTSTRAP_ARCHIVE="${ARCHIVE}" \
+    bash -euo pipefail -c "source '${BOOTSTRAP}'; bootstrap_install; bootstrap_next_steps"
+}
+
+@test "a fresh install suggests seeding the generated files" {
+  run_next_steps
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'cp examples/pve-config.conf.example'* ]]
+  [[ "$output" == *'cp examples/secrets.env.example'* ]]
+}
+
+@test "an upgrade does not suggest overwriting what it just preserved" {
+  printf "PVE_DOMAIN='kept.net'\n" >"${PVE_CONFIG_DIR}/pve-config.conf"
+  printf "PVE_TOKEN='kept'\n" >"${PVE_CONFIG_DIR}/secrets.env"
+  chmod 600 "${PVE_CONFIG_DIR}/secrets.env"
+
+  run_next_steps
+  [ "$status" -eq 0 ]
+  [[ "$output" != *'cp examples/pve-config.conf.example'* ]]
+  [[ "$output" != *'cp examples/secrets.env.example'* ]]
+  run cat "${PVE_CONFIG_DIR}/pve-config.conf"
+  [ "$output" = "PVE_DOMAIN='kept.net'" ]
+}

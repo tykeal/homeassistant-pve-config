@@ -224,20 +224,19 @@ bootstrap_install() {
   bootstrap_log "installed to ${PVE_CONFIG_DIR}"
 }
 
+# The seeding commands are only suggested when there is nothing to seed.
+# After an upgrade they would overwrite the settings and credentials this
+# installer just took care to preserve.
 bootstrap_next_steps() {
-  cat <<EOF
-
-Next steps:
-
-  cd ${PVE_CONFIG_DIR}
-  cp examples/pve-config.conf.example pve-config.conf   # optional, the
-  cp examples/secrets.env.example secrets.env           # driver prompts too
-  chmod 600 secrets.env
-  ./pve-config.sh --list
-  ./pve-config.sh --dry-run
-  ./pve-config.sh
-
-EOF
+  printf '\nNext steps:\n\n  cd %s\n' "${PVE_CONFIG_DIR}"
+  if [[ ! -e ${PVE_CONFIG_DIR}/pve-config.conf ]]; then
+    printf '  cp examples/pve-config.conf.example pve-config.conf   # optional, the\n'
+  fi
+  if [[ ! -e ${PVE_CONFIG_DIR}/secrets.env ]]; then
+    printf '  cp examples/secrets.env.example secrets.env           # driver prompts too\n'
+    printf '  chmod 600 secrets.env\n'
+  fi
+  printf '  ./pve-config.sh --list\n  ./pve-config.sh --dry-run\n  ./pve-config.sh\n\n'
 }
 
 bootstrap_usage() {
