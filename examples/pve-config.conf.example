@@ -1,0 +1,112 @@
+# SPDX-FileCopyrightText: 2026 Andrew Grimberg <tykeal@bardicgrove.org>
+# SPDX-License-Identifier: Apache-2.0
+
+# Template for /root/pve-config/pve-config.conf.
+#
+# The real file lives on the host and is never committed. You do not have to
+# create it by hand: the driver prompts for whatever it cannot derive and
+# writes the answers here, so the second run is unattended. Copy this file
+# only when you want to pre-seed a deployment.
+#
+# Every key is also honoured as an environment variable, which takes
+# precedence over the value stored here.
+
+# --- Identity -------------------------------------------------------------
+
+# Short hostname and DNS domain. The driver derives the hostname from the
+# running system and the FQDN from the two, so in practice you only answer
+# the domain.
+PVE_HOSTNAME='pve1'
+PVE_DOMAIN='example.net'
+PVE_FQDN='pve1.example.net'
+
+# --- Networking -----------------------------------------------------------
+
+# Physical interfaces to enslave to the management bridge, space separated.
+# Detected from /sys/class/net when left unset; set it when the host has
+# interfaces that must stay out of the bridge.
+PVE_BRIDGE_PORTS=''
+
+# Management bridge name and addressing mode: dhcp or static.
+PVE_BRIDGE='vmbr0'
+PVE_BRIDGE_MODE='dhcp'
+
+# Only consulted when PVE_BRIDGE_MODE is static.
+PVE_BRIDGE_ADDRESS=''
+PVE_BRIDGE_GATEWAY=''
+
+# --- Repositories ---------------------------------------------------------
+
+# Debian suite for the Proxmox apt sources. Read from VERSION_CODENAME in
+# /etc/os-release when unset; override only to pin an older suite.
+# PVE_SUITE='trixie'
+
+# Use the no-subscription repository and suppress the subscription notice.
+PVE_NO_SUBSCRIPTION='yes'
+
+# --- Administrators -------------------------------------------------------
+
+# Space separated local usernames to create, add to sudo, and register in
+# Proxmox with the PVEAdmin role.
+PVE_ADMIN_USERS='alice'
+
+# Public key source used for every admin above. The value is either a
+# literal key or a path to a file holding one or more keys. Both forms work;
+# the path form keeps long keys out of this file.
+PVE_ADMIN_KEY_SOURCE='ssh-ed25519 AAAAC3Nza... alice@example.net'
+# PVE_ADMIN_KEY_SOURCE='/root/pve-config/keys/admins.pub'
+#
+# A per-user source overrides it, as PVE_ADMIN_KEY_<USERNAME>, uppercased.
+# PVE_ADMIN_KEY_ALICE='/root/pve-config/keys/alice.pub'
+
+# Allow sudo without a password when the caller forwards an SSH agent
+# holding one of the keys above (pam_ssh_agent_auth).
+PVE_SUDO_SSH_AGENT='yes'
+
+# --- Certificates ---------------------------------------------------------
+
+# ACME environment: staging or production. Staging is the default because
+# Let's Encrypt rate limits are unforgiving and a failed first attempt on
+# production can lock a deployment out for a week.
+PVE_ACME_ENVIRONMENT='staging'
+
+# Contact address for the ACME account and for expiry warnings.
+PVE_ACME_EMAIL='admin@example.net'
+
+# DNS-01 plugin name registered with pvenode. Credentials for it belong in
+# secrets.env.
+PVE_ACME_DNS_PLUGIN='dnsmadeeasy'
+
+# --- Guests ---------------------------------------------------------------
+
+# Hostname for the Tailscale LXC. Its container ID is allocated from the
+# first free ID unless you pin one here.
+PVE_TAILSCALE_HOSTNAME='ts-pve1'
+PVE_TAILSCALE_CTID=''
+
+# Hostname and resources for the Home Assistant OS VM. Blank RAM and core
+# values are derived from the host's totals.
+PVE_HAOS_HOSTNAME='haos'
+PVE_HAOS_VMID=''
+PVE_HAOS_RAM_MB=''
+PVE_HAOS_CORES=''
+
+# Hostname for the Frigate LXC.
+PVE_FRIGATE_HOSTNAME='frigate'
+PVE_FRIGATE_CTID=''
+
+# --- Community scripts ----------------------------------------------------
+
+# The guest stages drive the community-scripts ProxmoxVE helpers. Pin the
+# ref so a deployment is reproducible; an upstream change to main must never
+# alter what a rebuild produces.
+PVE_COMMUNITY_SCRIPTS_REPO='community-scripts/ProxmoxVE'
+PVE_COMMUNITY_SCRIPTS_REF='main'
+
+# --- Notifications --------------------------------------------------------
+
+# Boot and shutdown notices to a Zulip stream. Credentials belong in
+# secrets.env.
+PVE_ZULIP_ENABLED='no'
+PVE_ZULIP_STREAM='infrastructure'
+PVE_ZULIP_TOPIC='proxmox'

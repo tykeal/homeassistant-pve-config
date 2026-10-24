@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Andrew Grimberg <tykeal@bardicgrove.org>
+# SPDX-License-Identifier: Apache-2.0
+
+# Records the invocation and answers for the single fixture interface
+# "mock0". Any other interface is reported as unknown, which is how the real
+# tool behaves and is what the degradation tests rely on.
+printf '%s %s\n' "$(basename -- "$0")" "$*" >>"${PVE_CONFIG_MOCK_LOG:-/dev/null}"
+
+case "$*" in
+  *'addr show dev mock0')
+    echo '2: mock0    inet 192.0.2.10/24 brd 192.0.2.255 scope global mock0'
+    ;;
+  *'route show dev mock0')
+    echo '192.0.2.0/24 proto kernel scope link src 192.0.2.10'
+    ;;
+  *)
+    echo 'Device does not exist' >&2
+    exit 1
+    ;;
+esac
