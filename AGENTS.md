@@ -415,7 +415,15 @@ Specific things worth knowing:
   commit message (subject length and punctuation, body wrap, sign-off).
   The range is empty on `push` and `workflow_dispatch` because the
   reusable refuses a range with missing endpoints or one selecting no
-  commits, so commit-message linting is a pull-request-time gate.
+  commits, so commit-message linting is a pull-request-time gate. It is
+  also empty for pull requests authored by `dependabot[bot]`: those
+  subjects are generated from dependency names and regularly exceed the
+  50-character limit, and they can be neither shortened from our side nor
+  exempted from within `.gitlint`, since `ignore-by-author-name` has no
+  author under `--commit-msg-filename` and `ignore-by-title` is overwritten
+  by `ignore-by-body`, which every Dependabot body triggers via its
+  release-notes URL. The Semantic Pull Request check still covers those
+  pull requests.
 - **zizmor and aislop are advisory.** Both publish to GitHub code scanning
   rather than blocking a merge. The SARIF upload requires GitHub Advanced
   Security to be enabled for the repository.

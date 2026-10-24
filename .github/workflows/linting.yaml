@@ -56,8 +56,23 @@ jobs:
       # reusable refuses a range with missing endpoints (github.event.before
       # is all-zeroes on branch creation) or one selecting no commits, so
       # commit-message linting is a pull-request-time gate.
+      #
+      # The range is also empty for Dependabot pull requests. Dependabot
+      # generates its subjects from dependency names, so lines such as
+      # 'Chore: Bump step-security/harden-runner from 2.22.1 to 2.22.2'
+      # routinely exceed the 50-character title-max-length configured in
+      # .gitlint, and we cannot shorten a message we do not author. An
+      # exemption inside .gitlint is not viable either: ignore-by-author-name
+      # sees no author because prek invokes gitlint with
+      # --commit-msg-filename, and ignore-by-title is overwritten rather than
+      # appended to by ignore-by-body, which every Dependabot body triggers
+      # through its release-notes URL. Skipping the commit-msg stage for
+      # those pull requests keeps gitlint fully strict for human-authored
+      # commits, and the Semantic Pull Request check still validates the
+      # Dependabot PR title.
       commit_range: >-
-        ${{ github.event_name == 'pull_request'
+        ${{ (github.event_name == 'pull_request'
+             && github.event.pull_request.user.login != 'dependabot[bot]')
             && format('{0}..{1}',
                       github.event.pull_request.base.sha,
                       github.event.pull_request.head.sha)
