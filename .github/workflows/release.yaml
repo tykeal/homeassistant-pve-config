@@ -52,6 +52,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       tag: "${{ steps.tag-validate.outputs.tag_name }}"
+      sha: "${{ steps.pin-commit.outputs.sha }}"
     steps:
       # yamllint disable-line rule:line-length
       - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25  # v2.22.1
@@ -120,6 +121,23 @@ jobs:
           # pin here changing at all.
           use_local_action: 'true'
 
+      # A tag is a movable reference, and nothing stops it being
+      # force-updated between this job and the build. Re-resolving the
+      # tag name later would then package a commit no signature covered.
+      # Resolve it once, here, from the checkout the step above
+      # validated, and carry the immutable commit ID forward instead.
+      - name: 'Pin the verified commit'
+        id: 'pin-commit'
+        shell: bash
+        env:
+          TAG: "${{ steps.tag-validate.outputs.tag_name }}"
+        run: |
+          # Pin the verified commit
+          set -euo pipefail
+          SHA=$(git rev-parse --verify "refs/tags/${TAG}^{commit}")
+          echo "Tag ${TAG} verified at commit ${SHA}"
+          echo "sha=${SHA}" >> "${GITHUB_OUTPUT}"
+
       # release-drafter keeps a draft release in step with 'main', so one
       # normally exists by the time a tag lands. Create one if it does
       # not, because every later job attaches to a draft.
@@ -161,15 +179,14 @@ jobs:
         with:
           egress-policy: 'audit'
 
-      - name: 'Checkout tagged commit'
+      - name: 'Checkout the verified commit'
         # yamllint disable-line rule:line-length
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          # Fully qualified deliberately. An unqualified ref resolves as a
-          # branch first, so a branch sharing the tag's name would supply
-          # the tree packaged and published under a signature that never
-          # covered it.
-          ref: "refs/tags/${{ needs.tag-validate.outputs.tag }}"
+          # The commit ID the signature gate resolved, never the tag
+          # name. A tag name resolves as a branch first, and can move
+          # between jobs; the commit ID can do neither.
+          ref: "${{ needs.tag-validate.outputs.sha }}"
           fetch-depth: 0
           fetch-tags: true
           persist-credentials: false
@@ -179,6 +196,7 @@ jobs:
         shell: bash
         env:
           TAG: "${{ needs.tag-validate.outputs.tag }}"
+          SHA: "${{ needs.tag-validate.outputs.sha }}"
         run: |
           # Build reproducible source tarball
           set -euo pipefail
@@ -234,10 +252,10 @@ jobs:
           # gzip -n is the other half: without it gzip embeds the current
           # wall-clock time and the input filename in the gzip header, so
           # two builds of an identical tar would differ byte for byte.
-          # refs/tags/ for the same reason as the checkout above: a
-          # branch of the same name would otherwise win the lookup and
-          # date the archive from the wrong commit.
-          MTIME=$(git log -1 --format=%cI "refs/tags/${TAG}")
+          # From the pinned commit, not the tag name, so a tag moved
+          # after validation cannot date the archive from a commit this
+          # build never packaged.
+          MTIME=$(git log -1 --format=%cI "${SHA}")
           echo "Archive mtime: ${MTIME}"
 
           git ls-files -z \
@@ -417,6 +435,32 @@ jobs:
             echo "Release ${TAG} is draft, proceeding"
             echo "already_promoted=false" >> "${GITHUB_OUTPUT}"
           fi
+
+      # Last check before the point of no return. The tag still has to
+      # name the commit the signature gate verified and this pipeline
+      # packaged. A tag force-moved mid-run would otherwise publish,
+      # immutably, a release whose tag points somewhere the tarball
+      # never came from.
+      - name: 'Require the tag to still name the verified commit'
+        shell: bash
+        env:
+          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          GH_REPO: "${{ github.repository }}"
+          TAG: "${{ needs.tag-validate.outputs.tag }}"
+          SHA: "${{ needs.tag-validate.outputs.sha }}"
+        run: |
+          # Require the tag to still name the verified commit
+          set -euo pipefail
+          # The commits endpoint dereferences a tag to its commit, so
+          # this compares like with like however the tag was created.
+          CURRENT=$(gh api "repos/${GH_REPO}/commits/${TAG}" --jq '.sha')
+          if [ "${CURRENT}" != "${SHA}" ]; then
+            echo "::error::Tag ${TAG} moved during the release:" \
+              "verified ${SHA}, now ${CURRENT}." \
+              "Refusing to publish; re-run against a fresh tag."
+            exit 1
+          fi
+          echo "Tag ${TAG} still names the verified commit ${SHA}."
 
       # Publishing is the point of no return: the release and every
       # attached asset become immutable here.
