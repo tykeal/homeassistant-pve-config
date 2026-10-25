@@ -524,6 +524,25 @@ jobs:
         with:
           egress-policy: 'audit'
 
+      # Required, despite this job otherwise only calling APIs: the
+      # promote action shells out to git. It exports GH_REPOSITORY,
+      # which gh does not read, so gh resolves the repository from the
+      # git remote and dies with 'not a git repository' without a
+      # checkout on disk. The steps below survive without one only
+      # because they pass GH_REPO themselves. Do not remove this.
+      - name: 'Checkout the verified commit'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # The commit ID the signature gate resolved, never the tag
+          # name. A tag name resolves as a branch first, and can move
+          # between jobs; the commit ID can do neither.
+          ref: "${{ needs.tag-validate.outputs.sha }}"
+          # A shallow, tagless checkout is enough. Nothing here reads
+          # the worktree or the history: the checkout exists solely so
+          # gh can resolve the repository from the origin remote.
+          persist-credentials: false
+
       - name: 'Check if release is already promoted'
         id: 'check-promoted'
         shell: bash
