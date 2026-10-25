@@ -73,7 +73,8 @@ MOCK_READ_ONLY_PATTERNS=(
   '^sshd( -[^ ]+)* -t( |$).*'
   '^sshd( -[^ ]+)* -T( |$).*'
   '^visudo -c -f .*'
-  '^ifquery --syntax-check .*'
+  '^ifreload --syntax-check .*'
+  '^ifquery -a -i .*'
   '^findmnt( -[^ ]+)* .*'
   '^mountpoint -q .*'
   '^ssh-keygen -l -f /dev/stdin$'
@@ -291,7 +292,7 @@ iface lo inet loopback
   run run_phase1_stage 20-network.sh
   [ "$status" -ne 0 ]
   [ ! -e "${PVE_CONFIG_ROOT}/etc/network/interfaces" ]
-  [[ "$(mock_calls)" != *ifreload* ]]
+  [[ "$(mock_calls)" != *'ifreload -a'* ]]
 }
 
 @test "20-network re-reads the bridge address after reloading" {
@@ -309,7 +310,7 @@ iface lo inet loopback
   [ "$status" -eq 0 ]
   # Nothing is reconfigured when the description already matches and the
   # bridge is already addressed, and ifdown is never reached for at all.
-  [[ "$(mock_calls)" != *ifreload* ]]
+  [[ "$(mock_calls)" != *'ifreload -a'* ]]
   [[ "$(mock_calls)" != *ifdown* ]]
 }
 
@@ -1151,4 +1152,27 @@ zulip_secrets() {
   run run_phase1_stage 70-ssh-sudo.sh
   [ "$status" -eq 0 ]
   [ -f "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/99-hardening.conf" ]
+}
+
+@test "20-network refuses an unindented stanza option" {
+  mkdir -p "${PVE_CONFIG_ROOT}/etc/network"
+  printf 'auto lo\niface lo inet loopback\n\niface nic2 inet manual\nup ip addr add 10.9.0.2/24 dev nic2\n' \
+    >"${PVE_CONFIG_ROOT}/etc/network/interfaces"
+
+  run run_phase1_stage 20-network.sh
+  [ "$status" -ne 0 ]
+  [[ "$output" == *nic2* ]]
+}
+
+@test "20-network parses the candidate before activating it" {
+  run run_phase1_stage 20-network.sh
+  [ "$status" -eq 0 ]
+  [[ "$(mock_calls)" == *'ifreload --syntax-check'* ]]
+}
+
+@test "20-network parses with ifquery when ifreload will not take a file" {
+  export PVE_CONFIG_MOCK_IFRELOAD_NO_FILE=1
+  run run_phase1_stage 20-network.sh
+  [ "$status" -eq 0 ]
+  [[ "$(mock_calls)" == *'ifquery -a -i'* ]]
 }

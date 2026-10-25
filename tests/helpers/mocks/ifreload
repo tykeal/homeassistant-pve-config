@@ -4,5 +4,33 @@
 
 # Records the invocation and succeeds. Stage tests assert on the log rather
 # than on a host whose networking they must not touch.
+#
+# `--syntax-check -i FILE` stands in for ifupdown2's parser: it accepts the
+# stanza keywords the toolkit emits and rejects anything else, so a
+# candidate that would strand the host never reaches /etc/network.
 printf '%s %s\n' "$(basename -- "$0")" "$*" >>"${PVE_CONFIG_MOCK_LOG:-/dev/null}"
-exit 0
+
+syntax_check=0
+file=''
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -s | --syntax-check) syntax_check=1 ;;
+    -i | --interfaces)
+      file=$2
+      shift
+      ;;
+  esac
+  shift
+done
+
+[[ ${syntax_check} -eq 1 ]] || exit 0
+
+# A build that will not take an alternate interfaces file reports exactly
+# this, and the caller falls back to ifquery.
+if [[ -n ${file} && ${PVE_CONFIG_MOCK_IFRELOAD_NO_FILE:-0} == 1 ]]; then
+  printf 'ifreload: error: unrecognized arguments: -i %s\n' "${file}" >&2
+  exit 2
+fi
+
+[[ -n ${file} ]] || exit 0
+exec "$(dirname -- "$0")/ifquery" -a -i "${file}"

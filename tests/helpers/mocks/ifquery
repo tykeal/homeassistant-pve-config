@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: 2026 Andrew Grimberg <tykeal@bardicgrove.org>
 # SPDX-License-Identifier: Apache-2.0
 
-# Stands in for ifupdown2's syntax check. It accepts the stanza keywords the
-# toolkit emits and rejects anything else, so a candidate that would strand
-# the host never reaches /etc/network/interfaces.
+# Stands in for `ifquery -a -i FILE`, which parses the file and dumps what
+# it found. It accepts the stanza keywords the toolkit emits and rejects
+# anything else, so a candidate that would strand the host never reaches
+# /etc/network/interfaces.
 # shellcheck source=tests/helpers/mocks/_record
 source "$(dirname -- "$0")/_record"
 

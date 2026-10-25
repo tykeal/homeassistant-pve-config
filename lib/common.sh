@@ -628,14 +628,27 @@ _validator_missing() {
 _sshd_redirect_includes() {
   local body=$1 src=$2 conf_d=$3
   local bare='/etc/ssh/sshd_config.d'
-  local line trimmed out=''
+  local root
+  root=$(sysroot)
+  local line trimmed keyword operand rewritten out=''
   while IFS= read -r line || [[ -n ${line} ]]; do
     trimmed=${line#"${line%%[![:space:]]*}"}
     if [[ ${trimmed} == [Ii]nclude[[:space:]]* ]]; then
-      line=${line//"${src}/"/"${conf_d}/"}
-      # Also the unprefixed path, which is what the directive says on a real
-      # host and what this toolkit writes into it under a sysroot too.
-      line=${line//"${bare}/"/"${conf_d}/"}
+      keyword=${trimmed%%[[:space:]]*}
+      rewritten=''
+      for operand in ${trimmed#"${keyword}"}; do
+        case ${operand} in
+          "${src}"/*) operand="${conf_d}/${operand#"${src}/"}" ;;
+          "${bare}"/*) operand="${conf_d}/${operand#"${bare}/"}" ;;
+          # Everything else is read where sshd would read it, which under a
+          # sysroot means beneath that root; a relative path resolves
+          # against /etc/ssh exactly as sshd resolves it.
+          /*) operand="${root}${operand}" ;;
+          *) operand="${root}/etc/ssh/${operand}" ;;
+        esac
+        rewritten+=" ${operand}"
+      done
+      line="${keyword}${rewritten}"
     fi
     out+="${line}"$'\n'
   done <<<"${body}"
@@ -676,9 +689,13 @@ _sshd_effective_config() {
 
   mkdir -p -- "${conf_d}" || return 1
 
+  # Every file in the directory, not only *.conf: an Include naming
+  # `site-policy` or `*.cfg` pulls in whatever it names, and leaving those
+  # out of the scratch tree would validate a configuration the daemon does
+  # not have.
   local src="${root}/etc/ssh/sshd_config.d"
   if [[ -d ${src} ]]; then
-    for existing in "${src}"/*.conf; do
+    for existing in "${src}"/*; do
       [[ -f ${existing} ]] || continue
       [[ $(basename -- "${existing}") == "${base}" ]] && continue
       cp -- "${existing}" "${conf_d}/" || return 1
@@ -718,6 +735,17 @@ _sshd_effective_config() {
 
   printf '%s' "${body}" >"${main}" || return 1
   printf '%s\n' "${main}"
+}
+
+# OpenSSH accepts ChallengeResponseAuthentication as an alias for
+# KbdInteractiveAuthentication, so a conditional block spelled the old way
+# would slip past a check that compared keywords literally.
+_sshd_canonical_keyword() {
+  local keyword=${1,,}
+  case ${keyword} in
+    challengeresponseauthentication) printf 'kbdinteractiveauthentication\n' ;;
+    *) printf '%s\n' "${keyword}" ;;
+  esac
 }
 
 _sshd_canonical_value() {
@@ -784,10 +812,31 @@ _sshd_candidate_takes_effect() {
 # and everything is read beneath the sysroot so a test sees the tree it
 # set up rather than the one this process is running on.
 declare -gA _SSHD_SEEN=()
+declare -g _SSHD_ROOT=''
+declare -g _SSHD_LITERAL=''
 
+# root is the sysroot every path is read beneath; literal names a prefix
+# whose paths are already resolved (the scratch tree an assembled
+# configuration lives in) and must not be rooted a second time.
 _sshd_config_directives() {
   _SSHD_SEEN=()
+  _SSHD_ROOT=${2-$(sysroot)}
+  _SSHD_LITERAL=${3:-}
   _sshd_emit_directives "$1" ''
+}
+
+_sshd_resolve_include() {
+  local operand=$1
+  [[ ${operand} == /* ]] || operand="/etc/ssh/${operand}"
+  if [[ -n ${_SSHD_LITERAL} && ${operand} == "${_SSHD_LITERAL}"* ]]; then
+    printf '%s\n' "${operand}"
+    return 0
+  fi
+  if [[ -n ${_SSHD_ROOT} && ${operand} == "${_SSHD_ROOT}"/* ]]; then
+    printf '%s\n' "${operand}"
+    return 0
+  fi
+  printf '%s\n' "${_SSHD_ROOT}${operand}"
 }
 
 _sshd_emit_directives() {
@@ -799,10 +848,7 @@ _sshd_emit_directives() {
   [[ -n ${_SSHD_SEEN[${real}]+set} ]] && return 0
   _SSHD_SEEN[${real}]=1
 
-  local root
-  root=$(sysroot)
-
-  local line keyword value operand target
+  local line keyword value operand resolved target
   while IFS= read -r line || [[ -n ${line} ]]; do
     line=${line#"${line%%[![:space:]]*}"}
     [[ -z ${line} || ${line} == '#'* ]] && continue
@@ -813,11 +859,11 @@ _sshd_emit_directives() {
     case ${keyword,,} in
       include)
         for operand in ${value}; do
-          [[ ${operand} == /* ]] || operand="/etc/ssh/${operand}"
+          resolved=$(_sshd_resolve_include "${operand}")
           # Word splitting and globbing are what resolve the pattern sshd
           # would resolve; the operand came from a configuration file this
           # host already reads.
-          for target in ${root}${operand}; do
+          for target in ${resolved}; do
             [[ -f ${target} ]] || continue
             _sshd_emit_directives "${target}" "${criteria}"
           done
@@ -861,7 +907,7 @@ _sshd_conditional_overrides() {
     value=${line#"${keyword}"}
     value=${value#"${value%%[![:space:]]*}"}
     [[ -n ${value} ]] || continue
-    wanted["${keyword,,}"]=$(_sshd_canonical_value "${value}")
+    wanted[$(_sshd_canonical_keyword "${keyword}")]=$(_sshd_canonical_value "${value}")
   done <"${candidate}"
   [[ ${#wanted[@]} -gt 0 ]] || return 0
   [[ -f ${main} ]] || return 0
@@ -869,11 +915,12 @@ _sshd_conditional_overrides() {
   local criteria file
   while IFS=$'\x1f' read -r file criteria keyword value; do
     [[ -n ${criteria} ]] || continue
+    keyword=$(_sshd_canonical_keyword "${keyword}")
     [[ -n ${wanted[${keyword}]+set} ]] || continue
     [[ $(_sshd_canonical_value "${value}") == "${wanted[${keyword}]}" ]] && continue
     log_error "${file} sets ${keyword} to '${value}' under 'Match ${criteria}', contradicting this file; resolve that before hardening."
     return 1
-  done < <(_sshd_config_directives "${main}")
+  done < <(_sshd_config_directives "${main}" "$(sysroot)" "$(dirname -- "${main}")")
 }
 
 # Validators receive the candidate and the path it is destined for, and
@@ -913,7 +960,10 @@ validate_sshd_config() {
   fi
 
   _sshd_candidate_takes_effect "${binary}" "${candidate}" "${effective}" || return 1
-  _sshd_conditional_overrides "${candidate}" "$(sysroot)/etc/ssh/sshd_config"
+  # The assembled configuration, not the installed one: a managed fragment
+  # that drifted into a conflicting Match block is replaced by the
+  # candidate, and rereading the obsolete file would refuse the repair.
+  _sshd_conditional_overrides "${candidate}" "${effective}"
 }
 
 validate_sudoers_file() {
@@ -928,16 +978,36 @@ validate_sudoers_file() {
 
 # ifupdown2 will refuse a description it cannot parse, and it refuses it at
 # the point the interfaces are being reconfigured -- which on a remote host
-# is after they have gone down. Asking ifquery first moves the refusal to a
+# is after they have gone down. Parsing it first moves the refusal to a
 # point where nothing has changed yet.
+#
+# `--syntax-check` belongs to ifreload; ifquery's `-s` is `--syntax-help`
+# and parses nothing. ifreload is therefore asked first, and ifquery's
+# documented parse-and-dump is the fallback for a build whose ifreload
+# will not take an alternate interfaces file.
 validate_interfaces_file() {
   local candidate=$1 target=${2:-$1}
+  local output
+
+  if command -v ifreload >/dev/null 2>&1; then
+    log_info "checking the network interfaces candidate for ${target}"
+    if output=$(ifreload --syntax-check -a -i "${candidate}" 2>&1); then
+      [[ -n ${output} ]] && printf '%s\n' "${output}" >&2
+      return 0
+    fi
+    if [[ ${output} != *'unrecognized arguments'* && ${output} != *'unrecognized option'* ]]; then
+      printf '%s\n' "${output}" >&2
+      return 1
+    fi
+    log_warn 'ifreload will not read an alternate interfaces file; parsing with ifquery instead'
+  fi
+
   command -v ifquery >/dev/null 2>&1 || {
-    _validator_missing ifquery 'network interfaces file'
+    _validator_missing ifreload 'network interfaces file'
     return
   }
-  log_info "checking the network interfaces candidate for ${target}"
-  run_check ifquery --syntax-check -a -i "${candidate}" >&2
+  log_info "parsing the network interfaces candidate for ${target}"
+  run_check ifquery -a -i "${candidate}" >&2
 }
 
 # Writes the candidate into a directory only root can reach, hands it to a

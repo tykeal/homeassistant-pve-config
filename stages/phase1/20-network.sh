@@ -106,16 +106,28 @@ unmanaged_stanzas() {
     current=''
   }
 
+  local keyword
   while IFS= read -r line || [[ -n ${line} ]]; do
-    local indented=0
-    [[ ${line} == [[:space:]]* ]] && indented=1
     line=${line#"${line%%[![:space:]]*}"}
     [[ -z ${line} || ${line} == '#'* ]] && continue
+    keyword=${line%%[[:space:]]*}
 
-    if [[ ${indented} -eq 1 && -n ${current} ]]; then
-      body_lines=$((body_lines + 1))
-      continue
-    fi
+    # ifupdown2 does not require a stanza's options to be indented, so
+    # indentation says nothing: anything that is not itself a top level
+    # directive belongs to the stanza above it.
+    case ${keyword} in
+      auto | allow-* | iface | mapping | source | source-directory | rename | no-scripts) ;;
+      *)
+        [[ -n ${current} ]] && body_lines=$((body_lines + 1))
+        continue
+        ;;
+    esac
+
+    # Any top level directive ends the stanza above it.
+    flush
+    body_lines=0
+    current=''
+    current_method=''
 
     # The file this stage writes sources /etc/network/interfaces.d and
     # nothing else, so any other include would be dropped with it.
@@ -128,11 +140,7 @@ unmanaged_stanzas() {
       continue
     fi
 
-    [[ ${line} == iface[[:space:]]* ]] || continue
-    flush
-    body_lines=0
-    current=''
-    current_method=''
+    [[ ${keyword} == iface ]] || continue
     read -r -a fields <<<"${line}"
     name=${fields[1]:-}
     method=${fields[3]:-}
