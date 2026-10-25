@@ -101,11 +101,12 @@ than a blank line, a `#` comment or a quoted literal assignment aborts the
 run and names the file and the line. Single and double quotes both work; a
 double quoted value may not contain anything the shell would expand.
 
-Parsing covers the load, not everything downstream. A stage interpolates
-values such as `PVE_FQDN` into the scripts it generates, so a value crafted
-to break out of its quoting there can still run as root later, when that
-script does. Treat both files as root-owned inputs from a source you trust,
-and keep them at the permissions the toolkit sets.
+Parsing covers the load. Downstream, a stage that bakes a configured value
+into a script it generates writes that value as a single-quoted assignment
+the generated script reads back as a literal, so nothing in a config file is
+ever read as shell syntax. The driver also holds `PVE_HOSTNAME` and
+`PVE_FQDN` to the DNS label rules, whatever the value came from. Keep both
+files at the permissions the toolkit sets.
 
 Name every config key `PVE_*`, in capitals, digits and underscores. The
 loader does not skip any other name: it treats the assignment as a line it
@@ -153,9 +154,9 @@ The driver resolves these keys on every run.
 
 | Key | Required | Default or derivation | Meaning |
 | --- | --- | --- | --- |
-| `PVE_HOSTNAME` | yes | the running short hostname | Short hostname for this host |
+| `PVE_HOSTNAME` | yes | the running short hostname | Short hostname for this host, as a DNS label |
 | `PVE_DOMAIN` | yes | none, so the driver asks | DNS domain for this deployment |
-| `PVE_FQDN` | yes | `PVE_HOSTNAME`.`PVE_DOMAIN`, else the resolver's answer | Fully qualified domain name |
+| `PVE_FQDN` | yes | `PVE_HOSTNAME`.`PVE_DOMAIN`, else the resolver's answer | Fully qualified domain name, starting with `PVE_HOSTNAME` |
 | `PVE_ADMIN_USERS` | yes | none, so the driver asks | Space separated admin usernames to create |
 | `PVE_ADMIN_KEY_SOURCE` | no | none | SSH public key shared by every admin: a literal `ssh-...` string, or a path to a file holding one or more keys |
 | `PVE_SUITE` | yes | `VERSION_CODENAME` from `/etc/os-release` | Debian suite for the Proxmox apt sources |
@@ -173,6 +174,12 @@ The driver resolves these keys on every run.
 Derivation of `PVE_BRIDGE_PORTS` fails when the host has no default route,
 or carries more than one. The driver then names what it found and asks,
 rather than guessing and taking the host off the network.
+
+`PVE_HOSTNAME` must be a DNS label, and `PVE_FQDN` a dotted name whose
+labels are DNS labels and whose first label is `PVE_HOSTNAME`. The driver
+checks both whatever the value came from, and names the one it refused.
+Both names reach `/etc/hosts` and a hook that root runs on every DHCP
+lease.
 
 ### Keys the stages and the example read
 

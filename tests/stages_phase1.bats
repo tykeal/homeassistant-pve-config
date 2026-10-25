@@ -318,12 +318,36 @@ iface lo inet loopback
   assert_stage_converges 20-network.sh
 }
 
-@test "20-network changes nothing under a dry run" {
-  PVE_CONFIG_DRY_RUN=1 run run_phase1_stage 20-network.sh
+# shellcheck disable=SC2016  # the payloads must stay literal
+@test "20-network generates a hook no configured name can break out of" {
+  local payload="${BATS_TEST_TMPDIR}/pwned"
+  # Everything the parser accepts today, and nothing validation lets past.
+  # The hook has to be safe on its own, because it runs as root on every
+  # lease long after the run that wrote it.
+  export PVE_FQDN="pve1.example.net'; touch ${payload}; :'"
+  export PVE_HOSTNAME='pve1`touch '"${payload}"'`'
+
+  run run_phase1_stage 20-network.sh
   [ "$status" -eq 0 ]
-  [ ! -e "${PVE_CONFIG_ROOT}/etc/network/interfaces" ]
-  [ ! -e "${PVE_CONFIG_ROOT}/etc/hosts" ]
-  [[ "$(mock_calls)" != *'apt-get install'* ]]
+  [ ! -e "${payload}" ]
+
+  local hook="${PVE_CONFIG_ROOT}/etc/dhcp/dhclient-exit-hooks.d/update-etc-hosts"
+  sh -n "${hook}"
+
+  # Running it is the real test: a name that escaped its quoting would run
+  # here, as root, the first time the bridge took a lease.
+  local scratch="${BATS_TEST_TMPDIR}/hookroot"
+  mkdir -p "${scratch}"
+  printf '127.0.0.1\tlocalhost\n' >"${scratch}/hosts"
+  sed "s#/etc/hosts#${scratch}/hosts#g" "${hook}" >"${scratch}/hook.sh"
+
+  run env reason=BOUND interface=vmbr0 new_ip_address=192.0.2.9 \
+    sh "${scratch}/hook.sh"
+  [ "$status" -eq 0 ]
+  [ ! -e "${payload}" ]
+  # The name is data: it lands in the file exactly as configured.
+  run grep -qF "${PVE_FQDN}" "${scratch}/hosts"
+  [ "$status" -eq 0 ]
 }
 
 # --- 30-pve-cluster -------------------------------------------------------
@@ -411,6 +435,21 @@ seed_mount() {
 @test "30-pve-cluster is idempotent" {
   seed_cluster
   assert_stage_converges 30-pve-cluster.sh
+}
+
+# shellcheck disable=SC2016  # the helper keeps these for /bin/sh to expand
+@test "30-pve-cluster quotes the configured wait into its helper" {
+  seed_cluster
+  run_phase1_stage 30-pve-cluster.sh
+
+  local helper="${PVE_CONFIG_ROOT}/usr/local/lib/pve-config/wait-for-ip.sh"
+  sh -n "${helper}"
+  local body
+  body=$(cat "${helper}")
+  # A configured value reaches the helper as a quoted literal and is read
+  # back as a variable, never pasted into the loop as text.
+  [[ "${body}" == *"wait_seconds='2'"* ]]
+  [[ "${body}" == *'[ "$i" -lt "$wait_seconds" ]'* ]]
 }
 
 @test "30-pve-cluster changes nothing under a dry run" {
