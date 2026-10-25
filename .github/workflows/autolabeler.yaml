@@ -1,0 +1,106 @@
+---
+# SPDX-FileCopyrightText: 2026 Andrew Grimberg <tykeal@bardicgrove.org>
+# SPDX-License-Identifier: Apache-2.0
+
+# Applies release-note labels to pull requests from their titles, using
+# the autolabeler rules in .github/release-drafter.yml.
+
+name: 'Autolabeler'
+
+# yamllint disable-line rule:truthy
+on:
+  # 'edited' is load-bearing. Every autolabeler rule in
+  # .github/release-drafter.yml matches on the pull request TITLE, so
+  # a title corrected after opening needs a fresh run to earn its
+  # label. Without it, the common sequence of opening without a
+  # Conventional Commits prefix, failing the semantic pull request
+  # check, then fixing the title, leaves the pull request unlabelled
+  # for good: no release-note category and no version increment.
+  # 'synchronize' does not cover this, firing on a push rather than on
+  # a metadata edit.
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited
+  # zizmor's dangerous-triggers audit flags pull_request_target on
+  # sight, because the usual misuse is to check out and run the pull
+  # request head with a privileged token. The job below runs no checkout
+  # and no contributor-supplied code at all; it reads the title over the
+  # API and writes labels. The trigger is still needed, because a fork
+  # pull request gets a read-only token under 'pull_request' and could
+  # never be labelled. Scoped to this one audit, with the reasoning in
+  # the job's SECURITY comment.
+  # zizmor: ignore[dangerous-triggers]
+  pull_request_target:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited
+
+permissions: {}
+
+concurrency:
+  # Keep 'github.event_name' in the group key. This workflow triggers
+  # on both 'pull_request' and 'pull_request_target' for the same pull
+  # request, so a shared group would have one lane stall the other.
+  # yamllint disable-line rule:line-length
+  group: ${{ format('al-{0}-pr-{1}', github.event_name, github.event.pull_request.number) }}
+  # DIVERGENCE FROM UPSTREAM: the lfreleng-actions/dot-github template
+  # sets 'cancel-in-progress: true' here, on the grounds that this
+  # workflow "publishes no check run that a required status check
+  # names". That is a property of the consuming repository, and it is
+  # false for us: 'Autolabel PR' is a required status check. Do not
+  # sync this block back.
+  #
+  # A cancelled run leaves a cancelled check run beside a successful
+  # one for the same head SHA, so the merge box reads "Some checks
+  # were not successful" and ruleset evaluation blocks even though the
+  # check passed. The 'edited' trigger makes the back-to-back burst
+  # that produces this common.
+  #
+  # Queue rather than replace. The default queue is 'single', which
+  # holds one pending run and cancels it when a third event arrives,
+  # so a burst still leaves a cancellation behind. 'queue: max' holds
+  # up to 100 and runs them in order. The two settings are
+  # complementary: 'queue: max' cannot be combined with
+  # 'cancel-in-progress: true', which is a validation error.
+  # Labelling takes seconds, so running every superseded event through
+  # to completion costs almost nothing.
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  autolabel:
+    name: 'Autolabel PR'
+    # Run on pull_request_target for forks, pull_request for
+    # same-repo PRs to prevent duplicate runs
+    # yamllint disable rule:line-length
+    if: >
+      (github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.fork) ||
+      (github.event_name == 'pull_request' && !github.event.pull_request.head.repo.fork)
+    # yamllint enable rule:line-length
+    # SECURITY: pull_request_target with write permissions is safe
+    # here because this job NEVER checks out, builds or executes any
+    # code from the pull request head. It runs no checkout step at
+    # all; the autolabeler action reads the pull request title and
+    # body over the GitHub API and writes labels back. There is no
+    # path by which untrusted contributor content reaches the runner.
+    permissions:
+      contents: read  # Read .github/release-drafter.yml
+      pull-requests: write  # Apply the labels; nothing else is written
+    runs-on: 'ubuntu-latest'
+    timeout-minutes: 3
+    steps:
+      # Harden the runner used by this workflow
+      # yamllint disable-line rule:line-length
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25  # v2.22.1
+        with:
+          egress-policy: 'audit'
+
+      # yamllint disable-line rule:line-length
+      - uses: release-drafter/release-drafter/autolabeler@978bb0b30c5ee8cdd332ced253758157150d43f0  # v7.10.0
+        env:
+          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"

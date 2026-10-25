@@ -1,0 +1,391 @@
+---
+# SPDX-FileCopyrightText: 2026 Andrew Grimberg <tykeal@bardicgrove.org>
+# SPDX-License-Identifier: Apache-2.0
+
+# Publishes a release from a signed semver tag push.
+#
+# ORDERING IS LOAD-BEARING. Every asset attaches while the release is
+# still a DRAFT, and promotion to published runs LAST. This repository
+# has GitHub immutable releases enabled: immutability engages at publish
+# time and locks the release and its uploaded assets irreversibly.
+# Anything not attached before 'promote-release' can never be added
+# afterwards; correcting it needs a whole new tag.
+#
+# Note also that the deliverable tarball is built here with GNU 'tar' over
+# the file list from 'git ls-files', rather than taken from GitHub's
+# /archive/refs/tags/ endpoint. GitHub generates that source archive on
+# demand, which excludes it from both immutable-release protection and the
+# release attestation, so it cannot be verified with 'gh release
+# verify-asset'. Only an explicitly uploaded asset is covered. 'git
+# archive' is not used either, for the reason given on the build step: it
+# reads the object store and would ship the unstamped version placeholder.
+#
+# This workflow deliberately does NOT use actions/attest-build-provenance
+# and holds no 'id-token'/'attestations' permission. That is the separate
+# artifact attestations feature. Immutable releases produce their own
+# release attestation on publish with no extra workflow permission.
+
+name: 'Release'
+
+# yamllint disable-line rule:truthy
+on:
+  push:
+    tags:
+      - '**'
+
+permissions: {}
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: false
+
+jobs:
+  tag-validate:
+    name: 'Validate Tag Push'
+    runs-on: 'ubuntu-latest'
+    permissions:
+      contents: write  # Create the draft release if one is missing
+    timeout-minutes: 5
+    outputs:
+      tag: "${{ steps.tag-validate.outputs.tag_name }}"
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25  # v2.22.1
+        with:
+          egress-policy: 'audit'
+
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: 'Verify pushed tag'
+        id: 'tag-validate'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/tag-validate-action@63470621b8ebc5c4fc86ebb616727dd0a7285dd9  # v1.1.7
+        with:
+          token: "${{ secrets.GITHUB_TOKEN }}"
+          require_type: 'semver'
+          reject_development: 'true'
+          require_github: 'true'
+          require_signed: 'ssh,gpg-unverifiable'
+
+      # release-drafter keeps a draft release in step with 'main', so one
+      # normally exists by the time a tag lands. Create one if it does
+      # not, because every later job attaches to a draft.
+      - name: 'Ensure draft release exists'
+        id: 'ensure-release'
+        shell: bash
+        env:
+          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          GH_REPO: "${{ github.repository }}"
+          TAG: "${{ steps.tag-validate.outputs.tag_name }}"
+        run: |
+          # Ensure draft release exists
+          if RELEASE_INFO=$(gh release view "${TAG}" \
+            --json isDraft 2>/dev/null); then
+            IS_DRAFT=$(echo "${RELEASE_INFO}" | jq -r '.isDraft')
+            if [ "${IS_DRAFT}" = "true" ]; then
+              echo "Draft release for tag ${TAG} already exists"
+            else
+              echo "Published release for tag ${TAG} already exists"
+            fi
+          else
+            echo "Creating draft release for tag ${TAG}"
+            gh release create "${TAG}" \
+              --draft \
+              --title "Release ${TAG}" \
+              --notes "Automated release for ${TAG}"
+          fi
+
+  build-tarball:
+    name: 'Build Release Tarball'
+    needs: 'tag-validate'
+    runs-on: 'ubuntu-latest'
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25  # v2.22.1
+        with:
+          egress-policy: 'audit'
+
+      - name: 'Checkout tagged commit'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: "${{ needs.tag-validate.outputs.tag }}"
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: 'Build reproducible source tarball'
+        id: 'build'
+        shell: bash
+        env:
+          TAG: "${{ needs.tag-validate.outputs.tag }}"
+        run: |
+          # Build reproducible source tarball
+          set -euo pipefail
+
+          # Tag v1.2.3 carries version 1.2.3, mirroring rental-control's
+          # tag-pattern of 'v(?P<version>.*)'.
+          VERSION="${TAG#v}"
+          ASSET="pve-config-${TAG}.tar.gz"
+          PREFIX="pve-config-${TAG}"
+
+          # Stamp the version into the working tree. The committed tree
+          # always reads 0.0.0; only the released artefact carries a real
+          # version. The anchor on '^PVE_CONFIG_VERSION=' keeps the
+          # substitution from reaching anything else in the file.
+          sed -i "s|^PVE_CONFIG_VERSION=.*|PVE_CONFIG_VERSION='${VERSION}'|" \
+            lib/version.sh
+
+          # Verify the rewrite landed. Immutable releases cannot be
+          # amended, so a tarball that silently shipped 0.0.0 could never
+          # be corrected in place; fail the job loudly instead.
+          STAMPED=$(sed -n "s|^PVE_CONFIG_VERSION='\\(.*\\)'$|\\1|p" \
+            lib/version.sh)
+          if [ "${STAMPED}" != "${VERSION}" ]; then
+            echo "::error::version stamp failed: lib/version.sh reads" \
+              "'${STAMPED}', expected '${VERSION}'"
+            exit 1
+          fi
+          echo "lib/version.sh stamped with ${STAMPED}"
+
+          mkdir -p dist
+
+          # 'tar' rather than 'git archive'. DO NOT switch this back:
+          # git archive exports from the object store and would ship the
+          # committed 0.0.0 placeholder, ignoring the sed above
+          # entirely. The file list still comes from git, so the archive
+          # holds exactly the tracked tree and nothing the runner left
+          # lying around.
+          #
+          # The whole tracked tree ships, tests and CI configuration
+          # included: this is a source distribution an operator may want
+          # to read and re-run the suite against before trusting it on a
+          # hypervisor.
+          #
+          # Determinism has to be arranged by hand, since the working
+          # tree carries the runner's own timestamps and ownership:
+          #   --sort=name          fixed member order
+          #   --mtime              the tagged commit's committer date
+          #   --owner/--group/     fixed ownership, never the runner's
+          #     --numeric-owner
+          #   --transform          single pve-config-<tag>/ top level
+          #   --no-recursion       take the git list literally
+          #
+          # gzip -n is the other half: without it gzip embeds the current
+          # wall-clock time and the input filename in the gzip header, so
+          # two builds of an identical tar would differ byte for byte.
+          MTIME=$(git log -1 --format=%cI "${TAG}")
+          echo "Archive mtime: ${MTIME}"
+
+          git ls-files -z \
+            | LC_ALL=C sort -z \
+            | tar \
+                --sort=name \
+                --mtime="${MTIME}" \
+                --owner=0 --group=0 --numeric-owner \
+                --transform="s|^|${PREFIX}/|" \
+                --no-recursion \
+                --null --files-from=- \
+                -cf - \
+            | gzip -n -9 > "dist/${ASSET}"
+
+          # Generate the checksum from INSIDE dist/ so the filename
+          # column holds a bare filename with no directory component.
+          # 'sha256sum -c' resolves that column relative to the
+          # consumer's current directory, so a path prefix here (for
+          # example 'dist/pve-config-v1.0.0.tar.gz') makes verification
+          # fail on their side with "No such file or directory".
+          cd dist
+          sha256sum "${ASSET}" > "${ASSET}.sha256"
+
+          echo "asset=${ASSET}" >> "${GITHUB_OUTPUT}"
+
+          {
+            echo "## Release artefact"
+            echo
+            echo "| Item | Value |"
+            echo "| ---- | ----- |"
+            echo "| Tag | \`${TAG}\` |"
+            echo "| Version | \`${VERSION}\` |"
+            echo "| Asset | \`${ASSET}\` |"
+            echo "| Size | \`$(stat -c '%s' "${ASSET}")\` bytes |"
+            echo
+            echo '### Checksum'
+            echo
+            echo '```text'
+            cat "${ASSET}.sha256"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: 'Verify tarball contents and checksum'
+        shell: bash
+        env:
+          ASSET: "${{ steps.build.outputs.asset }}"
+          TAG: "${{ needs.tag-validate.outputs.tag }}"
+        run: |
+          # Verify tarball contents and checksum
+          set -euo pipefail
+          cd dist
+
+          # The checksum file must round-trip exactly as a consumer
+          # would use it: from the directory holding the tarball, with
+          # no path in the filename column.
+          sha256sum -c "${ASSET}.sha256"
+
+          # Exactly one top-level directory, and the stamped version
+          # survives into the archive.
+          TOPLEVEL=$(tar tzf "${ASSET}" \
+            | cut -d/ -f1 | sort -u)
+          if [ "${TOPLEVEL}" != "pve-config-${TAG}" ]; then
+            echo "::error::unexpected top level in ${ASSET}: ${TOPLEVEL}"
+            exit 1
+          fi
+          tar xzOf "${ASSET}" "pve-config-${TAG}/lib/version.sh" \
+            | grep -q "^PVE_CONFIG_VERSION='${TAG#v}'$"
+
+      - name: 'Upload tarball artefact'
+        # yamllint disable-line rule:line-length
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: 'release-tarball'
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          retention-days: 45
+          if-no-files-found: 'error'
+
+  attach-artefacts:
+    name: 'Attach Artefacts to Release'
+    runs-on: 'ubuntu-latest'
+    needs:
+      - 'tag-validate'
+      - 'build-tarball'
+    permissions:
+      contents: write  # Upload assets to the draft release
+    timeout-minutes: 5
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25  # v2.22.1
+        with:
+          egress-policy: 'audit'
+
+      - name: '⬇ Download tarball artefact'
+        # yamllint disable-line rule:line-length
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: 'release-tarball'
+          path: 'release-assets'
+
+      # The upload below runs with deny_overwrite: false, which deletes an
+      # existing asset of the same name before re-uploading. That is only
+      # ever acceptable against a DRAFT. Check it here and fail closed:
+      # replacing an asset on a published release would both be refused by
+      # immutability and destroy the guarantee this pipeline exists to
+      # provide.
+      - name: 'Require the release to still be a draft'
+        shell: bash
+        env:
+          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          GH_REPO: "${{ github.repository }}"
+          TAG: "${{ needs.tag-validate.outputs.tag }}"
+        run: |
+          # Require the release to still be a draft
+          set -euo pipefail
+          IS_DRAFT=$(gh release view "${TAG}" --json isDraft --jq '.isDraft')
+          if [ "${IS_DRAFT}" != 'true' ]; then
+            echo "::error::Release ${TAG} is already published." \
+              "A published release is immutable and cannot be amended;" \
+              "ship the correction under a new tag instead."
+            exit 1
+          fi
+          echo "Release ${TAG} is still a draft; attaching assets."
+
+      # Attaches to the DRAFT release. Both the tarball and its checksum
+      # must land here, before promote-release publishes and immutability
+      # locks the asset list.
+      - name: 'Attach artefacts to release'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/release-assets-action@51e2955cf9aeab3731efd7cc4605aa2847e7d8e2  # v0.1.3
+        with:
+          asset_paths: '["release-assets/**"]'
+          release_tag: "${{ needs.tag-validate.outputs.tag }}"
+          # The action uploads sequentially. With the default
+          # deny_overwrite: true, a run that attached the tarball and then
+          # failed on the checksum can never be retried: the re-run dies on
+          # the asset already present and never reaches the missing one,
+          # wedging the release in draft with a partial asset set. Allowing
+          # the overwrite (the action deletes then re-uploads) makes a
+          # re-run self-healing. The draft check above is what keeps this
+          # safe.
+          deny_overwrite: 'false'
+
+  promote-release:
+    name: 'Promote Draft Release'
+    needs:
+      - 'tag-validate'
+      - 'attach-artefacts'
+    runs-on: 'ubuntu-latest'
+    permissions:
+      contents: write  # Publish the draft release
+    timeout-minutes: 2
+    outputs:
+      # yamllint disable-line rule:line-length
+      release_url: "${{ steps.promote-release.outputs.release_url || steps.set-promoted-url.outputs.release_url }}"
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25  # v2.22.1
+        with:
+          egress-policy: 'audit'
+
+      - name: 'Check if release is already promoted'
+        id: 'check-promoted'
+        shell: bash
+        env:
+          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          GH_REPO: "${{ github.repository }}"
+          TAG: "${{ needs.tag-validate.outputs.tag }}"
+        run: |
+          # Check if release is already promoted
+          if gh release view "${TAG}" --json isDraft --jq '.isDraft' \
+              2>/dev/null | grep -q "false"; then
+            echo "Release ${TAG} is already promoted"
+            echo "already_promoted=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "Release ${TAG} is draft, proceeding"
+            echo "already_promoted=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      # Publishing is the point of no return: the release and every
+      # attached asset become immutable here.
+      - name: 'Promote draft release'
+        id: 'promote-release'
+        if: steps.check-promoted.outputs.already_promoted == 'false'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/draft-release-promote-action@3959dd702aab09b2885a68e57f6608003a6aa2bd  # v0.1.6
+        with:
+          token: "${{ secrets.GITHUB_TOKEN }}"
+          tag: "${{ needs.tag-validate.outputs.tag }}"
+          latest: true
+
+      - name: 'Set release URL for already promoted release'
+        id: 'set-promoted-url'
+        if: steps.check-promoted.outputs.already_promoted == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          GH_REPO: "${{ github.repository }}"
+          TAG: "${{ needs.tag-validate.outputs.tag }}"
+        run: |
+          # Set release URL for already promoted release
+          RELEASE_URL=$(gh release view "${TAG}" \
+            --json url --jq '.url')
+          echo "release_url=${RELEASE_URL}" >> "${GITHUB_OUTPUT}"

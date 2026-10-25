@@ -1,0 +1,49 @@
+---
+# SPDX-FileCopyrightText: 2026 Andrew Grimberg <tykeal@bardicgrove.org>
+# SPDX-License-Identifier: Apache-2.0
+
+# Keeps a draft release for the next version in step with what lands on
+# 'main'. It only ever DRAFTS. Publishing happens in release.yaml, from a
+# signed tag push.
+#
+# That split matters because this repository has GitHub immutable
+# releases enabled. Immutability engages at PUBLISH time and locks the
+# release and its uploaded assets irreversibly. A draft stays freely
+# amendable, so release-drafter can rewrite its notes on every merge
+# without ever touching a locked release.
+
+name: 'Release Drafter'
+
+# yamllint disable-line rule:truthy
+on:
+  push:
+    branches:
+      - main
+
+permissions: {}
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  update_release_draft:
+    name: 'Update Release Draft'
+    permissions:
+      contents: write  # Create and amend the draft release
+      pull-requests: read  # Read merged PR titles for the notes
+    runs-on: 'ubuntu-latest'
+    timeout-minutes: 3
+    steps:
+      # Harden the runner used by this workflow
+      # yamllint disable-line rule:line-length
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25  # v2.22.1
+        with:
+          egress-policy: 'audit'
+
+      # Reads .github/release-drafter.yml. With no 'publish' input the
+      # action leaves the release as a draft, which is what we want.
+      # yamllint disable-line rule:line-length
+      - uses: release-drafter/release-drafter@978bb0b30c5ee8cdd332ced253758157150d43f0  # v7.10.0
+        env:
+          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
