@@ -97,6 +97,112 @@ jobs:
             exit 1
           fi
           echo "Imported ${IMPORTED} signer key(s)"
+          # Signed tag 'v0.1.0' failed this workflow with "Key Type:
+          # INVALID (corrupted/tampered)" while the tag itself was
+          # perfectly valid. The copy of key 3360FFB703A9DA1F published
+          # on GitHub still carried expiry 2023-01-13 for signing subkey
+          # 0407AC67BA3CEF01, even though the owner had extended it
+          # locally to 2028-01-20 and never re-uploaded the refreshed
+          # export. The runner therefore imported expired key material,
+          # 'git verify-tag' reported EXPKEYSIG rather than GOODSIG, and
+          # tag-validate (which has no EXPKEYSIG branch) fell through to
+          # type 'invalid'. Keep the check below: it is the only place
+          # the real cause is still visible, and without it the next
+          # occurrence again points maintainers at the signature instead
+          # of at the key.
+          #
+          # It speaks up only for EXPKEYSIG and REVKEYSIG, the two
+          # statuses where the signature is cryptographically sound but
+          # the key is unusable, and it fails the job deliberately. That
+          # is fail-closed on purpose and changes no outcome: with
+          # 'require_signed: ssh,gpg' the validator classifies both
+          # statuses as 'invalid' and neither can ever pass. Exiting
+          # here replaces a misleading verdict with an accurate one, and
+          # keeping the exit avoids a latent fail-open path should that
+          # classification ever change. GOODSIG, BADSIG, ERRSIG, SSH
+          # signatures and anything unrecognised fall through in silence
+          # so that 'Verify pushed tag' below renders the verdict. In
+          # particular an SSH-signed tag, which 'require_signed:
+          # ssh,gpg' accepts, is none of this step's business.
+          TAG_STATUS=''
+          if [ "$(git cat-file -t "refs/tags/${GITHUB_REF_NAME}" \
+            2>/dev/null || true)" = 'tag' ]; then
+            # 'git verify-tag' exits non-zero for an expired or revoked
+            # key, which is precisely the case of interest, so the exit
+            # status is tolerated here and the GnuPG status lines on
+            # stderr are read instead. Real failures are not masked:
+            # every status other than the two handled below is ignored
+            # and left to the validator.
+            TAG_STATUS=$(git verify-tag --raw \
+              "refs/tags/${GITHUB_REF_NAME}" 2>&1 >/dev/null || true)
+          else
+            echo "No annotated tag object for ${GITHUB_REF_NAME};" \
+              'skipping signing-key diagnostics'
+          fi
+          SIG_KEY=$(printf '%s\n' "${TAG_STATUS}" \
+            | awk '/^\[GNUPG:\] (EXPKEYSIG|REVKEYSIG) /{print $3; exit}')
+          case "${TAG_STATUS}" in
+            *'[GNUPG:] EXPKEYSIG '*)
+              # The status lines were captured into TAG_STATUS, so they
+              # reach no log by default; print them for debugging.
+              printf 'git verify-tag status lines:\n%s\n' "${TAG_STATUS}"
+              # Status identifiers may be a long key ID or a
+              # fingerprint, so correlate on the 'fpr' record (field 10)
+              # as well as field 5. An unresolved date degrades to
+              # 'an unknown date'; the error is still reported.
+              EXPIRES=$(gpg --batch --list-keys --with-colons \
+                "${SIG_KEY}" | awk -F: -v k="${SIG_KEY}" '
+                  $1 == "pub" || $1 == "sub" {
+                    expiry = $7
+                    if ($5 == k) { print expiry; exit }
+                  }
+                  $1 == "fpr" && $10 == k { print expiry; exit }')
+              WHEN='an unknown date'
+              if [ -n "${EXPIRES:-}" ]; then
+                WHEN=$(date -u -d "@${EXPIRES}" '+%Y-%m-%d')
+              fi
+              msg="the public key material imported for ${GITHUB_REF_NAME}"
+              msg="${msg} is EXPIRED. The tag signature itself verified"
+              msg="${msg} cryptographically; key ${SIG_KEY} expired on"
+              msg="${msg} ${WHEN}."
+              echo "::error::${msg}"
+              fix='likely cause: the copy of the key published on GitHub'
+              fix="${fix} is stale. Extending an expiry in a local keyring"
+              fix="${fix} does not update it. The signer must re-export"
+              fix="${fix} the refreshed public key ('gpg --armor --export"
+              fix="${fix} <fingerprint>') and re-upload it at"
+              fix="${fix} https://github.com/settings/keys. If the key was"
+              fix="${fix} not extended at all, extend it first."
+              echo "::error::${fix}"
+              why='left unfixed, gpg reports EXPKEYSIG instead of GOODSIG'
+              why="${why} and the 'Verify pushed tag' step below"
+              why="${why} misreports this valid signature as 'invalid' /"
+              why="${why} 'corrupted/tampered'."
+              echo "::error::${why}"
+              exit 1
+              ;;
+            *'[GNUPG:] REVKEYSIG '*)
+              printf 'git verify-tag status lines:\n%s\n' "${TAG_STATUS}"
+              msg="the key that signed ${GITHUB_REF_NAME} has been"
+              msg="${msg} REVOKED. The tag signature itself verified"
+              msg="${msg} cryptographically, but key ${SIG_KEY} is"
+              msg="${msg} revoked, so it can no longer vouch for a"
+              msg="${msg} release. This is not a stale-expiry problem and"
+              msg="${msg} re-uploading the key will not clear it."
+              echo "::error::${msg}"
+              fix='a revocation is usually deliberate. Establish whether'
+              fix="${fix} the key was compromised, then re-sign the"
+              fix="${fix} release with a current key published on GitHub"
+              fix="${fix} and push a new tag."
+              echo "::error::${fix}"
+              why='left unchecked, the step below would report this'
+              why="${why} revoked-key signature as 'invalid' /"
+              why="${why} 'corrupted/tampered', which hides the"
+              why="${why} revocation."
+              echo "::error::${why}"
+              exit 1
+              ;;
+          esac
 
       - name: 'Verify pushed tag'
         id: 'tag-validate'
