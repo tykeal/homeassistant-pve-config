@@ -76,6 +76,99 @@ _schema_hint_PVE_BRIDGE_PORTS() {
   fi
 }
 
+# --- validation -----------------------------------------------------------
+#
+# A key may declare a _schema_validate_<KEY> function. schema_resolve calls
+# it with the resolved value, whatever the value came from, so a derived
+# answer, a config file, an environment override and a prompt are all held
+# to the same rule. The function prints why it refused and returns non-zero.
+
+# A label as DNS defines it: letters, digits and interior hyphens, at most
+# 63 characters. Anything outside that set is not a legal host name, and is
+# also the only way a configured name could be read as syntax by one of the
+# scripts the stages generate around it.
+_schema_label_valid() {
+  local label=$1
+  ((${#label} >= 1 && ${#label} <= 63)) || return 1
+  [[ ${label} =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]]
+}
+
+# shellcheck disable=SC2329  # called indirectly, by name, from schema_resolve
+_schema_validate_PVE_HOSTNAME() {
+  local value=$1
+  _schema_label_valid "${value}" && return 0
+  printf 'a short hostname must be a DNS label: letters, digits and interior hyphens, 1 to 63 characters\n'
+  return 1
+}
+
+# shellcheck disable=SC2329  # called indirectly, by name, from schema_resolve
+_schema_validate_PVE_FQDN() {
+  local value=$1 label
+  local -a labels=()
+
+  if ((${#value} > 253)); then
+    printf 'a domain name may be at most 253 characters\n'
+    return 1
+  fi
+  if [[ ! ${value} =~ ^[A-Za-z0-9.-]+$ ]]; then
+    printf 'a domain name holds only letters, digits, hyphens and dots\n'
+    return 1
+  fi
+  if [[ ${value} != *.* ]]; then
+    printf 'a fully qualified name carries a domain, so it has at least one dot\n'
+    return 1
+  fi
+  # read -a drops a trailing empty field, so an edge dot has to be caught
+  # before the labels are split out.
+  if [[ ${value} == .* || ${value} == *. || ${value} == *..* ]]; then
+    printf 'a domain name has no empty label, so it neither begins nor ends with a dot\n'
+    return 1
+  fi
+
+  IFS='.' read -r -a labels <<<"${value}"
+  for label in "${labels[@]}"; do
+    if ! _schema_label_valid "${label}"; then
+      printf 'the label "%s" is not a DNS label: letters, digits and interior hyphens, 1 to 63 characters\n' \
+        "${label}"
+      return 1
+    fi
+  done
+
+  # Phase 1 writes both names into the same /etc/hosts entry and tells
+  # Proxmox about both, so a pair that disagrees names two different hosts.
+  if [[ -n ${PVE_HOSTNAME:-} && ${labels[0],,} != "${PVE_HOSTNAME,,}" ]]; then
+    printf 'it begins with "%s", but PVE_HOSTNAME is "%s"\n' \
+      "${labels[0]}" "${PVE_HOSTNAME}"
+    return 1
+  fi
+}
+
+# shellcheck disable=SC2329  # called indirectly, by name, from schema_resolve
+_schema_validate_PVE_NETWORK_WAIT_SECONDS() {
+  local value=$1
+  # The stages compare this with -lt, which evaluates its operands
+  # arithmetically, and bash evaluates an array subscript inside such an
+  # operand as code. A plain count of seconds is the only thing it may be.
+  if [[ ! ${value} =~ ^(0|[1-9][0-9]*)$ ]] || ((10#${value} > 86400)); then
+    printf 'a wait is a whole number of seconds, from 0 to 86400\n'
+    return 1
+  fi
+}
+
+# Applies a key's validator, if it declares one. Empty is left to the
+# required check, which reports a missing value far better than a validator
+# can.
+_schema_validate() {
+  local name=$1 value=$2 reason=''
+  [[ -n ${value} ]] || return 0
+  declare -F "_schema_validate_${name}" >/dev/null 2>&1 || return 0
+  reason=$("_schema_validate_${name}" "${value}") && return 0
+  if config_is_secret "${name}"; then
+    die "${name} was rejected: ${reason}"
+  fi
+  die "${name} was rejected: ${reason}. Got: ${value}"
+}
+
 # Emits the key names in declaration order.
 schema_keys() {
   schema_entries | cut -d'|' -f1
@@ -145,6 +238,7 @@ schema_resolve() {
     if [[ ${required} == yes && -z ${value} ]]; then
       missing+=("${name}")
     fi
+    _schema_validate "${name}" "${value}"
     if [[ ${secret} == yes ]]; then
       redact_register "${value}"
     fi

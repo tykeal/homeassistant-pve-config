@@ -166,16 +166,34 @@ if [[ ${#UNMANAGED[@]} -gt 0 ]]; then
   fi
 fi
 
+# --- /etc/hosts backup ----------------------------------------------------
+
+# Taken before anything on this host can touch the file. The hook installed
+# below rewrites /etc/hosts the moment the bridge takes a lease, so a backup
+# taken any later records that rewrite instead of what the operator had.
+# backup_file is a one-time operation, so a re-run leaves the first copy
+# alone and a dry run takes none at all.
+hosts_path="${SYSROOT}/etc/hosts"
+ensure_dir "${SYSROOT}/etc" 0755 >/dev/null
+backup_file "${hosts_path}" >/dev/null
+
 # --- dhclient exit hook ---------------------------------------------------
 
-# The body is a quoted heredoc so that $reason and $new_ip_address reach the
-# generated script untouched; this host's own names are substituted in
-# afterwards, which is the only expansion that should happen here.
-read -r -d '' hook <<'HOOK' || true
-#!/bin/sh
+# This host's own names are fixed at generation time, as single-quoted
+# assignments the generated script reads back as literals. Substituting them
+# into the body instead would let a value carrying a quote, a backtick or a
+# $(...) escape its quoting and run as root when the hook next fires.
+hook="#!/bin/sh
 # Managed by pve-config. Keeps /etc/hosts on whatever address the bridge is
 # leased, so that pve-cluster and the web interface agree about this node.
+pve_fqdn=$(_config_quote "${PVE_FQDN}")
+pve_short=$(_config_quote "${PVE_HOSTNAME}")
+"
 
+# The rest is a quoted heredoc so that $reason, $interface and
+# $new_ip_address reach the generated script untouched: dhclient supplies
+# those at run time, and expanding them here would bake in an empty string.
+read -r -d '' hook_body <<'HOOK' || true
 case "${reason}" in
   BOUND | RENEW | REBIND | REBOOT)
     # Only the management bridge. dhclient runs every exit hook for every
@@ -184,9 +202,9 @@ case "${reason}" in
     if [ "${interface}" = '@BRIDGE@' ] && [ -n "${new_ip_address}" ]; then
       pve_hosts_tmp=$(mktemp /etc/hosts.pve-config.XXXXXX) || pve_hosts_tmp=''
       if [ -n "${pve_hosts_tmp}" ]; then
-        grep -v "[[:space:]]@FQDN@\([[:space:]]\|$\)" /etc/hosts \
+        grep -v "[[:space:]]${pve_fqdn}\([[:space:]]\|$\)" /etc/hosts \
           >"${pve_hosts_tmp}" || true
-        printf '%s\t%s\t%s\n' "${new_ip_address}" '@FQDN@' '@SHORT@' \
+        printf '%s\t%s\t%s\n' "${new_ip_address}" "${pve_fqdn}" "${pve_short}" \
           >>"${pve_hosts_tmp}"
         cat "${pve_hosts_tmp}" >/etc/hosts
         rm -f "${pve_hosts_tmp}"
@@ -196,9 +214,7 @@ case "${reason}" in
 esac
 HOOK
 
-hook=${hook//@FQDN@/${PVE_FQDN}}
-hook=${hook//@SHORT@/${PVE_HOSTNAME}}
-hook=${hook//@BRIDGE@/${BRIDGE}}
+hook+=${hook_body//@BRIDGE@/${BRIDGE}}
 hook+=$'\n'
 
 ensure_dir "${SYSROOT}/etc/dhcp/dhclient-exit-hooks.d" 0755 >/dev/null
@@ -224,7 +240,6 @@ HAD_PREVIOUS=0
 PREVIOUS_HOSTS=''
 HAD_PREVIOUS_HOSTS=0
 ROLLBACK_ARMED=0
-hosts_path="${SYSROOT}/etc/hosts"
 
 network_rollback() {
   [[ ${ROLLBACK_ARMED} -eq 1 ]] || return 0
@@ -326,7 +341,9 @@ if [[ -z ${address} ]]; then
     die "${BRIDGE} did not take an address within ${WAIT}s; the previous network configuration has been restored."
   fi
 else
-  write_file_backup "${hosts_path}" "\
+  # The original was copied aside before the hook was installed, so this
+  # only has to write; see the backup section above.
+  write_file "${hosts_path}" "\
 127.0.0.1	localhost
 ${address}	${PVE_FQDN}	${PVE_HOSTNAME}
 ::1		ip6-localhost ip6-loopback

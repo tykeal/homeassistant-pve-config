@@ -28,20 +28,29 @@ ensure_dir "${helper_dir}" 0755 >/dev/null
 read -r -d '' helper_body <<HELPER || true
 #!/bin/sh
 # Managed by pve-config. Succeeds as soon as ${BRIDGE} holds an address that
-# /etc/hosts already knows about, and gives up quietly after ${WAIT}s so a
-# host with no lease still boots.
+# /etc/hosts already knows about, and gives up quietly once the configured
+# wait has passed so a host with no lease still boots.
+#
+# The wait is a single-quoted assignment rather than text substituted into
+# the loop, so a configured value cannot be read as shell syntax here.
+bridge='${BRIDGE}'
+wait_seconds=$(_config_quote "${WAIT}")
+HELPER
+helper_body+=$'\n'
+
+read -r -d '' helper_loop <<'HELPER' || true
 i=0
-while [ "\$i" -lt ${WAIT} ]; do
-  ip=\$(ip -4 -o addr show ${BRIDGE} 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n 1)
-  if [ -n "\$ip" ] && grep -q "^\$ip[[:space:]]" /etc/hosts; then
+while [ "$i" -lt "$wait_seconds" ]; do
+  ip=$(ip -4 -o addr show "$bridge" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n 1)
+  if [ -n "$ip" ] && grep -q "^$ip[[:space:]]" /etc/hosts; then
     exit 0
   fi
   sleep 1
-  i=\$((i + 1))
+  i=$((i + 1))
 done
 exit 0
 HELPER
-helper_body+=$'\n'
+helper_body+="${helper_loop}"$'\n'
 
 helper_state=$(write_file "${helper}" "${helper_body}" 0755)
 
