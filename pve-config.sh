@@ -10,6 +10,8 @@ PVE_CONFIG_LIB_DIR=${PVE_CONFIG_LIB_DIR:-${PVE_CONFIG_SCRIPT_DIR}/lib}
 
 # shellcheck source=lib/common.sh
 source "${PVE_CONFIG_LIB_DIR}/common.sh"
+# shellcheck source=lib/version.sh
+source "${PVE_CONFIG_LIB_DIR}/version.sh"
 # shellcheck source=lib/config.sh
 source "${PVE_CONFIG_LIB_DIR}/config.sh"
 # shellcheck source=lib/detect.sh
@@ -52,12 +54,20 @@ Options:
   --config PATH          Use an alternate configuration file
   --non-interactive      Never prompt; fail if a required value is missing
   -h, --help             Show this help
+      --version          Print the toolkit version and exit
 
 Files:
   pve-config.conf        Generated configuration, reused on later runs
   secrets.env            Generated secrets, mode 600, never committed
   state/                 Per-stage completion markers
 EOF
+}
+
+# Reported by --version, and recorded into the state directory on every run
+# that touches the host. The committed tree reads 0.0.0; a release tarball
+# carries the tag it was built from.
+version() {
+  printf 'pve-config %s\n' "${PVE_CONFIG_VERSION:-unknown}"
 }
 
 stages_dir() {
@@ -429,6 +439,10 @@ main() {
         usage
         return 0
         ;;
+      --version)
+        version
+        return 0
+        ;;
       *) die "Unknown option: $1" ;;
     esac
     shift
@@ -518,6 +532,10 @@ main() {
   secrets_load "${secrets_path}"
   preflight "${config_path}" "${secrets_path}"
   export_runtime
+
+  # Stamp the configuring version before any stage runs, so a run that
+  # fails part way still leaves the host saying what was driving it.
+  state_record_version
 
   run_stages "${selected[@]}" || die 'Aborting; fix the failure above and re-run.'
 

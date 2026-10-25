@@ -18,7 +18,10 @@ PVE_CONFIG_DIR=${PVE_CONFIG_DIR:-/root/pve-config}
 # Only the code is replaced on an upgrade. Anything the operator or an
 # earlier run produced is carried across untouched.
 BOOTSTRAP_CODE_PATHS=(pve-config.sh bootstrap.sh lib stages examples)
-BOOTSTRAP_REQUIRED_PATHS=(pve-config.sh bootstrap.sh lib/common.sh lib/config.sh lib/detect.sh lib/state.sh lib/schema.sh)
+# Every library the driver sources unconditionally. A tree missing one of
+# these installs cleanly and then fails on the first run, which is what the
+# guard exists to catch before the swap.
+BOOTSTRAP_REQUIRED_PATHS=(pve-config.sh bootstrap.sh lib/common.sh lib/version.sh lib/config.sh lib/detect.sh lib/state.sh lib/schema.sh)
 # keys/ is an operator input the example config points at, so an upgrade
 # must carry it across like any other generated file.
 BOOTSTRAP_PRESERVE_PATHS=(pve-config.conf secrets.env state keys)

@@ -130,3 +130,15 @@ strict() {
     [ "$status" -eq 0 ]
   done < <(find "${REPO_ROOT}" -name '.git' -prune -o -type f -name '*.sh' -print)
 }
+
+@test "version recording survives strict mode" {
+  run strict "
+    source '${REPO_ROOT}/lib/version.sh'
+    source '${REPO_ROOT}/lib/version.sh'
+    state_record_version
+    state_record_version
+    state_recorded_version
+  "
+  [ "$status" -eq 0 ]
+  [ "$output" = '0.0.0' ]
+}

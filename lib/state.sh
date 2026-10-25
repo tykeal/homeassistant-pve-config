@@ -44,6 +44,33 @@ state_mark_done() {
   write_file "${marker}" "${content}" 0644 >/dev/null
 }
 
+# Which version of the toolkit last configured this host. Markers say what
+# ran; this says what it was. An operator looking at a host months later
+# can tell which release produced its state.
+#
+# It sits beside the markers rather than under $(sysroot), because the
+# whole state directory does: state_dir() is rooted at the install
+# directory, not at an absolute system path.
+_version_marker() {
+  printf '%s/version\n' "$(state_dir)"
+}
+
+state_record_version() {
+  local content
+  printf -v content '%s\n' "${PVE_CONFIG_VERSION:-unknown}"
+  # write_file reports "would write" and changes nothing on a dry run, so
+  # the dry-run behaviour here is inherited rather than special-cased.
+  write_file "$(_version_marker)" "${content}" 0644 >/dev/null
+}
+
+state_recorded_version() {
+  local marker version
+  marker=$(_version_marker)
+  [[ -f ${marker} ]] || return 1
+  IFS= read -r version <"${marker}" || return 1
+  printf '%s\n' "${version}"
+}
+
 state_clear() {
   local id=$1 marker
   marker=$(_state_marker "${id}")

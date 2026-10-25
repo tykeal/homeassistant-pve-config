@@ -10,6 +10,8 @@ _PVE_STAGE_LIB_DIR=${PVE_CONFIG_LIB_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]
 
 # shellcheck source=lib/common.sh
 source "${_PVE_STAGE_LIB_DIR}/common.sh"
+# shellcheck source=lib/version.sh
+source "${_PVE_STAGE_LIB_DIR}/version.sh"
 # shellcheck source=lib/config.sh
 source "${_PVE_STAGE_LIB_DIR}/config.sh"
 # shellcheck source=lib/detect.sh
