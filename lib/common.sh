@@ -457,6 +457,33 @@ ensure_dir() {
   fi
 }
 
+# Clears the group and other write bits and leaves every other bit alone.
+# Several things OpenSSH reads are refused outright when a path anybody
+# else can write to leads to them, and rewriting the whole mode to repair
+# that would discard whatever the operator meant by the rest of it.
+ensure_not_group_other_writable() {
+  local path=$1 mode
+  if [[ ! -e ${path} ]]; then
+    # Nothing on disk yet, which under a dry run is the normal case: the
+    # directory the caller just reported it would create.
+    printf 'unchanged\n'
+    return 0
+  fi
+  mode=$(stat -c '%a' -- "${path}" 2>/dev/null) || die "Unable to read the mode of ${path}"
+  if ((8#${mode} & 8#22)); then
+    if dry_run_enabled; then
+      log_info "would clear the group and other write bits on ${path}"
+      printf 'changed\n'
+      return 0
+    fi
+    chmod go-w -- "${path}" || die "Unable to clear the write bits on ${path}"
+    log_info "cleared the group and other write bits on ${path}"
+    printf 'changed\n'
+    return 0
+  fi
+  printf 'unchanged\n'
+}
+
 remove_path() {
   local path=$1
   if [[ ! -e ${path} && ! -L ${path} ]]; then
@@ -672,10 +699,12 @@ _sshd_effective_config() {
     # here, and the check below notices that the candidate is not among
     # them instead of approving a fragment sshd would never read.
     if ! _sshd_includes_candidate "${body}" "${conf_d}/${base}"; then
-      if dry_run_enabled; then
+      if dry_run_enabled || [[ ${PVE_CONFIG_SSHD_ASSUME_INCLUDE:-0} == 1 ]]; then
         # The caller adds the Include before installing; during a dry run it
-        # has not, so the assembled configuration stands in for the one a
-        # real run would check rather than failing on a file nothing wrote.
+        # has not, and a caller that deliberately defers the Include until
+        # the fragment has validated has not either. The assembled
+        # configuration stands in for the one sshd will read rather than
+        # failing on a file nothing has written yet.
         log_info "${host_main} does not include ${base}; an Include would be added"
         body="Include ${conf_d}/*.conf"$'\n'"${body}"
       else
@@ -741,6 +770,69 @@ _sshd_candidate_takes_effect() {
   done <"${candidate}"
 }
 
+# `sshd -T` reports the configuration as it resolves for no particular
+# connection, so a Match block is never entered and its overrides are
+# invisible to the check above. A `Match User alice` that turns password
+# authentication back on would leave this host taking passwords for alice
+# while the global dump agreed with the candidate in every respect.
+#
+# Rather than guess which contexts matter, any conditional setting that
+# disagrees with the candidate is refused: the operator is asked to resolve
+# the contradiction instead of being told the host is hardened when part of
+# it is not.
+_sshd_conditional_overrides() {
+  local candidate=$1 effective=$2
+  local conf_d
+  conf_d="$(dirname -- "${effective}")/sshd_config.d"
+
+  local -A wanted=()
+  local line keyword value
+  while IFS= read -r line || [[ -n ${line} ]]; do
+    line=${line#"${line%%[![:space:]]*}"}
+    [[ -z ${line} || ${line} == '#'* ]] && continue
+    keyword=${line%%[[:space:]]*}
+    value=${line#"${keyword}"}
+    value=${value#"${value%%[![:space:]]*}"}
+    [[ -n ${value} ]] || continue
+    wanted["${keyword,,}"]=$(_sshd_canonical_value "${value}")
+  done <"${candidate}"
+  [[ ${#wanted[@]} -gt 0 ]] || return 0
+
+  local -a files=("${effective}")
+  local existing
+  for existing in "${conf_d}"/*.conf; do
+    [[ -f ${existing} ]] && files+=("${existing}")
+  done
+
+  local file criteria in_match
+  for file in "${files[@]}"; do
+    in_match=0
+    while IFS= read -r line || [[ -n ${line} ]]; do
+      line=${line#"${line%%[![:space:]]*}"}
+      [[ -z ${line} || ${line} == '#'* ]] && continue
+      keyword=${line%%[[:space:]]*}
+      value=${line#"${keyword}"}
+      value=${value#"${value%%[![:space:]]*}"}
+      if [[ ${keyword,,} == match ]]; then
+        criteria=${value}
+        # `Match all` returns to the unconditional part of the file.
+        if [[ ${value,,} == all ]]; then
+          in_match=0
+        else
+          in_match=1
+        fi
+        continue
+      fi
+      [[ ${in_match} -eq 1 && -n ${value} ]] || continue
+      keyword=${keyword,,}
+      [[ -n ${wanted[${keyword}]+set} ]] || continue
+      [[ $(_sshd_canonical_value "${value}") == "${wanted[${keyword}]}" ]] && continue
+      log_error "${file} sets ${keyword} to '${value}' under 'Match ${criteria}', contradicting this file; resolve that before hardening."
+      return 1
+    done <"${file}"
+  done
+}
+
 # Validators receive the candidate and the path it is destined for, and
 # return non-zero when installing it would be a mistake. They never read the
 # installed file, so a dry run checks exactly what a real run would write.
@@ -777,7 +869,8 @@ validate_sshd_config() {
     fi
   fi
 
-  _sshd_candidate_takes_effect "${binary}" "${candidate}" "${effective}"
+  _sshd_candidate_takes_effect "${binary}" "${candidate}" "${effective}" || return 1
+  _sshd_conditional_overrides "${candidate}" "${effective}"
 }
 
 validate_sudoers_file() {

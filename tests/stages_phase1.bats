@@ -1070,3 +1070,62 @@ zulip_secrets() {
   run_phase1_stage 90-zulip.sh
   [[ "$(mock_calls)" == *'systemctl start -- zulip-shutdown-notify.service'* ]]
 }
+
+@test "70-ssh-sudo leaves no Include behind when validation fails" {
+  seed_admin_access
+  mkdir -p "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d"
+  printf 'Port 22\n' >"${PVE_CONFIG_ROOT}/etc/ssh/sshd_config"
+  printf 'NoSuchDirective yes\n' \
+    >"${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/10-broken.conf"
+
+  run run_phase1_stage 70-ssh-sudo.sh
+  [ "$status" -ne 0 ]
+  [ ! -e "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/99-hardening.conf" ]
+  [[ "$(cat "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config")" != *sshd_config.d* ]]
+}
+
+@test "70-ssh-sudo refuses a host that has public keys turned off" {
+  seed_admin_access
+  mkdir -p "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d"
+  printf 'PubkeyAuthentication no\nInclude /etc/ssh/sshd_config.d/*.conf\n' \
+    >"${PVE_CONFIG_ROOT}/etc/ssh/sshd_config"
+
+  run run_phase1_stage 70-ssh-sudo.sh
+  [ "$status" -ne 0 ]
+  [ ! -e "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/99-hardening.conf" ]
+}
+
+@test "70-ssh-sudo reloads again after a reload that failed" {
+  seed_admin_access
+  systemctl start ssh.service
+  run_phase1_stage 70-ssh-sudo.sh
+  printf 'pending\n' \
+    >"${PVE_CONFIG_ROOT}/var/lib/pve-config/sshd-reload-pending"
+
+  : >"${PVE_CONFIG_MOCK_LOG}"
+  run run_phase1_stage 70-ssh-sudo.sh
+  [ "$status" -eq 0 ]
+  [[ "$(mock_calls)" == *'systemctl reload -- ssh.service'* ]]
+  [ ! -e "${PVE_CONFIG_ROOT}/var/lib/pve-config/sshd-reload-pending" ]
+}
+
+@test "70-ssh-sudo adds the Include once the fragment has validated" {
+  seed_admin_access
+  mkdir -p "${PVE_CONFIG_ROOT}/etc/ssh"
+  printf 'Port 22\n' >"${PVE_CONFIG_ROOT}/etc/ssh/sshd_config"
+
+  run run_phase1_stage 70-ssh-sudo.sh
+  [ "$status" -eq 0 ]
+  [ -f "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/99-hardening.conf" ]
+  [[ "$(cat "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config")" == 'Include /etc/ssh/sshd_config.d/*.conf'* ]]
+}
+
+@test "60-admin-users makes a world writable home fit for sshd" {
+  mkdir -p "${PVE_CONFIG_ROOT}/home/alice"
+  chmod 0777 "${PVE_CONFIG_ROOT}/home/alice"
+  seed_user alice
+
+  run run_phase1_stage 60-admin-users.sh
+  [ "$status" -eq 0 ]
+  [ "$(stat -c '%a' "${PVE_CONFIG_ROOT}/home/alice")" = 755 ]
+}

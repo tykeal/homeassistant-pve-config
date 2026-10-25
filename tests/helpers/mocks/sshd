@@ -29,7 +29,7 @@ done
   exit 1
 }
 
-known='Include AcceptEnv AllowGroups AllowUsers AuthorizedKeysFile ChallengeResponseAuthentication
+known='Match Include AcceptEnv AllowGroups AllowUsers AuthorizedKeysFile ChallengeResponseAuthentication
 GatewayPorts HostKey KbdInteractiveAuthentication ListenAddress LogLevel
 PasswordAuthentication PermitRootLogin Port PubkeyAuthentication Subsystem
 UsePAM X11Forwarding'
@@ -83,6 +83,12 @@ dump_file() {
         done
       done
       continue
+    fi
+    # Without -C the real binary never enters a conditional block, so
+    # nothing after one is part of the dump.
+    if [[ ${keyword,,} == match ]]; then
+      [[ ${rest,,} == all ]] && continue
+      return 0
     fi
     lower=${keyword,,}
     [[ -n ${resolved[${lower}]+set} ]] && continue

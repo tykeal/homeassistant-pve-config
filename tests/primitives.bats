@@ -436,6 +436,70 @@ setup() {
   [[ "$output" == *'does not include'* ]]
 }
 
+@test "install_validated refuses a conditional block that undoes the fragment" {
+  mkdir -p "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d"
+  printf 'Include %s/etc/ssh/sshd_config.d/*.conf\nPort 22\nMatch User alice\n    PasswordAuthentication yes\n' \
+    "${PVE_CONFIG_ROOT}" >"${PVE_CONFIG_ROOT}/etc/ssh/sshd_config"
+
+  local target="${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/99-hardening.conf"
+  run install_validated "${target}" 'PasswordAuthentication no
+' 0644 validate_sshd_config
+
+  [ "$status" -ne 0 ]
+  [ ! -e "${target}" ]
+  [[ "$output" == *'Match User alice'* ]]
+}
+
+@test "install_validated accepts a conditional block about something else" {
+  mkdir -p "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d"
+  printf 'Include %s/etc/ssh/sshd_config.d/*.conf\nPort 22\nMatch User backup\n    X11Forwarding yes\n' \
+    "${PVE_CONFIG_ROOT}" >"${PVE_CONFIG_ROOT}/etc/ssh/sshd_config"
+
+  local target="${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/99-hardening.conf"
+  run install_validated "${target}" 'PasswordAuthentication no
+' 0644 validate_sshd_config
+
+  [ "$status" -eq 0 ]
+  [ -f "${target}" ]
+}
+
+@test "install_validated assembles the Include a caller has yet to add" {
+  mkdir -p "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d"
+  printf 'Port 22\n' >"${PVE_CONFIG_ROOT}/etc/ssh/sshd_config"
+
+  local target="${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/99-hardening.conf"
+  PVE_CONFIG_SSHD_ASSUME_INCLUDE=1 run install_validated "${target}" 'PasswordAuthentication no
+' 0644 validate_sshd_config
+
+  [ "$status" -eq 0 ]
+  [ -f "${target}" ]
+}
+
+@test "ensure_not_group_other_writable clears only the write bits" {
+  local dir="${PVE_CONFIG_ROOT}/home/alice"
+  mkdir -p "${dir}"
+  chmod 2775 "${dir}"
+
+  local verdict
+  verdict=$(ensure_not_group_other_writable "${dir}" 2>/dev/null)
+  [ "${verdict}" = changed ]
+  [ "$(stat -c '%a' "${dir}")" = 2755 ]
+
+  verdict=$(ensure_not_group_other_writable "${dir}" 2>/dev/null)
+  [ "${verdict}" = unchanged ]
+}
+
+@test "ensure_not_group_other_writable changes nothing under a dry run" {
+  local dir="${PVE_CONFIG_ROOT}/home/alice"
+  mkdir -p "${dir}"
+  chmod 0777 "${dir}"
+
+  local verdict
+  verdict=$(PVE_CONFIG_DRY_RUN=1 ensure_not_group_other_writable "${dir}" 2>/dev/null)
+  [ "${verdict}" = changed ]
+  [ "$(stat -c '%a' "${dir}")" = 777 ]
+}
+
 # --- node identity --------------------------------------------------------
 
 mark_pmxcfs() {

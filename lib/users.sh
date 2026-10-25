@@ -162,6 +162,14 @@ authorized_keys_install() {
   if [[ ${state} == changed ]]; then
     changed=1
   fi
+  # StrictModes, which is on by default, makes sshd ignore authorized_keys
+  # under a home anybody else can write to. The mode is otherwise left as
+  # the operator set it: only the bits that cost the administrator their
+  # login are cleared.
+  state_of state ensure_not_group_other_writable "${home}"
+  if [[ ${state} == changed ]]; then
+    changed=1
+  fi
   state_of state ensure_dir "${ssh_dir}" 0700 "${uid}" "${gid}"
   if [[ ${state} == changed ]]; then
     changed=1

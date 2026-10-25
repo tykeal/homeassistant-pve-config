@@ -64,29 +64,59 @@ fi
 # sshd only reads a fragment when the main configuration includes one, and
 # it keeps the first value it obtains. A host whose sshd_config has no
 # Include at all would take this file as validated and then never read it.
+#
+# The Include is added *after* the fragment has validated and installed.
+# Publishing it first would leave it behind on a validation failure, and
+# with it every other file in that directory -- including one some other
+# tool left broken -- newly live for the next sshd restart.
 sshd_main="${SYSROOT}/etc/ssh/sshd_config"
-if [[ -f ${sshd_main} ]] &&
-  ! grep -Eq '^[[:space:]]*[Ii]nclude[[:space:]]+.*sshd_config\.d' "${sshd_main}"; then
-  # Matched on sshd_config.d specifically: an Include naming some other
-  # policy file is somebody's access control and is not ours to remove.
-  ensure_exact_line "${sshd_main}" '^[[:space:]]*[Ii]nclude[[:space:]]+.*sshd_config\.d' \
-    'Include /etc/ssh/sshd_config.d/*.conf' prepend >/dev/null
+include_match='^[[:space:]]*[Ii]nclude[[:space:]]+.*sshd_config\.d'
+include_needed=0
+if [[ -f ${sshd_main} ]] && ! grep -Eq "${include_match}" "${sshd_main}"; then
+  include_needed=1
 fi
 
 hardening="# Managed by pve-config.
+PubkeyAuthentication yes
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 PermitRootLogin prohibit-password
 "
 
 ensure_dir "${SYSROOT}/etc/ssh/sshd_config.d" 0755 >/dev/null
-sshd_state=$(install_validated "${SYSROOT}/etc/ssh/sshd_config.d/99-hardening.conf" \
-  "${hardening}" 0644 validate_sshd_config)
+# The validator assembles the configuration sshd will read once the Include
+# is in place, which is not yet what is on disk.
+PVE_CONFIG_SSHD_ASSUME_INCLUDE="${include_needed}"
+sshd_state=unchanged
+state_of sshd_state install_validated \
+  "${SYSROOT}/etc/ssh/sshd_config.d/99-hardening.conf" \
+  "${hardening}" 0644 validate_sshd_config
+unset PVE_CONFIG_SSHD_ASSUME_INCLUDE
+
+include_state=unchanged
+if [[ ${include_needed} -eq 1 ]]; then
+  # Matched on sshd_config.d specifically: an Include naming some other
+  # policy file is somebody's access control and is not ours to remove.
+  state_of include_state ensure_exact_line "${sshd_main}" "${include_match}" \
+    'Include /etc/ssh/sshd_config.d/*.conf' prepend
+fi
+
+# A reload that never happened leaves the old policy running, and the next
+# run finds both files already correct and would skip it. The marker
+# outlives the failure so the retry still reloads.
+reload_marker="${SYSROOT}/var/lib/pve-config/sshd-reload-pending"
+reload_needed=0
+if [[ ${sshd_state} == changed || ${include_state} == changed || -f ${reload_marker} ]]; then
+  reload_needed=1
+fi
 
 # Reloaded, not restarted: this host is very likely being configured over
 # the connection that a restart would drop.
-if [[ ${sshd_state} == changed ]]; then
+if [[ ${reload_needed} -eq 1 ]]; then
+  ensure_dir "${SYSROOT}/var/lib/pve-config" 0755 >/dev/null
+  write_file "${reload_marker}" "pending"$'\n' 0644 >/dev/null
   service_reload ssh.service >/dev/null
+  remove_path "${reload_marker}" >/dev/null
 fi
 
 if [[ ${PVE_SUDO_SSH_AGENT:-yes} != yes ]]; then
