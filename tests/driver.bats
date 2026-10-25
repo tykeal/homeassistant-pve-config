@@ -48,6 +48,11 @@ source_driver() {
   # The release workflow stamps the real version in while it builds the
   # tarball. A real version committed here would ship inside an immutable
   # release and could never be corrected in place.
+  #
+  # The tarball ships this suite so an operator can re-run it, and that
+  # tree is correctly stamped, so the guard only applies to a git
+  # checkout. In a worktree .git is a file rather than a directory.
+  [ -e "${REPO_ROOT}/.git" ] || skip 'not a git checkout'
   run grep -c "^PVE_CONFIG_VERSION='0\.0\.0'$" "${REPO_ROOT}/lib/version.sh"
   [ "$status" -eq 0 ]
   [ "$output" -eq 1 ]

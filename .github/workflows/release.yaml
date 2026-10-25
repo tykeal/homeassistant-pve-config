@@ -36,8 +36,12 @@ on:
 permissions: {}
 
 concurrency:
-  group: "${{ github.workflow }}-${{ github.ref }}"
+  # Shared, deliberately literal, with release-drafter.yaml. See the
+  # reasoning there: both workflows write the same draft release, so they
+  # serialise rather than interleave.
+  group: 'release-draft'
   cancel-in-progress: false
+  queue: max
 
 jobs:
   tag-validate:
@@ -62,6 +66,37 @@ jobs:
           fetch-tags: true
           persist-credentials: false
 
+      # Without the signer's public key on the runner, 'git verify-tag'
+      # reports ERRSIG and the validator classifies the tag as
+      # 'gpg-unverifiable'. That classification SKIPS the GitHub key
+      # check entirely, so accepting it would quietly reduce the gate
+      # below to a check that the tag merely looks signed. Import the
+      # authorised signers' published keys first so a GPG signature is
+      # verified for real.
+      - name: 'Trust the authorised release signers'
+        shell: bash
+        env:
+          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          SIGNERS: 'tykeal'
+        run: |
+          # Trust the authorised release signers
+          set -euo pipefail
+          for signer in ${SIGNERS//,/ }; do
+            echo "Importing published GPG keys for ${signer}"
+            gh api "users/${signer}/gpg_keys" --jq '.[].raw_key // empty' \
+              | gpg --batch --import
+          done
+          # Fail closed: with no key imported every GPG signature would
+          # come back unverifiable, and the step below would reject it
+          # for the wrong reason.
+          IMPORTED=$(gpg --batch --list-keys --with-colons 2>/dev/null \
+            | grep -c '^pub:' || true)
+          if [ "${IMPORTED:-0}" -eq 0 ]; then
+            echo '::error::no signer keys imported'
+            exit 1
+          fi
+          echo "Imported ${IMPORTED} signer key(s)"
+
       - name: 'Verify pushed tag'
         id: 'tag-validate'
         # yamllint disable-line rule:line-length
@@ -70,8 +105,14 @@ jobs:
           token: "${{ secrets.GITHUB_TOKEN }}"
           require_type: 'semver'
           reject_development: 'true'
-          require_github: 'true'
-          require_signed: 'ssh,gpg-unverifiable'
+          # 'ssh,gpg' only. Both demand a signature this runner can
+          # actually verify; 'gpg-unverifiable' would not.
+          require_signed: 'ssh,gpg'
+          # require_github alone only asks that the signing key belongs
+          # to SOME GitHub account, which any collaborator able to push a
+          # tag would satisfy. Naming the owner restricts releases to the
+          # keys they publish. This implies require_github.
+          require_owner: 'tykeal'
 
       # release-drafter keeps a draft release in step with 'main', so one
       # normally exists by the time a tag lands. Create one if it does

@@ -76,11 +76,23 @@ jobs:
   autolabel:
     name: 'Autolabel PR'
     # Run on pull_request_target for forks, pull_request for
-    # same-repo PRs to prevent duplicate runs
+    # same-repo PRs to prevent duplicate runs.
+    #
+    # Dependabot is the exception. Its branches live in this repository,
+    # so they are not forks, but a 'pull_request' run raised by
+    # Dependabot gets a READ-ONLY token no matter what the job asks for,
+    # and labelling would fail. Route it through the target-event lane
+    # alongside fork pull requests, where the token is the ordinary one.
+    # 'pull_request.user.login' is used rather than 'github.actor'
+    # because an 'edited' event carries the editor as the actor.
     # yamllint disable rule:line-length
     if: >
-      (github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.fork) ||
-      (github.event_name == 'pull_request' && !github.event.pull_request.head.repo.fork)
+      (github.event_name == 'pull_request_target' &&
+        (github.event.pull_request.head.repo.fork ||
+         github.event.pull_request.user.login == 'dependabot[bot]')) ||
+      (github.event_name == 'pull_request' &&
+        !github.event.pull_request.head.repo.fork &&
+        github.event.pull_request.user.login != 'dependabot[bot]')
     # yamllint enable rule:line-length
     # SECURITY: pull_request_target with write permissions is safe
     # here because this job NEVER checks out, builds or executes any

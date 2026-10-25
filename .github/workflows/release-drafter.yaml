@@ -23,8 +23,19 @@ on:
 permissions: {}
 
 concurrency:
-  group: "${{ github.workflow }}-${{ github.ref }}"
-  cancel-in-progress: true
+  # Shared, deliberately literal, with release.yaml. Both workflows write
+  # the same draft release: this one rewrites its notes and resolved
+  # version on every merge, release.yaml attaches assets to it and
+  # publishes it. A merge landing mid-release could rename the draft out
+  # from under the tag or replace its notes with changes the tarball does
+  # not contain, so the two serialise rather than interleave.
+  group: 'release-draft'
+  # Never cancel. A cancelled drafter run leaves the draft half written,
+  # and a cancelled release run is worse. 'queue: max' holds the
+  # superseded events and runs them in order instead; drafting takes
+  # seconds, so running every one through costs almost nothing.
+  cancel-in-progress: false
+  queue: max
 
 jobs:
   update_release_draft:

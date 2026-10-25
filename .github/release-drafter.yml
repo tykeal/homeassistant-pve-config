@@ -48,6 +48,18 @@ categories:
   # replacing the deprecated top-level 'version-resolver.default'.
   - type: version-resolver
     semver-increment: patch
+# Remove configured labels a run no longer selects. Every autolabeler
+# rule below keys off the pull request TITLE, and a title corrected after
+# opening is routine here. Without syncing, a pull request opened as
+# 'Feat:' and corrected to 'Fix:' keeps its 'feature' label, so the notes
+# file it under New Features and the resolver reads a minor increment off
+# a bug fix. The 'edited' trigger in the workflow is what makes the
+# re-evaluation happen.
+#
+# The cost is that syncing also manages labels applied BY HAND: adding
+# 'breaking-change' manually to a title without '!' will not survive the
+# next edit event. Put the '!' in the title instead.
+sync-labels: true
 autolabeler:
   # Keep the '/.../i' regex literal form on every title rule. A bare
   # string compiles with only the 'g' flag, so matching stays

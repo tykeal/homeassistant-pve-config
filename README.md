@@ -514,6 +514,11 @@ workflow checks the tag signature, builds a source tarball from the tagged
 commit, attaches the tarball to the still-draft release, then promotes the
 draft to a published release.
 
+The signature check is strict: the tag must carry a GPG or SSH signature the
+workflow can verify against a key the repository owner publishes on GitHub.
+A signature it cannot verify, or one made with anybody else's key, stops the
+release before the build starts.
+
 Every release carries two assets:
 
 - `pve-config-<tag>.tar.gz` — a reproducible archive of the tagged commit,
