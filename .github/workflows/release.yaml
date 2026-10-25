@@ -113,6 +113,12 @@ jobs:
           # tag would satisfy. Naming the owner restricts releases to the
           # keys they publish. This implies require_github.
           require_owner: 'tykeal'
+          # Run the validator bundled with the pinned action SHA. The
+          # default pulls 'tag-validate' from PyPI through uvx with no
+          # version constraint, so the code enforcing this gate could
+          # change under a job holding a write-capable token without the
+          # pin here changing at all.
+          use_local_action: 'true'
 
       # release-drafter keeps a draft release in step with 'main', so one
       # normally exists by the time a tag lands. Create one if it does
@@ -159,7 +165,11 @@ jobs:
         # yamllint disable-line rule:line-length
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          ref: "${{ needs.tag-validate.outputs.tag }}"
+          # Fully qualified deliberately. An unqualified ref resolves as a
+          # branch first, so a branch sharing the tag's name would supply
+          # the tree packaged and published under a signature that never
+          # covered it.
+          ref: "refs/tags/${{ needs.tag-validate.outputs.tag }}"
           fetch-depth: 0
           fetch-tags: true
           persist-credentials: false
@@ -224,7 +234,10 @@ jobs:
           # gzip -n is the other half: without it gzip embeds the current
           # wall-clock time and the input filename in the gzip header, so
           # two builds of an identical tar would differ byte for byte.
-          MTIME=$(git log -1 --format=%cI "${TAG}")
+          # refs/tags/ for the same reason as the checkout above: a
+          # branch of the same name would otherwise win the lookup and
+          # date the archive from the wrong commit.
+          MTIME=$(git log -1 --format=%cI "refs/tags/${TAG}")
           echo "Archive mtime: ${MTIME}"
 
           git ls-files -z \
