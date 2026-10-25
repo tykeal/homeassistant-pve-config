@@ -157,10 +157,13 @@ authorized_keys_install() {
   ssh_dir="${home}/.ssh"
   file="${ssh_dir}/authorized_keys"
 
-  if [[ $(ensure_dir "${home}" '' "${uid}" "${gid}") == changed ]]; then
+  local state
+  state_of state ensure_dir "${home}" '' "${uid}" "${gid}"
+  if [[ ${state} == changed ]]; then
     changed=1
   fi
-  if [[ $(ensure_dir "${ssh_dir}" 0700 "${uid}" "${gid}") == changed ]]; then
+  state_of state ensure_dir "${ssh_dir}" 0700 "${uid}" "${gid}"
+  if [[ ${state} == changed ]]; then
     changed=1
   fi
 
@@ -169,6 +172,10 @@ authorized_keys_install() {
   if [[ -f ${file} ]]; then
     while IFS= read -r existing || [[ -n ${existing} ]]; do
       merged+="${existing}"$'\n'
+      # A commented out key is kept, but it is not an active entry: counting
+      # it as one would suppress the real key and leave the administrator
+      # without a usable login once passwords are disabled.
+      _is_comment "${existing}" && continue
       identity=$(_ssh_key_identity "${existing}") || continue
       seen["${identity}"]=1
     done <"${file}"
@@ -185,12 +192,15 @@ authorized_keys_install() {
     merged+="${wanted}"$'\n'
   done < <(_ssh_keys_normalise "${keys}")
 
-  if [[ $(write_file "${file}" "${merged}" 0600) == changed ]]; then
+  state_of state write_file "${file}" "${merged}" 0600
+  if [[ ${state} == changed ]]; then
     changed=1
   fi
-  if [[ -n ${uid} && -n ${gid} ]] && [[ -f ${file} ]] &&
-    [[ $(ensure_owner "${file}" "${uid}" "${gid}") == changed ]]; then
-    changed=1
+  if [[ -n ${uid} && -n ${gid} ]] && [[ -f ${file} ]]; then
+    state_of state ensure_owner "${file}" "${uid}" "${gid}"
+    if [[ ${state} == changed ]]; then
+      changed=1
+    fi
   fi
 
   if [[ ${changed} -eq 1 ]]; then
@@ -221,11 +231,20 @@ admin_key_source_resolve() {
 }
 
 # The admin usernames, in the order the operator listed them.
+#
+# Nothing is emitted until every name has passed: the callers read this
+# through process substitution, where mapfile cannot see a later failure, so
+# a half-written list would silently drop the administrators after the bad
+# one and still look like a success.
 admin_users() {
   local user
+  local -a names=()
   for user in ${PVE_ADMIN_USERS:-}; do
     [[ ${user} =~ ^[a-z_][a-z0-9_-]*$ ]] ||
       die "Not a usable username in PVE_ADMIN_USERS: ${user}"
+    names+=("${user}")
+  done
+  for user in ${names[@]+"${names[@]}"}; do
     printf '%s\n' "${user}"
   done
 }

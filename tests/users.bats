@@ -248,3 +248,38 @@ bob' ]
   run admin_users
   [ "$status" -ne 0 ]
 }
+
+@test "admin_users emits nothing when a later name is unusable" {
+  # mapfile cannot see a failure inside process substitution, so a list that
+  # was half emitted before the bad name would silently drop everybody after
+  # it and still look like a success.
+  export PVE_ADMIN_USERS='alice ../root bob'
+  run admin_users
+  [ "$status" -ne 0 ]
+
+  local emitted
+  emitted=$(admin_users 2>/dev/null) || true
+  [ -z "${emitted}" ]
+}
+
+@test "authorized_keys_install adds a key a commented entry only looks like" {
+  seed_user alice
+  mkdir -p "${PVE_CONFIG_ROOT}/home/alice/.ssh"
+  local file="${PVE_CONFIG_ROOT}/home/alice/.ssh/authorized_keys"
+  printf '# %s\n' "${VALID_KEY}" >"${file}"
+
+  run authorized_keys_install alice "${VALID_KEY}"
+  [ "$status" -eq 0 ]
+  [ "$(grep -c '^ssh-ed25519' "${file}")" -eq 1 ]
+  [ "$(grep -c '^# ssh-ed25519' "${file}")" -eq 1 ]
+}
+
+@test "authorized_keys_install fails rather than writing through a symlink" {
+  seed_user alice
+  mkdir -p "${PVE_CONFIG_ROOT}/home/alice/.ssh" "${PVE_CONFIG_ROOT}/elsewhere"
+  ln -s /elsewhere/keys "${PVE_CONFIG_ROOT}/home/alice/.ssh/authorized_keys"
+
+  run authorized_keys_install alice "${VALID_KEY}"
+  [ "$status" -ne 0 ]
+  [ ! -e "${PVE_CONFIG_ROOT}/elsewhere/keys" ]
+}

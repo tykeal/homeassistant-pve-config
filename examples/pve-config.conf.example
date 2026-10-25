@@ -42,6 +42,13 @@ PVE_BRIDGE_GATEWAY=''
 # network stage will not write /etc/hosts without a real address.
 PVE_NETWORK_WAIT_SECONDS='60'
 
+# The network stage owns /etc/network/interfaces and describes only lo, the
+# bridge ports and vmbr0 in it. It stops when that file also describes
+# something else -- a storage port with an address, a VLAN, a second bridge
+# -- rather than taking those networks down. Move them into
+# /etc/network/interfaces.d, or set this to yes to replace the file anyway.
+PVE_NETWORK_TAKEOVER='no'
+
 # --- Repositories ---------------------------------------------------------
 
 # Debian suite for the Proxmox apt sources. Read from VERSION_CODENAME in

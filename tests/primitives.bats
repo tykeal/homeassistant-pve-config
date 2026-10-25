@@ -405,3 +405,88 @@ setup() {
   [ "$(cat "${path}")" = 'the original' ]
   [ ! -e "${path}.pve-config.bak" ]
 }
+
+@test "install_validated refuses a fragment an earlier file overrides" {
+  # sshd keeps the first value it obtains, so a fragment that parses
+  # cleanly can still be dead weight behind something read before it.
+  mkdir -p "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d"
+  printf 'Include %s/etc/ssh/sshd_config.d/*.conf\n' \
+    "${PVE_CONFIG_ROOT}" >"${PVE_CONFIG_ROOT}/etc/ssh/sshd_config"
+  printf 'PasswordAuthentication yes\n' \
+    >"${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/50-cloud-init.conf"
+
+  local target="${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/99-hardening.conf"
+  run install_validated "${target}" 'PasswordAuthentication no
+' 0644 validate_sshd_config
+
+  [ "$status" -ne 0 ]
+  [ ! -e "${target}" ]
+}
+
+@test "install_validated refuses an sshd fragment nothing would include" {
+  mkdir -p "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d"
+  printf 'Port 22\n' >"${PVE_CONFIG_ROOT}/etc/ssh/sshd_config"
+
+  local target="${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/99-hardening.conf"
+  run install_validated "${target}" 'PasswordAuthentication no
+' 0644 validate_sshd_config
+
+  [ "$status" -ne 0 ]
+  [ ! -e "${target}" ]
+  [[ "$output" == *'no Include line'* ]]
+}
+
+# --- node identity --------------------------------------------------------
+
+mark_pmxcfs() {
+  mkdir -p "${PVE_CONFIG_MOCK_STATE}"
+  printf '%s|%s\n' "${PVE_CONFIG_ROOT}/etc/pve" fuse.pve-cluster \
+    >>"${PVE_CONFIG_MOCK_STATE}/mounts"
+}
+
+@test "pve_node_rename copies the contents when pmxcfs will not rename" {
+  # pmxcfs refuses to rename a directory with anything in it, which a real
+  # node directory always has.
+  local nodes="${PVE_CONFIG_ROOT}/etc/pve/nodes"
+  mkdir -p "${nodes}/install/qemu-server"
+  printf 'cert\n' >"${nodes}/install/pve-ssl.pem"
+  mark_pmxcfs
+
+  mkdir -p "${BATS_TEST_TMPDIR}/nomv"
+  printf '#!/usr/bin/env bash\nexit 1\n' >"${BATS_TEST_TMPDIR}/nomv/mv"
+  chmod 0755 "${BATS_TEST_TMPDIR}/nomv/mv"
+
+  PATH="${BATS_TEST_TMPDIR}/nomv:${PATH}" run pve_node_rename "${nodes}" install pve1
+  [ "$status" -eq 0 ]
+  [ ! -e "${nodes}/install" ]
+  [ -d "${nodes}/pve1/qemu-server" ]
+  [ "$(cat "${nodes}/pve1/pve-ssl.pem")" = 'cert' ]
+}
+
+@test "pve_node_rename refuses to merge into a node that appeared meanwhile" {
+  local nodes="${PVE_CONFIG_ROOT}/etc/pve/nodes"
+  mkdir -p "${nodes}/install" "${nodes}/pve1"
+  printf 'old\n' >"${nodes}/install/pve-ssl.pem"
+  printf 'live\n' >"${nodes}/pve1/pve-ssl.pem"
+  mark_pmxcfs
+
+  mkdir -p "${BATS_TEST_TMPDIR}/nomv"
+  printf '#!/usr/bin/env bash\nexit 1\n' >"${BATS_TEST_TMPDIR}/nomv/mv"
+  chmod 0755 "${BATS_TEST_TMPDIR}/nomv/mv"
+
+  PATH="${BATS_TEST_TMPDIR}/nomv:${PATH}" run pve_node_rename "${nodes}" install pve1
+  [ "$status" -ne 0 ]
+  [ "$(cat "${nodes}/pve1/pve-ssl.pem")" = 'live' ]
+  [ ! -e "${nodes}/pve1/install" ]
+}
+
+# --- platform guard -------------------------------------------------------
+
+@test "stage_require_proxmox refuses a host with no Proxmox tooling" {
+  # Deliberately against no scratch tree: the guard exists to stop a stage
+  # reconfiguring an ordinary Debian machine, and the test runner is one.
+  run env -u PVE_CONFIG_ROOT -u PVE_CONFIG_DRY_RUN \
+    bash -c 'PVE_CONFIG_LIB_DIR='"${REPO_ROOT}"'/lib source '"${REPO_ROOT}"'/lib/stage.sh'
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'does not look like a Proxmox VE host'* ]]
+}

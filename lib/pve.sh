@@ -137,9 +137,28 @@ pve_node_rename() {
   pve_cluster_is_mounted ||
     die "Refusing to rename a node directory: $(sysroot)/etc/pve is not the pve-cluster filesystem."
 
-  if ! mv -T -- "${nodes_dir}/${from}" "${nodes_dir}/${to}" 2>/dev/null; then
-    die "Unable to rename the node directory ${from} to ${to}; ${to} may have appeared in the meantime."
+  if mv -T -- "${nodes_dir}/${from}" "${nodes_dir}/${to}" 2>/dev/null; then
+    log_info "renamed the node directory ${from} to ${to}"
+    printf 'changed\n'
+    return 0
   fi
-  log_info "renamed the node directory ${from} to ${to}"
+
+  # pmxcfs is not a general purpose filesystem and will not rename a
+  # directory that has anything in it, which a real node directory always
+  # does: it holds the node's certificates and its guest configuration. The
+  # supported migration is to copy the contents across and drop the old
+  # directory, which is what the manual rename procedure amounts to.
+  log_info "pmxcfs would not rename ${from}; copying its contents to ${to} instead"
+  # Plain mkdir, not -p: if the destination turned up between the caller's
+  # check and here, this fails rather than merging the old node's files into
+  # the live one.
+  mkdir -- "${nodes_dir}/${to}" ||
+    die "Unable to create the node directory ${to}; it may have appeared in the meantime."
+  if ! (shopt -s dotglob nullglob && cp -a -- "${nodes_dir}/${from}"/* "${nodes_dir}/${to}/"); then
+    die "Unable to copy the node directory ${from} to ${to}; the host's node identity is unchanged."
+  fi
+  rm -rf -- "${nodes_dir:?}/${from}" ||
+    die "Copied ${from} to ${to} but could not remove ${from}; remove it by hand."
+  log_info "migrated the node directory ${from} to ${to}"
   printf 'changed\n'
 }

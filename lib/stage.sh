@@ -41,3 +41,24 @@ stage_require() {
       die "${key} is required but unset; re-run the driver so it can resolve the configuration."
   done
 }
+
+# Phase 1 replaces this host's networking, hostname and SSH configuration on
+# the assumption that it is a Proxmox VE node. Run against an ordinary
+# Debian machine by mistake it would get most of the way through that before
+# the first pve command failed, so the check happens before any of it.
+#
+# A dry run and a scratch tree are both exempt: neither touches the host,
+# and the tests have no Proxmox tooling at all.
+stage_require_proxmox() {
+  local marker
+  [[ -z $(sysroot) ]] || return 0
+  dry_run_enabled && return 0
+  [[ ${PVE_CONFIG_SKIP_PLATFORM_CHECK:-0} == 1 ]] && return 0
+
+  for marker in /usr/bin/pveversion /usr/bin/pvesh /usr/sbin/pvecm; do
+    [[ -x ${marker} ]] && return 0
+  done
+  die 'This does not look like a Proxmox VE host: no pveversion, pvesh or pvecm. Refusing to reconfigure it.'
+}
+
+stage_require_proxmox

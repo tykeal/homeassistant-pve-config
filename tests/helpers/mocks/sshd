@@ -10,9 +10,11 @@ source "$(dirname -- "$0")/_record"
 
 file=''
 want_test=0
+want_dump=0
 while [[ $# -gt 0 ]]; do
   case $1 in
     -t) want_test=1 ;;
+    -T) want_dump=1 ;;
     -f)
       file=$2
       shift
@@ -21,7 +23,7 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-[[ ${want_test} -eq 1 ]] || exit 0
+[[ ${want_test} -eq 1 || ${want_dump} -eq 1 ]] || exit 0
 [[ -r ${file} ]] || {
   printf 'sshd: %s: No such file\n' "${file}" >&2
   exit 1
@@ -58,6 +60,43 @@ check_file() {
     fi
   done <"${path}"
 }
+
+# Stands in for `sshd -T -f FILE`: the keyword values the assembled
+# configuration resolves to. sshd keeps the first value it obtains, and so
+# does this, because that first-wins rule is exactly what the caller is
+# checking for.
+declare -A resolved=()
+
+dump_file() {
+  local path=$1 line trimmed keyword rest glob included lower
+  while IFS= read -r line || [[ -n ${line} ]]; do
+    trimmed=${line#"${line%%[![:space:]]*}"}
+    [[ -z ${trimmed} || ${trimmed} == '#'* ]] && continue
+    keyword=${trimmed%%[[:space:]]*}
+    rest=${trimmed#"${keyword}"}
+    rest=${rest#"${rest%%[![:space:]]*}"}
+    if [[ ${keyword} == [Ii]nclude ]]; then
+      for glob in ${rest}; do
+        for included in ${glob}; do
+          [[ -r ${included} ]] || continue
+          dump_file "${included}"
+        done
+      done
+      continue
+    fi
+    lower=${keyword,,}
+    [[ -n ${resolved[${lower}]+set} ]] && continue
+    resolved[${lower}]=${rest}
+  done <"${path}"
+}
+
+if [[ ${want_dump} -eq 1 ]]; then
+  dump_file "${file}"
+  for key in "${!resolved[@]}"; do
+    printf '%s %s\n' "${key}" "${resolved[${key}]}"
+  done
+  exit 0
+fi
 
 check_file "${file}" || exit 1
 exit 0

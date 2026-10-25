@@ -77,6 +77,50 @@ interfaces+="        bridge-ports ${BRIDGE_PORTS[*]}
 interfaces_path="${SYSROOT}/etc/network/interfaces"
 ensure_dir "${SYSROOT}/etc/network" 0755 >/dev/null
 
+# Everything this stage writes describes lo, the chosen ports and vmbr0.
+# Anything else the file already held -- a storage port with an address, a
+# VLAN, a second bridge -- would be dropped, and `ifreload -a` would take
+# those networks down while vmbr0 still came up with an address, so nothing
+# later in the stage would notice the loss.
+unmanaged_stanzas() {
+  local line name method managed
+  local -a fields=()
+  [[ -f ${interfaces_path} ]] || return 0
+  while IFS= read -r line || [[ -n ${line} ]]; do
+    line=${line#"${line%%[![:space:]]*}"}
+    [[ ${line} == iface[[:space:]]* ]] || continue
+    read -r -a fields <<<"${line}"
+    name=${fields[1]:-}
+    method=${fields[3]:-}
+    [[ -n ${name} ]] || continue
+    [[ ${name} == lo || ${name} == "${BRIDGE}" ]] && continue
+    managed=0
+    for port in "${BRIDGE_PORTS[@]}"; do
+      [[ ${name} == "${port}" ]] && managed=1
+    done
+    [[ ${managed} -eq 1 ]] && continue
+    # A bare `manual` stanza for a port this host is not using describes
+    # nothing and costs nothing to drop. A method, a VLAN, an alias or
+    # another bridge or bond is somebody's configuration.
+    case ${name} in
+      vmbr* | bond* | *.* | *:*) ;;
+      *)
+        [[ ${method} == manual || -z ${method} ]] && continue
+        ;;
+    esac
+    printf '%s\n' "${name}"
+  done <"${interfaces_path}"
+}
+
+mapfile -t UNMANAGED < <(unmanaged_stanzas)
+if [[ ${#UNMANAGED[@]} -gt 0 ]]; then
+  if [[ ${PVE_NETWORK_TAKEOVER:-no} == yes ]]; then
+    log_warn "replacing ${interfaces_path}, dropping: ${UNMANAGED[*]}"
+  else
+    die "${interfaces_path} also describes ${UNMANAGED[*]}, which this stage would drop. Move them into /etc/network/interfaces.d, or set PVE_NETWORK_TAKEOVER=yes to replace the file anyway."
+  fi
+fi
+
 # --- dhclient exit hook ---------------------------------------------------
 
 # The body is a quoted heredoc so that $reason and $new_ip_address reach the
@@ -89,7 +133,10 @@ read -r -d '' hook <<'HOOK' || true
 
 case "${reason}" in
   BOUND | RENEW | REBIND | REBOOT)
-    if [ -n "${new_ip_address}" ]; then
+    # Only the management bridge. dhclient runs every exit hook for every
+    # interface it manages, so a lease on a storage or WAN port would
+    # otherwise rewrite this node's address with that port's.
+    if [ "${interface}" = '@BRIDGE@' ] && [ -n "${new_ip_address}" ]; then
       pve_hosts_tmp=$(mktemp /etc/hosts.pve-config.XXXXXX) || pve_hosts_tmp=''
       if [ -n "${pve_hosts_tmp}" ]; then
         grep -v "[[:space:]]@FQDN@\([[:space:]]\|$\)" /etc/hosts \
@@ -106,6 +153,7 @@ HOOK
 
 hook=${hook//@FQDN@/${PVE_FQDN}}
 hook=${hook//@SHORT@/${PVE_HOSTNAME}}
+hook=${hook//@BRIDGE@/${BRIDGE}}
 hook+=$'\n'
 
 ensure_dir "${SYSROOT}/etc/dhcp/dhclient-exit-hooks.d" 0755 >/dev/null
@@ -128,7 +176,10 @@ network_reload() {
 # machine.
 PREVIOUS_BODY=''
 HAD_PREVIOUS=0
+PREVIOUS_HOSTS=''
+HAD_PREVIOUS_HOSTS=0
 ROLLBACK_ARMED=0
+hosts_path="${SYSROOT}/etc/hosts"
 
 network_rollback() {
   [[ ${ROLLBACK_ARMED} -eq 1 ]] || return 0
@@ -138,6 +189,15 @@ network_rollback() {
     _atomic_install "${interfaces_path}" "${PREVIOUS_BODY}" 0644
   else
     rm -f -- "${interfaces_path}"
+  fi
+  # The dhclient hook installed above rewrites /etc/hosts as soon as the
+  # bridge takes a lease, so by the time anything fails the hosts file can
+  # already describe the configuration being rolled back. Restoring the
+  # interfaces alone would leave the two disagreeing, and nothing runs the
+  # hook again to repair it.
+  if [[ ${HAD_PREVIOUS_HOSTS} -eq 1 ]]; then
+    _atomic_install "${hosts_path}" "${PREVIOUS_HOSTS}" 0644
+    log_warn "restored the previous ${hosts_path}"
   fi
   network_reload || log_error 'The previous network configuration could not be reloaded either.'
 }
@@ -161,6 +221,10 @@ disarm_rollback() {
 if [[ -f ${interfaces_path} ]]; then
   HAD_PREVIOUS=1
   _slurp PREVIOUS_BODY "${interfaces_path}"
+fi
+if [[ -f ${hosts_path} ]]; then
+  HAD_PREVIOUS_HOSTS=1
+  _slurp PREVIOUS_HOSTS "${hosts_path}"
 fi
 
 # Checked before it is installed, not after: ifupdown2 will refuse a file it
@@ -209,7 +273,6 @@ fi
 
 # --- /etc/hosts -----------------------------------------------------------
 
-hosts_path="${SYSROOT}/etc/hosts"
 if [[ -z ${address} ]]; then
   if dry_run_enabled; then
     log_warn "${BRIDGE} holds no address; ${hosts_path} would be left alone"

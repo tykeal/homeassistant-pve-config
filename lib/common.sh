@@ -371,6 +371,22 @@ run_check() {
   "$@"
 }
 
+# Captures a helper's verdict into a named variable, and dies when the
+# helper itself failed.
+#
+# `[[ $(write_file ...) == changed ]]` cannot tell a refusal from a no-op:
+# die runs inside the command substitution's subshell, so the caller sees an
+# empty string and a comparison that is merely false. Everything that merges
+# a verdict goes through this instead, so a refused symlink or a failed chown
+# stops the run rather than being reported as "nothing to do".
+state_of() {
+  local __var=$1
+  shift
+  local __out
+  __out=$("$@") || die "Failed while running: $(redact "$*")"
+  printf -v "${__var}" '%s' "${__out}"
+}
+
 _owner_matches() {
   local path=$1 uid=$2 gid=$3 current
   current=$(stat -c '%u:%g' -- "${path}" 2>/dev/null) || return 1
@@ -427,7 +443,9 @@ ensure_dir() {
   fi
 
   if [[ -n ${uid} && -n ${gid} ]]; then
-    if [[ $(ensure_owner "${path}" "${uid}" "${gid}") == changed ]]; then
+    local owner_state
+    state_of owner_state ensure_owner "${path}" "${uid}" "${gid}"
+    if [[ ${owner_state} == changed ]]; then
       changed=1
     fi
   fi
@@ -609,9 +627,15 @@ _sshd_effective_config() {
       body=$(printf '%s' "${body}" |
         sed -E "s|^([[:space:]]*[Ii]nclude[[:space:]]+).*sshd_config\.d/.*|\1${conf_d}/*.conf|")
       body+=$'\n'
-    else
-      log_warn "${host_main} has no Include line; $(basename -- "${target}") would never be read"
+    elif dry_run_enabled; then
+      # The caller adds the Include before installing. During a dry run it
+      # has not, so the assembled configuration stands in for the one a real
+      # run would validate rather than failing on a file nothing wrote yet.
+      log_info "${host_main} has no Include line; one would be added"
       body="Include ${conf_d}/*.conf"$'\n'"${body}"
+    else
+      log_error "${host_main} has no Include line, so $(basename -- "${target}") would never be read"
+      return 1
     fi
   else
     body="Include ${conf_d}/*.conf"$'\n'
@@ -619,6 +643,42 @@ _sshd_effective_config() {
 
   printf '%s' "${body}" >"${main}" || return 1
   printf '%s\n' "${main}"
+}
+
+# sshd keeps the *first* value it obtains for a keyword, so a fragment that
+# parses cleanly can still lose to the main configuration or to a fragment
+# that sorts ahead of it; cloud-init's 50-cloud-init.conf turning password
+# authentication back on is the usual way a host stays reachable by password
+# after this toolkit has reported it hardened. Asking sshd what the assembled
+# configuration resolves to is the only way to notice.
+_sshd_candidate_takes_effect() {
+  local binary=$1 candidate=$2 effective=$3
+  local resolved line keyword value actual
+
+  if ! resolved=$("${binary}" -T -f "${effective}" 2>/dev/null); then
+    log_warn 'sshd would not resolve the effective configuration; its values were not verified'
+    return 0
+  fi
+
+  while IFS= read -r line || [[ -n ${line} ]]; do
+    line=${line#"${line%%[![:space:]]*}"}
+    [[ -z ${line} || ${line} == '#'* ]] && continue
+    keyword=${line%%[[:space:]]*}
+    value=${line#"${keyword}"}
+    value=${value#"${value%%[![:space:]]*}"}
+    [[ -n ${value} ]] || continue
+    keyword=${keyword,,}
+    actual=$(awk -v k="${keyword}" \
+      'tolower($1) == k { $1 = ""; sub(/^[[:space:]]+/, ""); print; exit }' \
+      <<<"${resolved}")
+    # Only keywords sshd reports back are checked; a repeated one such as
+    # HostKey has no single effective value to compare against.
+    [[ -n ${actual} ]] || continue
+    if [[ ${actual,,} != "${value,,}" ]]; then
+      log_error "sshd resolves ${keyword} to '${actual}' rather than the '${value}' this file asks for; something read earlier wins."
+      return 1
+    fi
+  done <"${candidate}"
 }
 
 # Validators receive the candidate and the path it is destined for, and
@@ -640,25 +700,24 @@ validate_sshd_config() {
     }
 
   log_info "checking the effective sshd configuration for ${target}"
-  if output=$("${binary}" -t -f "${effective}" 2>&1); then
-    return 0
+  if ! output=$("${binary}" -t -f "${effective}" 2>&1); then
+    # Off a real host, and as an ordinary user, sshd gets as far as loading
+    # host keys and stops there. The configuration itself parsed, which is
+    # the only thing being asked.
+    #
+    # Matched as the whole diagnostic rather than as a substring: a run that
+    # also reported a real problem must not be waved through because this
+    # line happened to appear in it. sshd ends the line with CR, hence the
+    # trailing whitespace allowance.
+    if [[ ${output} =~ ^[[:alnum:]_./-]*sshd:\ no\ hostkeys\ available\ --\ exiting\.[[:space:]]*$ ]]; then
+      log_warn 'sshd found no host keys; the configuration itself parsed cleanly'
+    else
+      log_error "${output}"
+      return 1
+    fi
   fi
 
-  # Off a real host, and as an ordinary user, sshd gets as far as loading
-  # host keys and stops there. The configuration itself parsed, which is
-  # the only thing being asked.
-  #
-  # Matched as the whole diagnostic rather than as a substring: a run that
-  # also reported a real problem must not be waved through because this
-  # line happened to appear in it. sshd ends the line with CR, hence the
-  # trailing whitespace allowance.
-  if [[ ${output} =~ ^[[:alnum:]_./-]*sshd:\ no\ hostkeys\ available\ --\ exiting\.[[:space:]]*$ ]]; then
-    log_warn 'sshd found no host keys; the configuration itself parsed cleanly'
-    return 0
-  fi
-
-  log_error "${output}"
-  return 1
+  _sshd_candidate_takes_effect "${binary}" "${candidate}" "${effective}"
 }
 
 validate_sudoers_file() {

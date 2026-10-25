@@ -16,7 +16,50 @@ SYSROOT=$(sysroot)
 # the last moment at which saying so is any use.
 admin_keys_require >/dev/null
 
+mapfile -t USERS < <(admin_users)
+[[ ${#USERS[@]} -gt 0 ]] || die 'PVE_ADMIN_USERS resolved to no usernames.'
+
+# A valid key in the configuration is not the same as a key this host will
+# accept. The driver happily runs this stage on its own, so on a fresh
+# password-only machine 60-admin-users may never have run and disabling
+# passwords here would close the only way in.
+assert_admin_access() {
+  local user home keys key file installed
+  for user in "${USERS[@]}"; do
+    user_exists "${user}" ||
+      die "${user} has no account on this host; run the 60-admin-users stage before hardening SSH."
+    home=$(user_home "${user}") || home="/home/${user}"
+    file="$(sysroot)${home}/.ssh/authorized_keys"
+    [[ -f ${file} ]] ||
+      die "${user} has no ${file}; run the 60-admin-users stage before hardening SSH."
+    _slurp installed "${file}"
+    keys=$(admin_keys_for "${user}")
+    while IFS= read -r key || [[ -n ${key} ]]; do
+      [[ -n ${key} ]] || continue
+      key=$(_ssh_key_identity "${key}") || continue
+      [[ ${installed} == *"${key}"* ]] ||
+        die "${user}'s configured key is not in ${file}; run the 60-admin-users stage before hardening SSH."
+    done <<<"${keys}"
+  done
+}
+
+if dry_run_enabled; then
+  log_info 'would check that every administrator can already log in with a key'
+else
+  assert_admin_access
+fi
+
 # --- sshd -----------------------------------------------------------------
+
+# sshd only reads a fragment when the main configuration includes one, and
+# it keeps the first value it obtains. A host whose sshd_config has no
+# Include at all would take this file as validated and then never read it.
+sshd_main="${SYSROOT}/etc/ssh/sshd_config"
+if [[ -f ${sshd_main} ]] &&
+  ! grep -Eq '^[[:space:]]*[Ii]nclude[[:space:]]+.*sshd_config\.d' "${sshd_main}"; then
+  ensure_exact_line "${sshd_main}" '^[[:space:]]*[Ii]nclude[[:space:]]' \
+    'Include /etc/ssh/sshd_config.d/*.conf' prepend >/dev/null
+fi
 
 hardening="# Managed by pve-config.
 PasswordAuthentication no
@@ -42,9 +85,6 @@ fi
 # --- sudo via a forwarded agent -------------------------------------------
 
 pkg_install sudo libpam-ssh-agent-auth >/dev/null
-
-mapfile -t USERS < <(admin_users)
-[[ ${#USERS[@]} -gt 0 ]] || die 'PVE_ADMIN_USERS resolved to no usernames.'
 
 # One file holding every administrator's key. pam_ssh_agent_auth reads it as
 # root, so it is deliberately not any individual's authorized_keys.

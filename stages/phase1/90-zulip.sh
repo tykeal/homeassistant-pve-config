@@ -120,20 +120,26 @@ WantedBy=multi-user.target
 UNIT
 boot_unit+=$'\n'
 
+# A unit that is started during shutdown cannot rely on networking: systemd
+# runs stop jobs before start jobs, so curl would often find the network
+# already gone. This one is started at boot and does its work in ExecStop
+# instead, which systemd orders before the network units it depends on are
+# stopped.
 read -r -d '' shutdown_unit <<'UNIT' || true
 [Unit]
 Description=Send a Zulip shutdown notification
-DefaultDependencies=no
-Before=shutdown.target
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/zulip-notify.sh shutdown
-TimeoutStartSec=15
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=/usr/local/bin/zulip-notify.sh shutdown
+TimeoutStopSec=15
 
 [Install]
-WantedBy=shutdown.target
+WantedBy=multi-user.target
 UNIT
 shutdown_unit+=$'\n'
 

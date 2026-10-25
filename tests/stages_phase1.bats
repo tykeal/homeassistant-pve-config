@@ -71,6 +71,7 @@ MOCK_READ_ONLY_PATTERNS=(
   '^systemctl (is-active|is-enabled|show|list-unit-files)( |$).*'
   '^pveum (user|acl|role) list( |$).*'
   '^sshd( -[^ ]+)* -t( |$).*'
+  '^sshd( -[^ ]+)* -T( |$).*'
   '^visudo -c -f .*'
   '^ifquery --syntax-check .*'
   '^findmnt( -[^ ]+)* .*'
@@ -626,9 +627,25 @@ seed_mount() {
   [[ "$(mock_calls)" != *'user add'* ]]
 }
 
+# 70-ssh-sudo refuses to disable password authentication until every
+# administrator can already log in with a key, which is 60-admin-users'
+# job. These tests stand in for it.
+seed_admin_access() {
+  local user key dir
+  for user in ${PVE_ADMIN_USERS}; do
+    seed_user "${user}"
+    dir="${PVE_CONFIG_ROOT}/home/${user}/.ssh"
+    mkdir -p "${dir}"
+    key=$(admin_keys_for "${user}")
+    printf '%s\n' "${key}" >"${dir}/authorized_keys"
+    chmod 600 "${dir}/authorized_keys"
+  done
+}
+
 # --- 70-ssh-sudo ----------------------------------------------------------
 
 @test "70-ssh-sudo installs a validated sshd fragment and reloads ssh" {
+  seed_admin_access
   run run_phase1_stage 70-ssh-sudo.sh
   [ "$status" -eq 0 ]
 
@@ -660,6 +677,7 @@ seed_mount() {
 }
 
 @test "70-ssh-sudo leaves exactly one PAM line however often it runs" {
+  seed_admin_access
   mkdir -p "${PVE_CONFIG_ROOT}/etc/pam.d"
   printf '#%%PAM-1.0\n@include common-auth\n' >"${PVE_CONFIG_ROOT}/etc/pam.d/sudo"
 
@@ -675,6 +693,7 @@ seed_mount() {
 @test "70-ssh-sudo gathers every administrator's key for pam_ssh_agent_auth" {
   export PVE_ADMIN_USERS='alice bob'
   export PVE_ADMIN_KEY_BOB='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPEGfEQ9kLDwwnJtIwSPIv2Vdq2jdD8j5zg76sU1nqjj bob@example.net'
+  seed_admin_access
 
   run_phase1_stage 70-ssh-sudo.sh
   local file="${PVE_CONFIG_ROOT}/etc/security/authorized_keys"
@@ -684,12 +703,14 @@ seed_mount() {
 }
 
 @test "70-ssh-sudo points sudo-i at the same PAM stack" {
+  seed_admin_access
   run_phase1_stage 70-ssh-sudo.sh
   [ -L "${PVE_CONFIG_ROOT}/etc/pam.d/sudo-i" ]
   [ "$(readlink "${PVE_CONFIG_ROOT}/etc/pam.d/sudo-i")" = '/etc/pam.d/sudo' ]
 }
 
 @test "70-ssh-sudo installs a validated sudoers drop-in at mode 440" {
+  seed_admin_access
   run_phase1_stage 70-ssh-sudo.sh
   local file="${PVE_CONFIG_ROOT}/etc/sudoers.d/90-ssh-agent"
   [ "$(stat -c '%a' "${file}")" = '440' ]
@@ -699,6 +720,7 @@ seed_mount() {
 
 @test "70-ssh-sudo stops at sshd hardening when agent sudo is not wanted" {
   export PVE_SUDO_SSH_AGENT='no'
+  seed_admin_access
   run run_phase1_stage 70-ssh-sudo.sh
   [ "$status" -eq 0 ]
   [ -f "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/99-hardening.conf" ]
@@ -706,6 +728,7 @@ seed_mount() {
 }
 
 @test "70-ssh-sudo is idempotent" {
+  seed_admin_access
   mkdir -p "${PVE_CONFIG_ROOT}/etc/pam.d"
   printf '#%%PAM-1.0\n@include common-auth\n' >"${PVE_CONFIG_ROOT}/etc/pam.d/sudo"
   assert_stage_converges 70-ssh-sudo.sh
@@ -866,4 +889,119 @@ zulip_secrets() {
   [ ! -e "${PVE_CONFIG_ROOT}/etc/pve-config/zulip.env" ]
   [ ! -e "${PVE_CONFIG_ROOT}/usr/local/bin/zulip-notify.sh" ]
   [[ "$(mock_calls)" != *'systemctl enable'* ]]
+}
+
+# --- review follow-ups ----------------------------------------------------
+
+@test "20-network refuses to drop an interface it does not manage" {
+  mkdir -p "${PVE_CONFIG_ROOT}/etc/network"
+  printf 'auto lo\niface lo inet loopback\n\nauto nic2\niface nic2 inet static\n        address 10.9.0.2/24\n' \
+    >"${PVE_CONFIG_ROOT}/etc/network/interfaces"
+
+  run run_phase1_stage 20-network.sh
+  [ "$status" -ne 0 ]
+  [[ "$output" == *nic2* ]]
+  [[ "$(cat "${PVE_CONFIG_ROOT}/etc/network/interfaces")" == *'10.9.0.2/24'* ]]
+}
+
+@test "20-network replaces unmanaged stanzas when told to take over" {
+  mkdir -p "${PVE_CONFIG_ROOT}/etc/network"
+  printf 'auto lo\niface lo inet loopback\n\nauto nic2\niface nic2 inet static\n        address 10.9.0.2/24\n' \
+    >"${PVE_CONFIG_ROOT}/etc/network/interfaces"
+  export PVE_NETWORK_TAKEOVER='yes'
+
+  run run_phase1_stage 20-network.sh
+  [ "$status" -eq 0 ]
+  [[ "$(cat "${PVE_CONFIG_ROOT}/etc/network/interfaces")" != *'10.9.0.2/24'* ]]
+}
+
+@test "20-network leaves a bare manual stanza for an unused port alone" {
+  mkdir -p "${PVE_CONFIG_ROOT}/etc/network"
+  printf 'auto lo\niface lo inet loopback\n\niface nic2 inet manual\n' \
+    >"${PVE_CONFIG_ROOT}/etc/network/interfaces"
+
+  run run_phase1_stage 20-network.sh
+  [ "$status" -eq 0 ]
+}
+
+# shellcheck disable=SC2016  # the hook keeps $interface for dhclient to expand
+@test "20-network restricts the dhclient hook to the management bridge" {
+  run_phase1_stage 20-network.sh
+  local hook
+  hook=$(cat "${PVE_CONFIG_ROOT}/etc/dhcp/dhclient-exit-hooks.d/update-etc-hosts")
+  [[ "${hook}" == *'[ "${interface}" = '"'"'vmbr0'"'"' ]'* ]]
+}
+
+@test "20-network restores /etc/hosts along with the interfaces" {
+  # The hook rewrites /etc/hosts as soon as the bridge takes a lease, so a
+  # rollback that put back only the interfaces would leave the two
+  # describing different networks.
+  mkdir -p "${PVE_CONFIG_ROOT}/etc"
+  printf '127.0.0.1\tlocalhost\n10.9.0.2\tpve1.example.net\tpve1\n' \
+    >"${PVE_CONFIG_ROOT}/etc/hosts"
+  export PVE_CONFIG_MOCK_BRIDGE_IP=''
+
+  run run_phase1_stage 20-network.sh
+  [ "$status" -ne 0 ]
+  [[ "$(cat "${PVE_CONFIG_ROOT}/etc/hosts")" == *'10.9.0.2	pve1.example.net	pve1'* ]]
+}
+
+@test "40-repos moves an enterprise Ceph source off the subscription host" {
+  mkdir -p "${PVE_CONFIG_ROOT}/etc/apt/sources.list.d"
+  printf 'Types: deb\nURIs: https://enterprise.proxmox.com/debian/ceph-squid\nSuites: trixie\nComponents: enterprise\n' \
+    >"${PVE_CONFIG_ROOT}/etc/apt/sources.list.d/ceph.sources"
+
+  run run_phase1_stage 40-repos.sh
+  [ "$status" -eq 0 ]
+  local body
+  body=$(cat "${PVE_CONFIG_ROOT}/etc/apt/sources.list.d/ceph.sources")
+  [[ "${body}" == *'download.proxmox.com/debian/ceph-squid'* ]]
+  [[ "${body}" == *'Components: no-subscription'* ]]
+  [[ "${body}" != *enterprise* ]]
+}
+
+@test "40-repos migrates a legacy Ceph list before removing it" {
+  mkdir -p "${PVE_CONFIG_ROOT}/etc/apt/sources.list.d"
+  printf 'deb https://enterprise.proxmox.com/debian/ceph-squid trixie enterprise\n' \
+    >"${PVE_CONFIG_ROOT}/etc/apt/sources.list.d/ceph.list"
+
+  run run_phase1_stage 40-repos.sh
+  [ "$status" -eq 0 ]
+  [ ! -e "${PVE_CONFIG_ROOT}/etc/apt/sources.list.d/ceph.list" ]
+  local body
+  body=$(cat "${PVE_CONFIG_ROOT}/etc/apt/sources.list.d/ceph.sources")
+  [[ "${body}" == *'download.proxmox.com/debian/ceph-squid'* ]]
+  [[ "${body}" == *'Suites: trixie'* ]]
+  [[ "${body}" == *'Components: no-subscription'* ]]
+}
+
+@test "40-repos refreshes again after a refresh that failed" {
+  export PVE_CONFIG_MOCK_APT_UPDATE_FAILS=1
+  run run_phase1_stage 40-repos.sh
+  [ "$status" -ne 0 ]
+
+  unset PVE_CONFIG_MOCK_APT_UPDATE_FAILS
+  : >"${PVE_CONFIG_MOCK_LOG}"
+  run run_phase1_stage 40-repos.sh
+  [ "$status" -eq 0 ]
+  [[ "$(mock_calls)" == *'apt-get update'* ]]
+}
+
+@test "70-ssh-sudo refuses to harden before the administrators can log in" {
+  # The driver runs stages on their own, so 60-admin-users may never have
+  # run and passwords may still be the only way in.
+  run run_phase1_stage 70-ssh-sudo.sh
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'60-admin-users'* ]]
+  [ ! -e "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/99-hardening.conf" ]
+}
+
+@test "90-zulip sends the shutdown notice from ExecStop" {
+  zulip_secrets
+  run_phase1_stage 90-zulip.sh
+  local unit
+  unit=$(cat "${PVE_CONFIG_ROOT}/etc/systemd/system/zulip-shutdown-notify.service")
+  [[ "${unit}" == *'ExecStop=/usr/local/bin/zulip-notify.sh shutdown'* ]]
+  [[ "${unit}" == *'RemainAfterExit=yes'* ]]
+  [[ "${unit}" != *'WantedBy=shutdown.target'* ]]
 }
