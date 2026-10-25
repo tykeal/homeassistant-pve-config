@@ -53,10 +53,36 @@ assert_admin_access() {
   done
 }
 
+# sshd only reads ~/.ssh/authorized_keys because that is the default; a
+# host that names somewhere else, or `none`, ignores every key installed
+# above. Disabling passwords on top of that removes the last way in, so
+# any AuthorizedKeysFile this host sets -- globally or under a Match -- has
+# to still name the file the keys went into.
+assert_authorized_keys_path() {
+  local main="${SYSROOT}/etc/ssh/sshd_config"
+  [[ -f ${main} ]] || return 0
+
+  local file criteria keyword value operand ok
+  while IFS=$'\x1f' read -r file criteria keyword value; do
+    [[ ${keyword} == authorizedkeysfile ]] || continue
+    ok=0
+    for operand in ${value}; do
+      operand=${operand#'%h/'}
+      [[ ${operand} == '.ssh/authorized_keys' ]] && ok=1
+    done
+    [[ ${ok} -eq 1 ]] && continue
+    if [[ -n ${criteria} ]]; then
+      die "${file} sets AuthorizedKeysFile to '${value}' under 'Match ${criteria}', so the keys installed for the administrators would be ignored."
+    fi
+    die "${file} sets AuthorizedKeysFile to '${value}', so the keys installed for the administrators would be ignored."
+  done < <(_sshd_config_directives "${main}")
+}
+
 if dry_run_enabled; then
   log_info 'would check that every administrator can already log in with a key'
 else
   assert_admin_access
+  assert_authorized_keys_path
 fi
 
 # --- sshd -----------------------------------------------------------------

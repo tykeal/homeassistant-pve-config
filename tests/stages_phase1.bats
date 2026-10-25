@@ -1129,3 +1129,26 @@ zulip_secrets() {
   [ "$status" -eq 0 ]
   [ "$(stat -c '%a' "${PVE_CONFIG_ROOT}/home/alice")" = 755 ]
 }
+
+@test "70-ssh-sudo refuses a host that reads keys from somewhere else" {
+  seed_admin_access
+  mkdir -p "${PVE_CONFIG_ROOT}/etc/ssh"
+  printf 'Include /etc/ssh/sshd_config.d/*.conf\nAuthorizedKeysFile /etc/ssh/keys/%%u\n' \
+    >"${PVE_CONFIG_ROOT}/etc/ssh/sshd_config"
+
+  run run_phase1_stage 70-ssh-sudo.sh
+  [ "$status" -ne 0 ]
+  [[ "$output" == *AuthorizedKeysFile* ]]
+  [ ! -e "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/99-hardening.conf" ]
+}
+
+@test "70-ssh-sudo accepts the default key file spelled out" {
+  seed_admin_access
+  mkdir -p "${PVE_CONFIG_ROOT}/etc/ssh"
+  printf 'Include /etc/ssh/sshd_config.d/*.conf\nAuthorizedKeysFile %%h/.ssh/authorized_keys .ssh/authorized_keys2\n' \
+    >"${PVE_CONFIG_ROOT}/etc/ssh/sshd_config"
+
+  run run_phase1_stage 70-ssh-sudo.sh
+  [ "$status" -eq 0 ]
+  [ -f "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/99-hardening.conf" ]
+}

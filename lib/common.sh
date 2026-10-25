@@ -770,6 +770,75 @@ _sshd_candidate_takes_effect() {
   done <"${candidate}"
 }
 
+# Walks the Include graph of an sshd configuration and reports every
+# directive it finds as `file US criteria US keyword US value`, with the
+# criteria empty outside a conditional block. The unit separator is used
+# rather than a tab because `read` would fold an empty field away between
+# two whitespace delimiters. Includes are followed
+# wherever they lead, not only into sshd_config.d: a policy file an
+# operator includes by name is as much a part of this host's
+# configuration as anything else, and a check that stops at the first
+# Include is a check that can be stepped around.
+#
+# Relative Include paths resolve against /etc/ssh, as sshd resolves them,
+# and everything is read beneath the sysroot so a test sees the tree it
+# set up rather than the one this process is running on.
+declare -gA _SSHD_SEEN=()
+
+_sshd_config_directives() {
+  _SSHD_SEEN=()
+  _sshd_emit_directives "$1" ''
+}
+
+_sshd_emit_directives() {
+  local file=$1 criteria=$2
+  [[ -r ${file} ]] || return 0
+
+  local real
+  real=$(readlink -f -- "${file}" 2>/dev/null) || real=${file}
+  [[ -n ${_SSHD_SEEN[${real}]+set} ]] && return 0
+  _SSHD_SEEN[${real}]=1
+
+  local root
+  root=$(sysroot)
+
+  local line keyword value operand target
+  while IFS= read -r line || [[ -n ${line} ]]; do
+    line=${line#"${line%%[![:space:]]*}"}
+    [[ -z ${line} || ${line} == '#'* ]] && continue
+    keyword=${line%%[[:space:]]*}
+    value=${line#"${keyword}"}
+    value=${value#"${value%%[![:space:]]*}"}
+    value=${value%"${value##*[![:space:]]}"}
+    case ${keyword,,} in
+      include)
+        for operand in ${value}; do
+          [[ ${operand} == /* ]] || operand="/etc/ssh/${operand}"
+          # Word splitting and globbing are what resolve the pattern sshd
+          # would resolve; the operand came from a configuration file this
+          # host already reads.
+          for target in ${root}${operand}; do
+            [[ -f ${target} ]] || continue
+            _sshd_emit_directives "${target}" "${criteria}"
+          done
+        done
+        ;;
+      match)
+        # `Match all` returns to the unconditional part of the file.
+        if [[ ${value,,} == all ]]; then
+          criteria=''
+        else
+          criteria=${value}
+        fi
+        ;;
+      *)
+        [[ -n ${value} ]] || continue
+        printf '%s\x1f%s\x1f%s\x1f%s\n' "${file}" "${criteria}" "${keyword,,}" "${value}"
+        ;;
+    esac
+  done <"${file}"
+}
+
 # `sshd -T` reports the configuration as it resolves for no particular
 # connection, so a Match block is never entered and its overrides are
 # invisible to the check above. A `Match User alice` that turns password
@@ -781,9 +850,7 @@ _sshd_candidate_takes_effect() {
 # the contradiction instead of being told the host is hardened when part of
 # it is not.
 _sshd_conditional_overrides() {
-  local candidate=$1 effective=$2
-  local conf_d
-  conf_d="$(dirname -- "${effective}")/sshd_config.d"
+  local candidate=$1 main=$2
 
   local -A wanted=()
   local line keyword value
@@ -797,40 +864,16 @@ _sshd_conditional_overrides() {
     wanted["${keyword,,}"]=$(_sshd_canonical_value "${value}")
   done <"${candidate}"
   [[ ${#wanted[@]} -gt 0 ]] || return 0
+  [[ -f ${main} ]] || return 0
 
-  local -a files=("${effective}")
-  local existing
-  for existing in "${conf_d}"/*.conf; do
-    [[ -f ${existing} ]] && files+=("${existing}")
-  done
-
-  local file criteria in_match
-  for file in "${files[@]}"; do
-    in_match=0
-    while IFS= read -r line || [[ -n ${line} ]]; do
-      line=${line#"${line%%[![:space:]]*}"}
-      [[ -z ${line} || ${line} == '#'* ]] && continue
-      keyword=${line%%[[:space:]]*}
-      value=${line#"${keyword}"}
-      value=${value#"${value%%[![:space:]]*}"}
-      if [[ ${keyword,,} == match ]]; then
-        criteria=${value}
-        # `Match all` returns to the unconditional part of the file.
-        if [[ ${value,,} == all ]]; then
-          in_match=0
-        else
-          in_match=1
-        fi
-        continue
-      fi
-      [[ ${in_match} -eq 1 && -n ${value} ]] || continue
-      keyword=${keyword,,}
-      [[ -n ${wanted[${keyword}]+set} ]] || continue
-      [[ $(_sshd_canonical_value "${value}") == "${wanted[${keyword}]}" ]] && continue
-      log_error "${file} sets ${keyword} to '${value}' under 'Match ${criteria}', contradicting this file; resolve that before hardening."
-      return 1
-    done <"${file}"
-  done
+  local criteria file
+  while IFS=$'\x1f' read -r file criteria keyword value; do
+    [[ -n ${criteria} ]] || continue
+    [[ -n ${wanted[${keyword}]+set} ]] || continue
+    [[ $(_sshd_canonical_value "${value}") == "${wanted[${keyword}]}" ]] && continue
+    log_error "${file} sets ${keyword} to '${value}' under 'Match ${criteria}', contradicting this file; resolve that before hardening."
+    return 1
+  done < <(_sshd_config_directives "${main}")
 }
 
 # Validators receive the candidate and the path it is destined for, and
@@ -870,7 +913,7 @@ validate_sshd_config() {
   fi
 
   _sshd_candidate_takes_effect "${binary}" "${candidate}" "${effective}" || return 1
-  _sshd_conditional_overrides "${candidate}" "${effective}"
+  _sshd_conditional_overrides "${candidate}" "$(sysroot)/etc/ssh/sshd_config"
 }
 
 validate_sudoers_file() {

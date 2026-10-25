@@ -436,6 +436,22 @@ setup() {
   [[ "$output" == *'does not include'* ]]
 }
 
+@test "install_validated refuses a conditional block an Include hides" {
+  mkdir -p "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d"
+  printf 'Include %s/etc/ssh/sshd_config.d/*.conf\nInclude /etc/ssh/site-policy.conf\n' \
+    "${PVE_CONFIG_ROOT}" >"${PVE_CONFIG_ROOT}/etc/ssh/sshd_config"
+  printf 'Match User alice\n    PasswordAuthentication yes\n' \
+    >"${PVE_CONFIG_ROOT}/etc/ssh/site-policy.conf"
+
+  local target="${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/99-hardening.conf"
+  run install_validated "${target}" 'PasswordAuthentication no
+' 0644 validate_sshd_config
+
+  [ "$status" -ne 0 ]
+  [ ! -e "${target}" ]
+  [[ "$output" == *site-policy.conf* ]]
+}
+
 @test "install_validated refuses a conditional block that undoes the fragment" {
   mkdir -p "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d"
   printf 'Include %s/etc/ssh/sshd_config.d/*.conf\nPort 22\nMatch User alice\n    PasswordAuthentication yes\n' \
