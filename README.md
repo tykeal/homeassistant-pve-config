@@ -103,10 +103,11 @@ double quoted value may not contain anything the shell would expand.
 
 Parsing covers the load. Downstream, a stage that bakes a configured value
 into a script it generates writes that value as a single-quoted assignment
-the generated script reads back as a literal, so nothing in a config file is
-ever read as shell syntax. The driver also holds `PVE_HOSTNAME` and
-`PVE_FQDN` to the DNS label rules, whatever the value came from. Keep both
-files at the permissions the toolkit sets.
+the generated script reads back as a literal, so nothing in a config file
+reaches those scripts as shell syntax. The driver also holds `PVE_HOSTNAME`
+and `PVE_FQDN` to the DNS label rules, and `PVE_NETWORK_WAIT_SECONDS` to a
+count of seconds, whatever the value came from. Keep both files at the
+permissions the toolkit sets.
 
 Name every config key `PVE_*`, in capitals, digits and underscores. The
 loader does not skip any other name: it treats the assignment as a line it
@@ -164,7 +165,7 @@ The driver resolves these keys on every run.
 | `PVE_BRIDGE_MODE` | yes | `dhcp` | Addressing for `vmbr0`: `dhcp` or `static` |
 | `PVE_BRIDGE_ADDRESS` | no | none | Static CIDR address for `vmbr0`; the stage reads it only in `static` mode |
 | `PVE_BRIDGE_GATEWAY` | no | none | Default gateway; the stage reads it only in `static` mode |
-| `PVE_NETWORK_WAIT_SECONDS` | yes | `60` | Seconds to wait for `vmbr0` to pick up an address |
+| `PVE_NETWORK_WAIT_SECONDS` | yes | `60` | Seconds to wait for `vmbr0` to pick up an address, from 0 to 86400 |
 | `PVE_NO_SUBSCRIPTION` | yes | `yes` | Use the no-subscription repository and suppress the subscription notice |
 | `PVE_SUDO_SSH_AGENT` | yes | `yes` | Let `sudo` accept a forwarded SSH agent key |
 | `PVE_ZULIP_ENABLED` | yes | `no` | Send boot and shutdown notices to Zulip |
@@ -176,10 +177,11 @@ or carries more than one. The driver then names what it found and asks,
 rather than guessing and taking the host off the network.
 
 `PVE_HOSTNAME` must be a DNS label, and `PVE_FQDN` a dotted name whose
-labels are DNS labels and whose first label is `PVE_HOSTNAME`. The driver
-checks both whatever the value came from, and names the one it refused.
-Both names reach `/etc/hosts` and a hook that root runs on every DHCP
-lease.
+labels are DNS labels and whose first label is `PVE_HOSTNAME`. Both names
+reach `/etc/hosts` and a hook that root runs on every DHCP lease.
+`PVE_NETWORK_WAIT_SECONDS` must be a whole number of seconds, because the
+stages compare it arithmetically. The driver checks each of them whatever
+the value came from, and names the one it refused.
 
 ### Keys the stages and the example read
 

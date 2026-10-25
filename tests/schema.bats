@@ -217,6 +217,33 @@ EOF
   done
 }
 
+# shellcheck disable=SC2016  # the payload must stay literal to be a payload
+@test "a wait that is not a count of seconds is rejected" {
+  local value
+  # bash evaluates an array subscript inside an arithmetic operand as code,
+  # and the stages compare this value with -lt.
+  for value in 'a[$(id)]' '60; id' '60s' '-1' '1e3' '' ' 60'; do
+    run _schema_validate_PVE_NETWORK_WAIT_SECONDS "${value}"
+    [ "$status" -ne 0 ] || {
+      echo "accepted: ${value}"
+      return 1
+    }
+  done
+  run _schema_validate_PVE_NETWORK_WAIT_SECONDS '86401'
+  [ "$status" -ne 0 ]
+}
+
+@test "an ordinary wait is accepted" {
+  local value
+  for value in 0 1 60 86400; do
+    run _schema_validate_PVE_NETWORK_WAIT_SECONDS "${value}"
+    [ "$status" -eq 0 ] || {
+      echo "rejected: ${value}"
+      return 1
+    }
+  done
+}
+
 # Everything the driver resolves before the first stage runs, bar the names
 # under test.
 resolve_names() {
@@ -252,6 +279,15 @@ resolve_names() {
   run resolve_names
   [ "$status" -ne 0 ]
   [[ "$output" == *'PVE_FQDN'* ]]
+}
+
+# shellcheck disable=SC2016  # the payload must stay literal to be a payload
+@test "schema_resolve rejects a wait it cannot count in seconds" {
+  export PVE_HOSTNAME='pve1' PVE_DOMAIN='example.test'
+  export PVE_NETWORK_WAIT_SECONDS='a[$(id)]'
+  run resolve_names
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'PVE_NETWORK_WAIT_SECONDS'* ]]
 }
 
 @test "schema_resolve accepts the names it derives for itself" {

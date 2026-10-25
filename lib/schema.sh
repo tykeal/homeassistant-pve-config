@@ -143,6 +143,18 @@ _schema_validate_PVE_FQDN() {
   fi
 }
 
+# shellcheck disable=SC2329  # called indirectly, by name, from schema_resolve
+_schema_validate_PVE_NETWORK_WAIT_SECONDS() {
+  local value=$1
+  # The stages compare this with -lt, which evaluates its operands
+  # arithmetically, and bash evaluates an array subscript inside such an
+  # operand as code. A plain count of seconds is the only thing it may be.
+  if [[ ! ${value} =~ ^(0|[1-9][0-9]*)$ ]] || ((10#${value} > 86400)); then
+    printf 'a wait is a whole number of seconds, from 0 to 86400\n'
+    return 1
+  fi
+}
+
 # Applies a key's validator, if it declares one. Empty is left to the
 # required check, which reports a missing value far better than a validator
 # can.
