@@ -263,6 +263,7 @@ gate.
 | `--config PATH` | Use an alternate configuration file instead of `pve-config.conf` |
 | `--non-interactive` | Never prompt. A required value with no default aborts the run, and the driver reports all such keys at once |
 | `-h`, `--help` | Print usage |
+| `--version` | Print the toolkit version and exit. Needs no root |
 
 With no flag the driver picks the lowest phase that still has pending
 stages, and runs that whole phase. Once every stage reaches `done` the
@@ -439,7 +440,8 @@ Preview a deployment this way:
 
 `/root/pve-config/state` holds one `phase<N>__<stage>.done` file per
 completed stage, each carrying its completion timestamp, plus a
-`phase1.bootid` recording the boot phase 1 finished under.
+`phase1.bootid` recording the boot phase 1 finished under and a `version`
+file naming the release that last configured the host.
 
 ```shell
 ./pve-config.sh --list          # phase, stage and status for every stage
@@ -500,6 +502,55 @@ back or delete it first.
   Home Assistant OS and Frigate guests remain a later effort. Their
   configuration keys already appear in the example file and survive a
   rewrite, but no stage reads them yet.
+
+## Releases
+
+Release notes assemble themselves. Release Drafter reads the title of every
+pull request that lands on `main` and keeps a draft release current with the
+next version number. It never publishes.
+
+Pushing a signed semver tag (`vX.Y.Z`) publishes that draft. The release
+workflow checks the tag signature, builds a source tarball from the tagged
+commit, attaches the tarball to the still-draft release, then promotes the
+draft to a published release.
+
+Every release carries two assets:
+
+- `pve-config-<tag>.tar.gz` — a reproducible archive of the tagged commit,
+  unpacking into a single `pve-config-<tag>/` directory.
+- `pve-config-<tag>.tar.gz.sha256` — the checksum, in `sha256sum` format.
+
+Verify and unpack a download from the directory holding both files:
+
+```bash
+sha256sum -c pve-config-v1.0.0.tar.gz.sha256
+tar xzf pve-config-v1.0.0.tar.gz
+```
+
+### Versioning
+
+`lib/version.sh` in the committed tree always reads `0.0.0`. The release
+workflow rewrites that assignment from the pushed tag (`v1.2.3` becomes
+`1.2.3`) while it builds the tarball, so only a released artefact carries a
+real version. A test guards the placeholder, and the workflow fails the
+build if the rewrite does not take.
+
+Ask an installed copy for its version:
+
+```bash
+./pve-config.sh --version
+```
+
+Each run that touches the host also writes that version to `state/version`.
+An operator can then tell which release configured the machine. A dry run
+writes nothing.
+
+GitHub immutable releases lock a release the moment it publishes. Nobody can
+edit, replace or delete an asset afterwards. Correcting a mistake means
+tagging a new version.
+
+Note that `bootstrap.sh` still fetches the scripts straight from the `main`
+branch rather than from a release tarball.
 
 ## Contributing
 
