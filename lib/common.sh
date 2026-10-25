@@ -647,7 +647,9 @@ _sshd_redirect_includes() {
           "${bare}"/*) operand="${conf_d}/${operand#"${bare}/"}" ;;
           # Everything else is read where sshd would read it, which under a
           # sysroot means beneath that root; a relative path resolves
-          # against /etc/ssh exactly as sshd resolves it.
+          # against /etc/ssh exactly as sshd resolves it. A path already
+          # beneath the root is left alone rather than rooted twice.
+          "${root}"/*) ;;
           /*) operand="${root}${operand}" ;;
           *) operand="${root}/etc/ssh/${operand}" ;;
         esac
@@ -851,8 +853,11 @@ _sshd_emit_directives() {
 
   local real
   real=$(readlink -f -- "${file}" 2>/dev/null) || real=${file}
-  [[ -n ${_SSHD_SEEN[${real}]+set} ]] && return 0
-  _SSHD_SEEN[${real}]=1
+  # A file read once globally and again under a Match says different
+  # things each time, so the guard is against re-reading it in the same
+  # context, not against reading it twice.
+  [[ -n ${_SSHD_SEEN[${real}$'\x1f'${criteria}]+set} ]] && return 0
+  _SSHD_SEEN[${real}$'\x1f'${criteria}]=1
 
   local line keyword value operand resolved target
   local -a operands=()

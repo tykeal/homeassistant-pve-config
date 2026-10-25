@@ -1225,3 +1225,28 @@ zulip_secrets() {
   [[ "$output" == *wheel* ]]
   [ ! -e "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/99-hardening.conf" ]
 }
+
+@test "70-ssh-sudo refuses a key entry that is locked to one address" {
+  seed_admin_access
+  local dir="${PVE_CONFIG_ROOT}/home/alice/.ssh"
+  printf 'from="127.0.0.1" %s\n' "$(admin_keys_for alice)" >"${dir}/authorized_keys"
+
+  run run_phase1_stage 70-ssh-sudo.sh
+  [ "$status" -ne 0 ]
+  [[ "$output" == *restrictions* ]]
+  [ ! -e "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/99-hardening.conf" ]
+  # The restriction is the operator's, so the stage leaves it alone.
+  [[ "$(cat "${dir}/authorized_keys")" == 'from="127.0.0.1" '* ]]
+}
+
+@test "70-ssh-sudo adds up every denial the configuration makes" {
+  seed_admin_access
+  mkdir -p "${PVE_CONFIG_ROOT}/etc/ssh"
+  printf 'DenyUsers alice\nDenyUsers mallory\nInclude /etc/ssh/sshd_config.d/*.conf\n' \
+    >"${PVE_CONFIG_ROOT}/etc/ssh/sshd_config"
+
+  run run_phase1_stage 70-ssh-sudo.sh
+  [ "$status" -ne 0 ]
+  [[ "$output" == *denies* ]]
+  [ ! -e "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/99-hardening.conf" ]
+}

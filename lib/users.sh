@@ -120,6 +120,35 @@ user_join_group() {
 #
 # This is a shape test, not a validity test. Nothing is installed on the
 # strength of it alone; see ssh_key_is_valid.
+# The option list an authorized_keys entry carries, which is everything
+# before the algorithm token.
+_ssh_key_options() {
+  local line=$1 field
+  local -a fields=()
+  read -r -a fields <<<"${line}"
+  local -a opts=()
+  for field in ${fields[@]+"${fields[@]}"}; do
+    case ${field} in
+      ssh-* | ecdsa-* | sk-ssh-* | sk-ecdsa-*) break ;;
+      *) opts+=("${field}") ;;
+    esac
+  done
+  printf '%s\n' "${opts[*]-}"
+}
+
+# Whether an entry would let an administrator log in from anywhere and get
+# a shell. Source restrictions and forced commands may well be deliberate,
+# but they are not something this toolkit can verify remote access through.
+ssh_key_entry_is_unrestricted() {
+  local opts
+  opts=$(_ssh_key_options "$1")
+  [[ -n ${opts} ]] || return 0
+  case ",${opts,,}," in
+    *from=* | *command=* | *restrict* | *no-pty*) return 1 ;;
+  esac
+  return 0
+}
+
 _ssh_key_identity() {
   local line=$1 field
   local -a fields=()

@@ -36,12 +36,16 @@ assert_admin_access() {
     # Active entries only. A commented out key is not one this host would
     # accept, and taking it for one would disable passwords behind a login
     # nobody has.
-    local -A active=()
+    local -A active=() unrestricted=()
     local entry identity
     while IFS= read -r entry || [[ -n ${entry} ]]; do
       _is_comment "${entry}" && continue
       identity=$(_ssh_key_identity "${entry}") || continue
       active["${identity}"]=1
+      # An entry carrying from= or a forced command may be deliberate, but
+      # it is not one this stage can call a working remote login, and
+      # rewriting someone else's restriction is not ours to do either.
+      ssh_key_entry_is_unrestricted "${entry}" && unrestricted["${identity}"]=1
     done <<<"${installed}"
     keys=$(admin_keys_for "${user}")
     while IFS= read -r key || [[ -n ${key} ]]; do
@@ -49,6 +53,8 @@ assert_admin_access() {
       key=$(_ssh_key_identity "${key}") || continue
       [[ -n ${active[${key}]+set} ]] ||
         die "${user}'s configured key is not active in ${file}; run the 60-admin-users stage before hardening SSH."
+      [[ -n ${unrestricted[${key}]+set} ]] ||
+        die "${user}'s only entry for that key in ${file} carries restrictions (from=, command=, restrict or no-pty) that this stage cannot verify remote logins through; add an unrestricted entry or relax the restriction before hardening SSH."
     done <<<"${keys}"
   done
 }
@@ -100,13 +106,17 @@ assert_ssh_admits_admins() {
 
   local -a allow_users=() deny_users=() allow_groups=() deny_groups=()
   local file criteria keyword value
+  local -a more=()
+  # sshd accumulates every occurrence of these keywords rather than
+  # letting the first one win, so each directive adds to the list.
   while IFS=$'\x1f' read -r file criteria keyword value; do
     [[ -n ${criteria} ]] && continue
+    read -r -a more <<<"${value}"
     case ${keyword} in
-      allowusers) read -r -a allow_users <<<"${value}" ;;
-      denyusers) read -r -a deny_users <<<"${value}" ;;
-      allowgroups) read -r -a allow_groups <<<"${value}" ;;
-      denygroups) read -r -a deny_groups <<<"${value}" ;;
+      allowusers) allow_users+=(${more[@]+"${more[@]}"}) ;;
+      denyusers) deny_users+=(${more[@]+"${more[@]}"}) ;;
+      allowgroups) allow_groups+=(${more[@]+"${more[@]}"}) ;;
+      denygroups) deny_groups+=(${more[@]+"${more[@]}"}) ;;
     esac
   done < <(_sshd_config_directives "${main}")
 

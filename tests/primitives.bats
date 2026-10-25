@@ -659,3 +659,21 @@ mark_pmxcfs() {
   [[ "${out}" == *'*.conf' ]]
   [[ "${out}" != *50-site.conf* ]]
 }
+
+@test "install_validated refuses a policy file a Match reads a second time" {
+  mkdir -p "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d"
+  printf 'Include %s/etc/ssh/sshd_config.d/*.conf\nInclude /etc/ssh/site-policy.conf\nMatch User alice\nInclude /etc/ssh/site-policy.conf\n' \
+    "${PVE_CONFIG_ROOT}" \
+    >"${PVE_CONFIG_ROOT}/etc/ssh/sshd_config"
+  printf 'PasswordAuthentication yes\n' \
+    >"${PVE_CONFIG_ROOT}/etc/ssh/site-policy.conf"
+
+  local target="${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/99-hardening.conf"
+  run install_validated "${target}" 'PasswordAuthentication no
+' 0644 validate_sshd_config
+
+  # The global read loses to the fragment, but the one under the Match
+  # still turns passwords back on for alice.
+  [ "$status" -ne 0 ]
+  [ ! -e "${target}" ]
+}
