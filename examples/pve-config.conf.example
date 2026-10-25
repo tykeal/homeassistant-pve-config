@@ -23,17 +23,24 @@ PVE_FQDN='pve1.example.net'
 # --- Networking -----------------------------------------------------------
 
 # Physical interfaces to enslave to the management bridge, space separated.
-# Detected from /sys/class/net when left unset; set it when the host has
-# interfaces that must stay out of the bridge.
+# Left unset, the interface carrying the default route is used, and only
+# that one: putting two live ports in a bridge with STP off invites a
+# broadcast storm, and on a larger host it merges storage or WAN with
+# management. Set this when the uplink cannot be identified, or when the
+# bridge should hold something other than it.
 PVE_BRIDGE_PORTS=''
 
-# Management bridge name and addressing mode: dhcp or static.
-PVE_BRIDGE='vmbr0'
+# Management bridge addressing mode: dhcp or static. The bridge itself is
+# always vmbr0; that name is fixed by convention and is not configurable.
 PVE_BRIDGE_MODE='dhcp'
 
 # Only consulted when PVE_BRIDGE_MODE is static.
 PVE_BRIDGE_ADDRESS=''
 PVE_BRIDGE_GATEWAY=''
+
+# How long to wait for vmbr0 to pick up an address before giving up. The
+# network stage will not write /etc/hosts without a real address.
+PVE_NETWORK_WAIT_SECONDS='60'
 
 # --- Repositories ---------------------------------------------------------
 
@@ -50,9 +57,11 @@ PVE_NO_SUBSCRIPTION='yes'
 # Proxmox with the PVEAdmin role.
 PVE_ADMIN_USERS='alice'
 
-# Public key source used for every admin above. The value is either a
+# Public key source shared by every admin above. The value is either a
 # literal key or a path to a file holding one or more keys. Both forms work;
-# the path form keeps long keys out of this file.
+# the path form keeps long keys out of this file. It may be left unset when
+# every admin has a key of their own below; what is checked is that each
+# admin ends up covered, and that every key is one ssh-keygen accepts.
 PVE_ADMIN_KEY_SOURCE='ssh-ed25519 AAAAC3Nza... alice@example.net'
 # PVE_ADMIN_KEY_SOURCE='/root/pve-config/keys/admins.pub'
 #

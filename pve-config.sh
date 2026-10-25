@@ -355,6 +355,36 @@ After the host comes back, run this script again to continue with phase 2
 EOF
 }
 
+# What phase 1 produced, read back off the host rather than echoed from the
+# values that went in. Every lookup is guarded: this runs at the end of a
+# successful phase and must never be the thing that fails it.
+phase1_summary() {
+  local root value
+  root=$(sysroot)
+
+  printf '\n=== Phase 1 summary ===\n'
+  printf '%-14s %s\n' 'Hostname:' "$(hostname -f 2>/dev/null || printf 'unknown')"
+
+  value=$(detect_ipv4_address vmbr0 2>/dev/null) || value='none'
+  printf '%-14s %s\n' 'vmbr0:' "${value}"
+
+  value=$(cd -- "${root}/etc/pve/nodes" 2>/dev/null && printf '%s ' */ || true)
+  printf '%-14s %s\n' 'Node dir:' "${value:-unknown}"
+
+  local unit
+  for unit in pve-cluster pveproxy pvedaemon pvestatd; do
+    value=$(systemctl is-active "${unit}.service" 2>/dev/null) || value='unknown'
+    printf '%-14s %s\n' "${unit}:" "${value}"
+  done
+
+  if [[ -f ${root}/etc/apt/sources.list.d/proxmox.sources ]]; then
+    value=$(sed -n 's/^Suites: //p' "${root}/etc/apt/sources.list.d/proxmox.sources")
+    printf '%-14s %s\n' 'Apt suite:' "${value:-unknown}"
+  fi
+
+  printf '%-14s %s\n' 'Admins:' "${PVE_ADMIN_USERS:-none}"
+}
+
 # Resolves the whole schema before any stage runs. Stages are children, so a
 # value they resolve cannot be saved by the driver; asking here is what makes
 # every run after the first unattended.
@@ -496,6 +526,7 @@ main() {
   # first becomes complete and is not repeated afterwards.
   if ! dry_run_enabled && [[ ${phase} == 1 ]] && [[ ${STAGES_EXECUTED} -gt 0 ]] &&
     [[ ${phase1_was_complete} == 0 ]] && phase_is_complete 1; then
+    phase1_summary
     reboot_notice
   fi
 }
