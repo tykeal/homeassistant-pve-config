@@ -345,11 +345,9 @@ before you let a run touch networking or SSH policy.
 - **It keeps the originals of the three files it rewrites wholesale.**
   Before first editing `/etc/network/interfaces`, `/etc/hosts` or
   `/root/.bashrc`, the toolkit copies the original to `<path>.pve-config.bak`.
-  The `/etc/hosts` copy carries one caveat: on the DHCP path stage 20
-  installs its dhclient exit hook before reloading the network, so a lease
-  arriving in that window rewrites `/etc/hosts` first and the copy records
-  that rewrite rather than what you started with. Save `/etc/hosts`
-  yourself if it held anything you need.
+  Stage 20 copies `/etc/hosts` aside before it installs the dhclient hook
+  and before it reloads the network, so a lease arriving mid-run cannot get
+  into the copy.
   A file that did not exist gets an empty `<path>.pve-config.absent`
   tombstone, so a later run cannot mistake the toolkit's own output for what
   you had. No other file carries this guarantee: stage 10 rewrites

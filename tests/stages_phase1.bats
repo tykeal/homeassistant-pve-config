@@ -350,6 +350,55 @@ iface lo inet loopback
   [ "$status" -eq 0 ]
 }
 
+@test "20-network backs up /etc/hosts before the hook can rewrite it" {
+  mkdir -p "${PVE_CONFIG_ROOT}/etc"
+  local original='127.0.0.1	localhost
+10.9.0.2	operator-entry
+'
+  printf '%s' "${original}" >"${PVE_CONFIG_ROOT}/etc/hosts"
+  # A lease lands while the network is reloading, which is exactly the
+  # window the hook is installed for.
+  export PVE_CONFIG_MOCK_LEASE_HOSTS="${PVE_CONFIG_ROOT}/etc/hosts"
+
+  run run_phase1_stage 20-network.sh
+  [ "$status" -eq 0 ]
+
+  # The copy is what the operator had, not what the hook or this stage
+  # replaced it with.
+  [ "$(cat "${PVE_CONFIG_ROOT}/etc/hosts.pve-config.bak")" = "$(printf '%s' "${original}")" ]
+  [[ "$(cat "${PVE_CONFIG_ROOT}/etc/hosts")" == *'192.0.2.50	pve1.example.net	pve1'* ]]
+}
+
+@test "20-network keeps the first /etc/hosts backup across runs" {
+  mkdir -p "${PVE_CONFIG_ROOT}/etc"
+  local original='127.0.0.1	localhost
+10.9.0.2	operator-entry
+'
+  printf '%s' "${original}" >"${PVE_CONFIG_ROOT}/etc/hosts"
+
+  run_phase1_stage 20-network.sh
+  run_phase1_stage 20-network.sh
+  [ "$(cat "${PVE_CONFIG_ROOT}/etc/hosts.pve-config.bak")" = "$(printf '%s' "${original}")" ]
+}
+
+@test "20-network takes no /etc/hosts backup under a dry run" {
+  mkdir -p "${PVE_CONFIG_ROOT}/etc"
+  printf '127.0.0.1\tlocalhost\n' >"${PVE_CONFIG_ROOT}/etc/hosts"
+
+  PVE_CONFIG_DRY_RUN=1 run run_phase1_stage 20-network.sh
+  [ "$status" -eq 0 ]
+  [ ! -e "${PVE_CONFIG_ROOT}/etc/hosts.pve-config.bak" ]
+  [ "$(cat "${PVE_CONFIG_ROOT}/etc/hosts")" = '127.0.0.1	localhost' ]
+}
+
+@test "20-network changes nothing under a dry run" {
+  PVE_CONFIG_DRY_RUN=1 run run_phase1_stage 20-network.sh
+  [ "$status" -eq 0 ]
+  [ ! -e "${PVE_CONFIG_ROOT}/etc/network/interfaces" ]
+  [ ! -e "${PVE_CONFIG_ROOT}/etc/hosts" ]
+  [[ "$(mock_calls)" != *'apt-get install'* ]]
+}
+
 # --- 30-pve-cluster -------------------------------------------------------
 
 # The node directory plus the fact that /etc/pve is the pmxcfs filesystem

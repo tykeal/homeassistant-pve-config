@@ -166,6 +166,17 @@ if [[ ${#UNMANAGED[@]} -gt 0 ]]; then
   fi
 fi
 
+# --- /etc/hosts backup ----------------------------------------------------
+
+# Taken before anything on this host can touch the file. The hook installed
+# below rewrites /etc/hosts the moment the bridge takes a lease, so a backup
+# taken any later records that rewrite instead of what the operator had.
+# backup_file is a one-time operation, so a re-run leaves the first copy
+# alone and a dry run takes none at all.
+hosts_path="${SYSROOT}/etc/hosts"
+ensure_dir "${SYSROOT}/etc" 0755 >/dev/null
+backup_file "${hosts_path}" >/dev/null
+
 # --- dhclient exit hook ---------------------------------------------------
 
 # This host's own names are fixed at generation time, as single-quoted
@@ -229,7 +240,6 @@ HAD_PREVIOUS=0
 PREVIOUS_HOSTS=''
 HAD_PREVIOUS_HOSTS=0
 ROLLBACK_ARMED=0
-hosts_path="${SYSROOT}/etc/hosts"
 
 network_rollback() {
   [[ ${ROLLBACK_ARMED} -eq 1 ]] || return 0
@@ -331,7 +341,9 @@ if [[ -z ${address} ]]; then
     die "${BRIDGE} did not take an address within ${WAIT}s; the previous network configuration has been restored."
   fi
 else
-  write_file_backup "${hosts_path}" "\
+  # The original was copied aside before the hook was installed, so this
+  # only has to write; see the backup section above.
+  write_file "${hosts_path}" "\
 127.0.0.1	localhost
 ${address}	${PVE_FQDN}	${PVE_HOSTNAME}
 ::1		ip6-localhost ip6-loopback

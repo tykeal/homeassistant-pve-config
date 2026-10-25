@@ -23,7 +23,17 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-[[ ${syntax_check} -eq 1 ]] || exit 0
+if [[ ${syntax_check} -eq 0 ]]; then
+  # A lease arriving in the reload window. On a real host the dhclient exit
+  # hook rewrites /etc/hosts the instant the bridge is addressed, which is
+  # the moment a backup taken later would record. A test points this at its
+  # scratch copy to model that.
+  if [[ -n ${PVE_CONFIG_MOCK_LEASE_HOSTS:-} ]]; then
+    printf '# rewritten by the dhclient exit hook\n' \
+      >"${PVE_CONFIG_MOCK_LEASE_HOSTS}"
+  fi
+  exit 0
+fi
 
 # A build that will not take an alternate interfaces file reports exactly
 # this, and the caller falls back to ifquery.
