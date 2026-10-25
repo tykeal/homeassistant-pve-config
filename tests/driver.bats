@@ -364,6 +364,33 @@ source_driver() {
   [[ "$output" != *'Phase 1 is complete'* ]]
 }
 
+@test "the phase 1 summary reports what the host ended up with" {
+  use_mocks
+  isolate_system
+  make_stage 1 '10-host.sh' >/dev/null
+  export PVE_ADMIN_USERS='alice bob'
+  mkdir -p "${PVE_CONFIG_ROOT}/etc/apt/sources.list.d" "${PVE_CONFIG_ROOT}/etc/pve/nodes/pve1"
+  printf 'Suites: trixie\n' \
+    >"${PVE_CONFIG_ROOT}/etc/apt/sources.list.d/proxmox.sources"
+
+  source_driver
+  run main --phase 1
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'Phase 1 summary'* ]]
+  [[ "$output" == *'Node dir:'*pve1* ]]
+  [[ "$output" == *'Apt suite:'*trixie* ]]
+  [[ "$output" == *'Admins:'*'alice bob'* ]]
+}
+
+@test "a dry run prints no phase 1 summary" {
+  make_stage 1 '10-host.sh' >/dev/null
+
+  source_driver
+  run main --dry-run
+  [ "$status" -eq 0 ]
+  [[ "$output" != *'Phase 1 summary'* ]]
+}
+
 @test "a dry run never prints the reboot notice" {
   make_stage 1 '10-host.sh' >/dev/null
 

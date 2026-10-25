@@ -12,6 +12,10 @@ export REPO_ROOT
 use_mocks() {
   export PVE_CONFIG_MOCK_LOG="${BATS_TEST_TMPDIR}/mock-calls.log"
   : >"${PVE_CONFIG_MOCK_LOG}"
+  # The stateful mocks keep their fixtures here, which is what lets a stage
+  # be run twice and converge on the second pass.
+  export PVE_CONFIG_MOCK_STATE="${BATS_TEST_TMPDIR}/mock-state"
+  mkdir -p "${PVE_CONFIG_MOCK_STATE}"
   PATH="${REPO_ROOT}/tests/helpers/mocks:${PATH}"
   export PATH
 }
@@ -23,7 +27,7 @@ mock_calls() {
 # Sources the libraries into the current test shell.
 load_libs() {
   local lib
-  for lib in common config detect state schema; do
+  for lib in common config detect state schema pkg users service pve; do
     # shellcheck disable=SC1090
     source "${REPO_ROOT}/lib/${lib}.sh"
   done
@@ -39,6 +43,48 @@ isolate_env() {
   export PVE_CONFIG_BOOT_ID_PATH="${BATS_TEST_TMPDIR}/boot_id"
   printf 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\n' >"${PVE_CONFIG_BOOT_ID_PATH}"
   export PVE_CONFIG_DRY_RUN=0 NON_INTERACTIVE=0 ASSUME_YES=0 FORCE=0 RECONFIGURE=0
+  seed_nics nic0 nic1
+  seed_default_route nic0
+}
+
+# A canned routing table. Uplink detection reads this instead of asking the
+# kernel, so the bridge port a test derives does not depend on how the
+# runner happens to be connected.
+seed_default_route() {
+  export PVE_CONFIG_DEFAULT_ROUTES="${BATS_TEST_TMPDIR}/default-routes"
+  : >"${PVE_CONFIG_DEFAULT_ROUTES}"
+  local dev
+  for dev in "$@"; do
+    printf 'default via 192.0.2.1 dev %s proto dhcp metric 100\n' "${dev}" \
+      >>"${PVE_CONFIG_DEFAULT_ROUTES}"
+  done
+}
+
+# A sysfs fixture standing in for /sys/class/net, so NIC detection answers
+# from the test rather than from whatever the runner happens to be cabled
+# with. Each name gets the `device` link detection uses to tell a real port
+# from a virtual one.
+seed_nics() {
+  export PVE_CONFIG_SYSNET="${BATS_TEST_TMPDIR}/sysnet"
+  rm -rf -- "${PVE_CONFIG_SYSNET}"
+  local name
+  for name in "$@"; do
+    mkdir -p "${PVE_CONFIG_SYSNET}/${name}"
+    : >"${PVE_CONFIG_SYSNET}/${name}/device"
+  done
+}
+
+# Puts the bridge in the fixture holding the given ports, which is what an
+# already-configured host looks like to detection on a re-run.
+seed_bridge() {
+  local bridge=$1
+  shift
+  mkdir -p "${PVE_CONFIG_SYSNET}/${bridge}/brif"
+  : >"${PVE_CONFIG_SYSNET}/${bridge}/bridge"
+  local port
+  for port in "$@"; do
+    mkdir -p "${PVE_CONFIG_SYSNET}/${bridge}/brif/${port}"
+  done
 }
 
 # Writes a stage that records the fact it ran, so ordering and child-process
@@ -83,4 +129,34 @@ stage_ran() {
 
 stage_order() {
   cat "${BATS_TEST_TMPDIR}/stage-order.log" 2>/dev/null || true
+}
+
+# A scratch filesystem the stages write into instead of the host, plus the
+# account fixtures lib/users.sh converges. The ids are the runner's own, so
+# the ownership checks pass without the suite needing to be root.
+isolate_system() {
+  export PVE_CONFIG_ROOT="${BATS_TEST_TMPDIR}/sysroot"
+  export PVE_CONFIG_PASSWD="${PVE_CONFIG_ROOT}/etc/passwd"
+  export PVE_CONFIG_GROUP="${PVE_CONFIG_ROOT}/etc/group"
+  export PVE_CONFIG_MOCK_HOME_BASE="/home"
+  mkdir -p "${PVE_CONFIG_ROOT}/etc" "${PVE_CONFIG_ROOT}/home"
+  printf 'root:x:0:0::/root:/bin/bash\n' >"${PVE_CONFIG_PASSWD}"
+  printf 'root:x:0:\nsudo:x:27:\n' >"${PVE_CONFIG_GROUP}"
+}
+
+# Adds an account to the passwd fixture as if it had always been there.
+seed_user() {
+  local name=$1 shell=${2:-/bin/bash}
+  printf '%s:x:%s:%s::/home/%s:%s\n' \
+    "${name}" "$(id -u)" "$(id -g)" "${name}" "${shell}" >>"${PVE_CONFIG_PASSWD}"
+}
+
+# Runs one of the real phase 1 stages as the driver would: a child process
+# with nothing but the exported environment.
+run_phase1_stage() {
+  bash "${REPO_ROOT}/stages/phase1/$1"
+}
+
+sysroot_file() {
+  printf '%s\n' "${PVE_CONFIG_ROOT}$1"
 }

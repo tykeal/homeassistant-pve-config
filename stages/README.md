@@ -43,14 +43,38 @@ driver rejects both mistakes rather than guessing at an order.
 Each stage:
 
 - starts with `#!/usr/bin/env bash` and `set -euo pipefail`
-- sources the libraries from `${PVE_CONFIG_LIB_DIR}`
+- sources `${PVE_CONFIG_LIB_DIR}/stage.sh`, which pulls in the libraries
+  every stage needs and defines the fixed `vmbr0` bridge name
 - reads its configuration from the environment the driver exports
 - converges rather than asserts: a second run changes nothing
-- routes **every** mutation through `run_cmd`, `write_file`,
-  `ensure_line_in_file` or `backup_file` from `lib/common.sh`
+- prefixes every absolute system path with `$(sysroot)`, so a test can point
+  the stage at a scratch tree instead of the running host
+- routes **every** mutation through the helpers: `run_cmd`, `write_file`,
+  `write_file_backup`, `ensure_line_in_file`, `ensure_exact_line`,
+  `ensure_dir`, `ensure_symlink`, `remove_path` and `install_validated` from
+  `lib/common.sh`, and the convergence helpers in `lib/pkg.sh`,
+  `lib/users.sh`, `lib/service.sh` and `lib/pve.sh`
 - exits non-zero when it cannot reach the desired state
 
 The driver writes the completion marker. A stage must never write its own.
+
+## Convergence helpers
+
+| Module | Covers |
+| --- | --- |
+| `lib/pkg.sh` | apt package install, apt source convergence |
+| `lib/users.sh` | system accounts, group membership, `authorized_keys` |
+| `lib/service.sh` | systemd enable/disable, start/restart/reload, reload |
+| `lib/pve.sh` | `pveum` users and ACLs, waiting for `/etc/pve` |
+
+Each reports `changed` or `unchanged`, no-ops under `--dry-run`, and is safe
+to call on a host that is already in the desired state.
+
+Configuration files that have a validator never go in unchecked:
+`install_validated` writes the candidate to a root-only scratch directory,
+runs `sshd -t -f` or `visudo -c -f` against it, and installs it atomically
+only when it passes. A broken `sshd_config` or `sudoers` on a remote host
+locks the operator out, so there is no path that skips this.
 
 ## Dry run
 

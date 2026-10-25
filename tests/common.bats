@@ -101,11 +101,23 @@ setup() {
   [ "$(cat "${TARGET}.pve-config.bak")" = 'original' ]
 }
 
-@test "backup_file does nothing for a file that does not exist" {
+@test "backup_file records that a file was not there to begin with" {
   run backup_file "${BATS_TEST_TMPDIR}/absent"
   [ "$status" -eq 0 ]
-  [[ "$output" == *unchanged* ]]
   [ ! -e "${BATS_TEST_TMPDIR}/absent.pve-config.bak" ]
+  # Without this marker a later change would back up our own generated file
+  # and present it to the operator as the state they had before.
+  [ -f "${BATS_TEST_TMPDIR}/absent.pve-config.absent" ]
+  [ ! -s "${BATS_TEST_TMPDIR}/absent.pve-config.absent" ]
+}
+
+@test "backup_file does not mistake our own output for operator state" {
+  local target="${BATS_TEST_TMPDIR}/generated"
+  backup_file "${target}" >/dev/null
+  printf 'ours\n' >"${target}"
+  run backup_file "${target}"
+  [ "$status" -eq 0 ]
+  [ ! -e "${target}.pve-config.bak" ]
 }
 
 @test "run_cmd executes normally and only logs under a dry run" {

@@ -176,21 +176,25 @@ _refuse_symlink() {
 # content is written byte for byte, so a caller that wants a trailing
 # newline includes one. Prints "changed" or "unchanged" so callers can
 # report accurately rather than claiming work they did not do.
+# True when write_file would alter the path, so a caller can decide whether
+# anything more expensive (a backup, a validation run) is worth doing.
+write_file_pending() {
+  local path=$1 content=$2 mode=${3:-}
+  if [[ ! -f ${path} ]]; then
+    return 0
+  fi
+  if ! printf '%s' "${content}" | cmp -s - "${path}"; then
+    return 0
+  fi
+  [[ -n ${mode} ]] && ! _mode_matches "${path}" "${mode}"
+}
+
 write_file() {
   local path=$1 content=$2 mode=${3:-}
   _refuse_symlink "${path}"
 
   local changed=0
-  if [[ -f ${path} ]]; then
-    if ! printf '%s' "${content}" | cmp -s - "${path}"; then
-      changed=1
-    fi
-    if [[ -n ${mode} ]] && ! _mode_matches "${path}" "${mode}"; then
-      changed=1
-    fi
-  else
-    changed=1
-  fi
+  write_file_pending "${path}" "${content}" "${mode}" && changed=1
 
   if [[ ${changed} -eq 0 ]]; then
     printf 'unchanged\n'
@@ -269,13 +273,32 @@ ensure_line_in_file() {
 
 # Takes a single pristine copy before the toolkit first edits a file, so the
 # operator can always see what the installer inherited.
+#
+# A file that was not there to begin with gets an empty tombstone instead.
+# Without one, a managed file created by an early run would be backed up on
+# a later one, presenting this toolkit's own output as operator state.
 backup_file() {
   local path=$1
   local backup="${path}.pve-config.bak"
-  if [[ ! -f ${path} ]] || [[ -e ${backup} ]]; then
+  local tombstone="${path}.pve-config.absent"
+
+  if [[ -e ${backup} ]] || [[ -e ${tombstone} ]]; then
     printf 'unchanged\n'
     return 0
   fi
+
+  if [[ ! -f ${path} ]]; then
+    if dry_run_enabled; then
+      log_info "would record that ${path} did not exist"
+      printf 'changed\n'
+      return 0
+    fi
+    _atomic_install "${tombstone}" '' 0644
+    log_info "recorded that ${path} did not exist before pve-config"
+    printf 'changed\n'
+    return 0
+  fi
+
   if dry_run_enabled; then
     log_info "would back up ${path} to ${backup}"
     printf 'changed\n'
@@ -284,6 +307,18 @@ backup_file() {
   cp -p -- "${path}" "${backup}"
   log_info "backed up ${path} to ${backup}"
   printf 'changed\n'
+}
+
+# write_file, preceded by a one-time backup of whatever the operator had
+# there before. The backup is taken only when the content is genuinely about
+# to change; backing up unconditionally would, on the second run, snapshot
+# our own output over the original.
+write_file_backup() {
+  local path=$1 content=$2 mode=${3:-}
+  if write_file_pending "${path}" "${content}" "${mode}"; then
+    backup_file "${path}" >/dev/null
+  fi
+  write_file "${path}" "${content}" "${mode}"
 }
 
 # Yes/no prompt. ASSUME_YES answers yes; NON_INTERACTIVE takes the default
@@ -302,4 +337,724 @@ confirm() {
   read -r -p "${prompt} [${hint}] " reply || reply=''
   reply=${reply:-${default}}
   [[ ${reply} =~ ^[Yy]([Ee][Ss])?$ ]]
+}
+
+# Absolute system paths are built on this prefix so the stages can be
+# exercised against a scratch tree instead of the host they would otherwise
+# reconfigure. It is empty on a real host.
+sysroot() {
+  printf '%s\n' "${PVE_CONFIG_ROOT:-}"
+}
+
+# Private scratch space for candidate files. It lives beside the state
+# directory, which is root owned, because a candidate sudoers or sshd
+# fragment must never be visible at the path those daemons read.
+# A private directory that lives only for the duration of one validation
+# and is removed on every path out. Nothing persists, so a dry run leaves
+# the host exactly as it found it, and a candidate sudoers or sshd file is
+# never readable by anyone but root even for the instant it exists.
+_validation_dir() {
+  local dir
+  dir=$(mktemp -d "${TMPDIR:-/tmp}/pve-config-validate.XXXXXX") || return 1
+  chmod 0700 -- "${dir}" || {
+    rm -rf -- "${dir}"
+    return 1
+  }
+  printf '%s\n' "${dir}"
+}
+
+# Runs a read-only check. Unlike run_cmd this executes during a dry run as
+# well: a validator changes nothing, and its verdict is the whole point of
+# calling it.
+run_check() {
+  log_info "checking: $(redact "$*")"
+  "$@"
+}
+
+# Captures a helper's verdict into a named variable, and dies when the
+# helper itself failed.
+#
+# `[[ $(write_file ...) == changed ]]` cannot tell a refusal from a no-op:
+# die runs inside the command substitution's subshell, so the caller sees an
+# empty string and a comparison that is merely false. Everything that merges
+# a verdict goes through this instead, so a refused symlink or a failed chown
+# stops the run rather than being reported as "nothing to do".
+state_of() {
+  local __var=$1
+  shift
+  local __out
+  __out=$("$@") || die "Failed while running: $(redact "$*")"
+  printf -v "${__var}" '%s' "${__out}"
+}
+
+_owner_matches() {
+  local path=$1 uid=$2 gid=$3 current
+  current=$(stat -c '%u:%g' -- "${path}" 2>/dev/null) || return 1
+  [[ ${current} == "${uid}:${gid}" ]]
+}
+
+# Numeric ids rather than names: the toolkit reads them out of the passwd
+# database it is converging, and a name lookup would have to agree with it.
+ensure_owner() {
+  local path=$1 uid=$2 gid=$3
+  if _owner_matches "${path}" "${uid}" "${gid}"; then
+    printf 'unchanged\n'
+    return 0
+  fi
+  if dry_run_enabled; then
+    log_info "would set the owner of ${path} to ${uid}:${gid}"
+    printf 'changed\n'
+    return 0
+  fi
+  chown -- "${uid}:${gid}" "${path}" || die "Unable to set the owner of ${path}"
+  log_info "set the owner of ${path} to ${uid}:${gid}"
+  printf 'changed\n'
+}
+
+ensure_dir() {
+  local path=$1 mode=${2:-} uid=${3:-} gid=${4:-}
+  local changed=0
+
+  if [[ -L ${path} ]]; then
+    die "Refusing to use the symlink ${path} as a directory"
+  fi
+  if [[ -e ${path} && ! -d ${path} ]]; then
+    die "Refusing to use ${path} as a directory: it is not one"
+  fi
+
+  if [[ ! -d ${path} ]]; then
+    changed=1
+    if dry_run_enabled; then
+      log_info "would create the directory ${path}"
+      printf 'changed\n'
+      return 0
+    fi
+    mkdir -p -- "${path}" || die "Unable to create the directory ${path}"
+    log_info "created the directory ${path}"
+  fi
+
+  if [[ -n ${mode} ]] && ! _mode_matches "${path}" "${mode}"; then
+    changed=1
+    if dry_run_enabled; then
+      log_info "would set mode ${mode} on ${path}"
+    else
+      chmod -- "${mode}" "${path}" || die "Unable to set mode ${mode} on ${path}"
+    fi
+  fi
+
+  if [[ -n ${uid} && -n ${gid} ]]; then
+    local owner_state
+    state_of owner_state ensure_owner "${path}" "${uid}" "${gid}"
+    if [[ ${owner_state} == changed ]]; then
+      changed=1
+    fi
+  fi
+
+  if [[ ${changed} -eq 1 ]]; then
+    printf 'changed\n'
+  else
+    printf 'unchanged\n'
+  fi
+}
+
+# Clears the group and other write bits and leaves every other bit alone.
+# Several things OpenSSH reads are refused outright when a path anybody
+# else can write to leads to them, and rewriting the whole mode to repair
+# that would discard whatever the operator meant by the rest of it.
+ensure_not_group_other_writable() {
+  local path=$1 mode
+  if [[ ! -e ${path} ]]; then
+    # Nothing on disk yet, which under a dry run is the normal case: the
+    # directory the caller just reported it would create.
+    printf 'unchanged\n'
+    return 0
+  fi
+  mode=$(stat -c '%a' -- "${path}" 2>/dev/null) || die "Unable to read the mode of ${path}"
+  if ((8#${mode} & 8#22)); then
+    if dry_run_enabled; then
+      log_info "would clear the group and other write bits on ${path}"
+      printf 'changed\n'
+      return 0
+    fi
+    chmod go-w -- "${path}" || die "Unable to clear the write bits on ${path}"
+    log_info "cleared the group and other write bits on ${path}"
+    printf 'changed\n'
+    return 0
+  fi
+  printf 'unchanged\n'
+}
+
+remove_path() {
+  local path=$1
+  if [[ ! -e ${path} && ! -L ${path} ]]; then
+    printf 'unchanged\n'
+    return 0
+  fi
+  if dry_run_enabled; then
+    log_info "would remove ${path}"
+    printf 'changed\n'
+    return 0
+  fi
+  rm -f -- "${path}" || die "Unable to remove ${path}"
+  log_info "removed ${path}"
+  printf 'changed\n'
+}
+
+# Points link at target. An existing regular file is backed up first, since
+# replacing it is the one case where the original content would be lost.
+ensure_symlink() {
+  local target=$1 link=$2 current=''
+  if [[ -L ${link} ]]; then
+    current=$(readlink -- "${link}") || current=''
+    if [[ ${current} == "${target}" ]]; then
+      printf 'unchanged\n'
+      return 0
+    fi
+  elif [[ -f ${link} ]]; then
+    backup_file "${link}" >/dev/null
+  elif [[ -e ${link} ]]; then
+    die "Refusing to replace ${link} with a symlink: it is not a regular file"
+  fi
+
+  if dry_run_enabled; then
+    log_info "would link ${link} to ${target}"
+    printf 'changed\n'
+    return 0
+  fi
+  ln -sfn -- "${target}" "${link}" || die "Unable to link ${link} to ${target}"
+  log_info "linked ${link} to ${target}"
+  printf 'changed\n'
+}
+
+_is_comment() {
+  local text=$1
+  text=${text#"${text%%[![:space:]]*}"}
+  [[ ${text} == '#'* ]]
+}
+
+# Leaves exactly one active line matching a pattern, wherever the file had
+# them before. ensure_line_in_file only appends when nothing matches, which
+# is why a `sed -i '1a ...'` replacement needs this instead: the duplicates
+# an earlier run left behind have to be removed, not merely not added to.
+#
+# Commented out variants are left alone, so an operator's note about why a
+# line was disabled survives.
+#
+# position is append, prepend, or after-first, the last of which reproduces
+# the placement a PAM stack expects without reproducing the duplication.
+ensure_exact_line() {
+  local path=$1 match=$2 line=$3 position=${4:-append}
+  _refuse_symlink "${path}"
+
+  local -a kept=()
+  local existing
+  if [[ -f ${path} ]]; then
+    while IFS= read -r existing || [[ -n ${existing} ]]; do
+      if ! _is_comment "${existing}" && [[ ${existing} =~ ${match} ]]; then
+        continue
+      fi
+      kept+=("${existing}")
+    done <"${path}"
+  fi
+
+  case ${position} in
+    prepend)
+      kept=("${line}" ${kept[@]+"${kept[@]}"})
+      ;;
+    append)
+      kept+=("${line}")
+      ;;
+    after-first)
+      if [[ ${#kept[@]} -eq 0 ]]; then
+        kept=("${line}")
+      else
+        local -a rest=("${kept[@]:1}")
+        kept=("${kept[0]}" "${line}" ${rest[@]+"${rest[@]}"})
+      fi
+      ;;
+    *) die "ensure_exact_line: unknown position '${position}'" ;;
+  esac
+
+  local rebuilt=''
+  for existing in "${kept[@]}"; do
+    rebuilt+="${existing}"$'\n'
+  done
+
+  local original=''
+  _slurp original "${path}"
+  if [[ ${rebuilt} == "${original}" ]]; then
+    printf 'unchanged\n'
+    return 0
+  fi
+
+  if dry_run_enabled; then
+    log_info "would set the ${match} line in ${path}"
+    printf 'changed\n'
+    return 0
+  fi
+
+  backup_file "${path}" >/dev/null
+  _atomic_install "${path}" "${rebuilt}"
+  log_info "set the ${match} line in ${path}"
+  printf 'changed\n'
+}
+
+_sshd_binary() {
+  local candidate
+  candidate=$(command -v sshd 2>/dev/null) || candidate=''
+  if [[ -z ${candidate} && -x /usr/sbin/sshd ]]; then
+    candidate=/usr/sbin/sshd
+  fi
+  [[ -n ${candidate} ]] || return 1
+  printf '%s\n' "${candidate}"
+}
+
+# A validator's tool can be absent precisely because a dry run declined to
+# install the package providing it. That cannot fail a dry run, and must
+# always fail a real one.
+_validator_missing() {
+  local tool=$1 target=$2
+  if dry_run_enabled; then
+    log_warn "${tool} is not installed; would validate ${target} once it is"
+    return 0
+  fi
+  log_error "${tool} is not installed; refusing to install an unvalidated ${target}"
+  return 1
+}
+
+# Points every Include that referred to the host's sshd_config.d at the
+# scratch copy of it, leaving the filename or glob it named -- and any other
+# operand on the line -- exactly as it was.
+_sshd_redirect_includes() {
+  local body=$1 src=$2 conf_d=$3
+  local bare='/etc/ssh/sshd_config.d'
+  local root
+  root=$(sysroot)
+  local line trimmed keyword operand rewritten out=''
+  local -a operands=()
+  while IFS= read -r line || [[ -n ${line} ]]; do
+    trimmed=${line#"${line%%[![:space:]]*}"}
+    if [[ ${trimmed} == [Ii]nclude[[:space:]]* ]]; then
+      keyword=${trimmed%%[[:space:]]*}
+      rewritten=''
+      # read, not an unquoted expansion: the operand is a pattern naming
+      # files on the host, and letting the shell expand it here would
+      # replace it with whatever happens to match outside the scratch tree.
+      read -r -a operands <<<"${trimmed#"${keyword}"}"
+      for operand in ${operands[@]+"${operands[@]}"}; do
+        case ${operand} in
+          "${src}"/*) operand="${conf_d}/${operand#"${src}/"}" ;;
+          "${bare}"/*) operand="${conf_d}/${operand#"${bare}/"}" ;;
+          # Everything else is read where sshd would read it, which under a
+          # sysroot means beneath that root; a relative path resolves
+          # against /etc/ssh exactly as sshd resolves it. A path already
+          # beneath the root is left alone rather than rooted twice.
+          "${root}"/*) ;;
+          /*) operand="${root}${operand}" ;;
+          *) operand="${root}/etc/ssh/${operand}" ;;
+        esac
+        rewritten+=" ${operand}"
+      done
+      line="${keyword}${rewritten}"
+    fi
+    out+="${line}"$'\n'
+  done <<<"${body}"
+  printf '%s' "${out%$'\n'}"
+}
+
+# Whether the assembled configuration actually pulls the candidate in. An
+# Include naming one file rather than the whole directory does not, and
+# validating a fragment on the strength of an Include that excludes it is
+# how a host ends up reporting itself hardened and still taking passwords.
+_sshd_includes_candidate() {
+  local body=$1 candidate=$2
+  local line trimmed glob match
+  local -a operands=()
+  while IFS= read -r line || [[ -n ${line} ]]; do
+    trimmed=${line#"${line%%[![:space:]]*}"}
+    [[ ${trimmed} == [Ii]nclude[[:space:]]* ]] || continue
+    read -r -a operands <<<"${trimmed#*[[:space:]]}"
+    for glob in ${operands[@]+"${operands[@]}"}; do
+      for match in ${glob}; do
+        [[ ${match} == "${candidate}" ]] && return 0
+      done
+    done
+  done <<<"${body}"
+  return 1
+}
+
+# Assembles the configuration sshd would actually read: the host's own
+# sshd_config, its Include redirected into a scratch tree, every other
+# fragment it would pull in, and the candidate in place of the one being
+# replaced. Checking the fragment on its own would miss every interaction
+# between it and the rest of the configuration.
+_sshd_effective_config() {
+  local candidate=$1 target=$2 dir=$3
+  local conf_d="${dir}/sshd_config.d"
+  local base main body='' existing root
+  root=$(sysroot)
+  base=$(basename -- "${target}")
+
+  mkdir -p -- "${conf_d}" || return 1
+
+  # Every file in the directory, not only *.conf: an Include naming
+  # `site-policy` or `*.cfg` pulls in whatever it names, and leaving those
+  # out of the scratch tree would validate a configuration the daemon does
+  # not have.
+  local src="${root}/etc/ssh/sshd_config.d"
+  if [[ -d ${src} ]]; then
+    for existing in "${src}"/*; do
+      [[ -f ${existing} ]] || continue
+      [[ $(basename -- "${existing}") == "${base}" ]] && continue
+      cp -- "${existing}" "${conf_d}/" || return 1
+    done
+  fi
+  cp -- "${candidate}" "${conf_d}/${base}" || return 1
+
+  main="${dir}/sshd_config"
+  local host_main="${root}/etc/ssh/sshd_config"
+  if [[ -f ${host_main} ]]; then
+    local original=''
+    _slurp original "${host_main}"
+    body=$(_sshd_redirect_includes "${original}" "${src}" "${conf_d}")
+    body+=$'\n'
+    # Rewriting the directory an Include points at, rather than the whole
+    # directive, is what keeps this honest: a host that includes one named
+    # file rather than the whole directory still includes only that file
+    # here, and the check below notices that the candidate is not among
+    # them instead of approving a fragment sshd would never read.
+    if ! _sshd_includes_candidate "${body}" "${conf_d}/${base}"; then
+      if dry_run_enabled || [[ ${PVE_CONFIG_SSHD_ASSUME_INCLUDE:-0} == 1 ]]; then
+        # The caller adds the Include before installing; during a dry run it
+        # has not, and a caller that deliberately defers the Include until
+        # the fragment has validated has not either. The assembled
+        # configuration stands in for the one sshd will read rather than
+        # failing on a file nothing has written yet.
+        log_info "${host_main} does not include ${base}; an Include would be added"
+        body="Include ${conf_d}/*.conf"$'\n'"${body}"
+      else
+        log_error "${host_main} does not include ${base}, so sshd would never read it"
+        return 1
+      fi
+    fi
+  else
+    body="Include ${conf_d}/*.conf"$'\n'
+  fi
+
+  printf '%s' "${body}" >"${main}" || return 1
+  printf '%s\n' "${main}"
+}
+
+# OpenSSH accepts ChallengeResponseAuthentication as an alias for
+# KbdInteractiveAuthentication, so a conditional block spelled the old way
+# would slip past a check that compared keywords literally.
+_sshd_canonical_keyword() {
+  local keyword=${1,,}
+  case ${keyword} in
+    challengeresponseauthentication) printf 'kbdinteractiveauthentication\n' ;;
+    *) printf '%s\n' "${keyword}" ;;
+  esac
+}
+
+_sshd_canonical_value() {
+  local value=${1,,}
+  case ${value} in
+    prohibit-password | without-password) printf 'without-password\n' ;;
+    forced-commands-only) printf 'forced-commands-only\n' ;;
+    true) printf 'yes\n' ;;
+    false) printf 'no\n' ;;
+    *) printf '%s\n' "${value}" ;;
+  esac
+}
+
+# sshd keeps the *first* value it obtains for a keyword, so a fragment that
+# parses cleanly can still lose to the main configuration or to a fragment
+# that sorts ahead of it; cloud-init's 50-cloud-init.conf turning password
+# authentication back on is the usual way a host stays reachable by password
+# after this toolkit has reported it hardened. Asking sshd what the assembled
+# configuration resolves to is the only way to notice.
+_sshd_candidate_takes_effect() {
+  local binary=$1 candidate=$2 effective=$3
+  local resolved line keyword value actual
+
+  if ! resolved=$("${binary}" -T -f "${effective}" 2>/dev/null); then
+    log_warn 'sshd would not resolve the effective configuration; its values were not verified'
+    return 0
+  fi
+
+  while IFS= read -r line || [[ -n ${line} ]]; do
+    line=${line#"${line%%[![:space:]]*}"}
+    [[ -z ${line} || ${line} == '#'* ]] && continue
+    keyword=${line%%[[:space:]]*}
+    value=${line#"${keyword}"}
+    value=${value#"${value%%[![:space:]]*}"}
+    [[ -n ${value} ]] || continue
+    keyword=${keyword,,}
+    actual=$(awk -v k="${keyword}" \
+      'tolower($1) == k { $1 = ""; sub(/^[[:space:]]+/, ""); print; exit }' \
+      <<<"${resolved}")
+    # Only keywords sshd reports back are checked; a repeated one such as
+    # HostKey has no single effective value to compare against.
+    [[ -n ${actual} ]] || continue
+    # sshd reports some values under their canonical spelling rather than
+    # the accepted synonym a file used: prohibit-password comes back as
+    # without-password, and the booleans as yes and no.
+    if [[ $(_sshd_canonical_value "${actual}") != "$(_sshd_canonical_value "${value}")" ]]; then
+      log_error "sshd resolves ${keyword} to '${actual}' rather than the '${value}' this file asks for; something read earlier wins."
+      return 1
+    fi
+  done <"${candidate}"
+}
+
+# Walks the Include graph of an sshd configuration and reports every
+# directive it finds as `file US criteria US keyword US value`, with the
+# criteria empty outside a conditional block. The unit separator is used
+# rather than a tab because `read` would fold an empty field away between
+# two whitespace delimiters. Includes are followed
+# wherever they lead, not only into sshd_config.d: a policy file an
+# operator includes by name is as much a part of this host's
+# configuration as anything else, and a check that stops at the first
+# Include is a check that can be stepped around.
+#
+# Relative Include paths resolve against /etc/ssh, as sshd resolves them,
+# and everything is read beneath the sysroot so a test sees the tree it
+# set up rather than the one this process is running on.
+declare -gA _SSHD_SEEN=()
+declare -g _SSHD_ROOT=''
+declare -g _SSHD_LITERAL=''
+
+# root is the sysroot every path is read beneath; literal names a prefix
+# whose paths are already resolved (the scratch tree an assembled
+# configuration lives in) and must not be rooted a second time.
+_sshd_config_directives() {
+  _SSHD_SEEN=()
+  _SSHD_ROOT=${2-$(sysroot)}
+  _SSHD_LITERAL=${3:-}
+  _sshd_emit_directives "$1" ''
+}
+
+_sshd_resolve_include() {
+  local operand=$1
+  [[ ${operand} == /* ]] || operand="/etc/ssh/${operand}"
+  if [[ -n ${_SSHD_LITERAL} && ${operand} == "${_SSHD_LITERAL}"* ]]; then
+    printf '%s\n' "${operand}"
+    return 0
+  fi
+  if [[ -n ${_SSHD_ROOT} && ${operand} == "${_SSHD_ROOT}"/* ]]; then
+    printf '%s\n' "${operand}"
+    return 0
+  fi
+  printf '%s\n' "${_SSHD_ROOT}${operand}"
+}
+
+_sshd_emit_directives() {
+  local file=$1 criteria=$2
+  [[ -r ${file} ]] || return 0
+
+  local real
+  real=$(readlink -f -- "${file}" 2>/dev/null) || real=${file}
+  # A file read once globally and again under a Match says different
+  # things each time, so the guard is against re-reading it in the same
+  # context, not against reading it twice.
+  [[ -n ${_SSHD_SEEN[${real}$'\x1f'${criteria}]+set} ]] && return 0
+  _SSHD_SEEN[${real}$'\x1f'${criteria}]=1
+
+  local line keyword value operand resolved target
+  local -a operands=()
+  while IFS= read -r line || [[ -n ${line} ]]; do
+    line=${line#"${line%%[![:space:]]*}"}
+    [[ -z ${line} || ${line} == '#'* ]] && continue
+    keyword=${line%%[[:space:]]*}
+    value=${line#"${keyword}"}
+    value=${value#"${value%%[![:space:]]*}"}
+    value=${value%"${value##*[![:space:]]}"}
+    case ${keyword,,} in
+      include)
+        read -r -a operands <<<"${value}"
+        for operand in ${operands[@]+"${operands[@]}"}; do
+          resolved=$(_sshd_resolve_include "${operand}")
+          # Word splitting and globbing are what resolve the pattern sshd
+          # would resolve; the operand came from a configuration file this
+          # host already reads.
+          for target in ${resolved}; do
+            [[ -f ${target} ]] || continue
+            _sshd_emit_directives "${target}" "${criteria}"
+          done
+        done
+        ;;
+      match)
+        # `Match all` returns to the unconditional part of the file.
+        if [[ ${value,,} == all ]]; then
+          criteria=''
+        else
+          criteria=${value}
+        fi
+        ;;
+      *)
+        [[ -n ${value} ]] || continue
+        printf '%s\x1f%s\x1f%s\x1f%s\n' "${file}" "${criteria}" "${keyword,,}" "${value}"
+        ;;
+    esac
+  done <"${file}"
+}
+
+# `sshd -T` reports the configuration as it resolves for no particular
+# connection, so a Match block is never entered and its overrides are
+# invisible to the check above. A `Match User alice` that turns password
+# authentication back on would leave this host taking passwords for alice
+# while the global dump agreed with the candidate in every respect.
+#
+# Rather than guess which contexts matter, any conditional setting that
+# disagrees with the candidate is refused: the operator is asked to resolve
+# the contradiction instead of being told the host is hardened when part of
+# it is not.
+_sshd_conditional_overrides() {
+  local candidate=$1 main=$2
+
+  local -A wanted=()
+  local line keyword value
+  while IFS= read -r line || [[ -n ${line} ]]; do
+    line=${line#"${line%%[![:space:]]*}"}
+    [[ -z ${line} || ${line} == '#'* ]] && continue
+    keyword=${line%%[[:space:]]*}
+    value=${line#"${keyword}"}
+    value=${value#"${value%%[![:space:]]*}"}
+    [[ -n ${value} ]] || continue
+    wanted[$(_sshd_canonical_keyword "${keyword}")]=$(_sshd_canonical_value "${value}")
+  done <"${candidate}"
+  [[ ${#wanted[@]} -gt 0 ]] || return 0
+  [[ -f ${main} ]] || return 0
+
+  local criteria file
+  while IFS=$'\x1f' read -r file criteria keyword value; do
+    [[ -n ${criteria} ]] || continue
+    keyword=$(_sshd_canonical_keyword "${keyword}")
+    [[ -n ${wanted[${keyword}]+set} ]] || continue
+    [[ $(_sshd_canonical_value "${value}") == "${wanted[${keyword}]}" ]] && continue
+    log_error "${file} sets ${keyword} to '${value}' under 'Match ${criteria}', contradicting this file; resolve that before hardening."
+    return 1
+  done < <(_sshd_config_directives "${main}" "$(sysroot)" "$(dirname -- "${main}")")
+}
+
+# Validators receive the candidate and the path it is destined for, and
+# return non-zero when installing it would be a mistake. They never read the
+# installed file, so a dry run checks exactly what a real run would write.
+validate_sshd_config() {
+  local candidate=$1 target=${2:-$1}
+  local binary effective output
+
+  binary=$(_sshd_binary) || {
+    _validator_missing sshd 'sshd configuration'
+    return
+  }
+
+  effective=$(_sshd_effective_config "${candidate}" "${target}" "$(dirname -- "${candidate}")") ||
+    {
+      log_error 'Unable to assemble the effective sshd configuration'
+      return 1
+    }
+
+  log_info "checking the effective sshd configuration for ${target}"
+  if ! output=$("${binary}" -t -f "${effective}" 2>&1); then
+    # Off a real host, and as an ordinary user, sshd gets as far as loading
+    # host keys and stops there. The configuration itself parsed, which is
+    # the only thing being asked.
+    #
+    # Matched as the whole diagnostic rather than as a substring: a run that
+    # also reported a real problem must not be waved through because this
+    # line happened to appear in it. sshd ends the line with CR, hence the
+    # trailing whitespace allowance.
+    if [[ ${output} =~ ^[[:alnum:]_./-]*sshd:\ no\ hostkeys\ available\ --\ exiting\.[[:space:]]*$ ]]; then
+      log_warn 'sshd found no host keys; the configuration itself parsed cleanly'
+    else
+      log_error "${output}"
+      return 1
+    fi
+  fi
+
+  _sshd_candidate_takes_effect "${binary}" "${candidate}" "${effective}" || return 1
+  # The assembled configuration, not the installed one: a managed fragment
+  # that drifted into a conflicting Match block is replaced by the
+  # candidate, and rereading the obsolete file would refuse the repair.
+  _sshd_conditional_overrides "${candidate}" "${effective}"
+}
+
+validate_sudoers_file() {
+  local candidate=$1 target=${2:-$1}
+  command -v visudo >/dev/null 2>&1 || {
+    _validator_missing visudo 'sudoers file'
+    return
+  }
+  log_info "checking the sudoers candidate for ${target}"
+  run_check visudo -c -f "${candidate}" >&2
+}
+
+# ifupdown2 will refuse a description it cannot parse, and it refuses it at
+# the point the interfaces are being reconfigured -- which on a remote host
+# is after they have gone down. Parsing it first moves the refusal to a
+# point where nothing has changed yet.
+#
+# `--syntax-check` belongs to ifreload; ifquery's `-s` is `--syntax-help`
+# and parses nothing. ifreload is therefore asked first, and ifquery's
+# documented parse-and-dump is the fallback for a build whose ifreload
+# will not take an alternate interfaces file.
+validate_interfaces_file() {
+  local candidate=$1 target=${2:-$1}
+  local output
+
+  if command -v ifreload >/dev/null 2>&1; then
+    log_info "checking the network interfaces candidate for ${target}"
+    if output=$(ifreload --syntax-check -a -i "${candidate}" 2>&1); then
+      [[ -n ${output} ]] && printf '%s\n' "${output}" >&2
+      return 0
+    fi
+    if [[ ${output} != *'unrecognized arguments'* && ${output} != *'unrecognized option'* ]]; then
+      printf '%s\n' "${output}" >&2
+      return 1
+    fi
+    log_warn 'ifreload will not read an alternate interfaces file; parsing with ifquery instead'
+  fi
+
+  command -v ifquery >/dev/null 2>&1 || {
+    _validator_missing ifreload 'network interfaces file'
+    return
+  }
+  log_info "parsing the network interfaces candidate for ${target}"
+  run_check ifquery -a -i "${candidate}" >&2
+}
+
+# Writes the candidate into a directory only root can reach, hands it to a
+# validator, and installs it only once the validator is happy. A malformed
+# sshd or sudoers file locks the operator out of a remote host, so this is
+# the only way either is ever written.
+#
+# Validation runs during a dry run too, and leaves nothing behind on either
+# path: the scratch directory is removed before this returns.
+install_validated() {
+  local path=$1 content=$2 mode=$3 validator=$4
+  _refuse_symlink "${path}"
+  declare -F "${validator}" >/dev/null 2>&1 ||
+    die "install_validated: no such validator '${validator}'"
+
+  local dir status=0
+  dir=$(_validation_dir) || die "Unable to create a validation directory for ${path}"
+
+  # The candidate is prepared and checked inside a subshell so that the
+  # cleanup trap belongs to it. A trap set here would have to displace
+  # whatever the caller had installed, and a stage that is holding a
+  # rollback trap of its own cannot afford to have it dropped.
+  (
+    trap 'rm -rf -- "${dir}"' EXIT HUP INT TERM
+    candidate="${dir}/$(basename -- "${path}")"
+    printf '%s' "${content}" >"${candidate}" || exit 2
+    chmod -- "${mode}" "${candidate}" || exit 2
+    "${validator}" "${candidate}" "${path}" || exit 3
+  ) || status=$?
+  rm -rf -- "${dir}"
+
+  [[ ${status} -ne 2 ]] || die "Unable to prepare the candidate for ${path}"
+  [[ ${status} -eq 0 ]] ||
+    die "Refusing to install ${path}: the candidate failed validation"
+
+  write_file "${path}" "${content}" "${mode}"
 }
