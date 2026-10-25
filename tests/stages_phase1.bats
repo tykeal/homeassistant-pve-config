@@ -1005,3 +1005,68 @@ zulip_secrets() {
   [[ "${unit}" == *'RemainAfterExit=yes'* ]]
   [[ "${unit}" != *'WantedBy=shutdown.target'* ]]
 }
+
+@test "20-network refuses to drop a source directive it does not manage" {
+  mkdir -p "${PVE_CONFIG_ROOT}/etc/network"
+  printf 'source /etc/network/storage/*.cfg\n\nauto lo\niface lo inet loopback\n' \
+    >"${PVE_CONFIG_ROOT}/etc/network/interfaces"
+
+  run run_phase1_stage 20-network.sh
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'/etc/network/storage'* ]]
+}
+
+@test "20-network refuses to drop a manual stanza that carries commands" {
+  mkdir -p "${PVE_CONFIG_ROOT}/etc/network"
+  printf 'auto lo\niface lo inet loopback\n\niface nic2 inet manual\n        mtu 9000\n        up ip addr add 10.9.0.2/24 dev nic2\n' \
+    >"${PVE_CONFIG_ROOT}/etc/network/interfaces"
+
+  run run_phase1_stage 20-network.sh
+  [ "$status" -ne 0 ]
+  [[ "$output" == *nic2* ]]
+}
+
+@test "40-repos keeps the signing key of a legacy Ceph list" {
+  mkdir -p "${PVE_CONFIG_ROOT}/etc/apt/sources.list.d"
+  printf 'deb [signed-by=/etc/apt/keyrings/ceph.gpg] https://enterprise.proxmox.com/debian/ceph-squid trixie enterprise\n' \
+    >"${PVE_CONFIG_ROOT}/etc/apt/sources.list.d/ceph.list"
+
+  run run_phase1_stage 40-repos.sh
+  [ "$status" -eq 0 ]
+  local body
+  body=$(cat "${PVE_CONFIG_ROOT}/etc/apt/sources.list.d/ceph.sources")
+  [[ "${body}" == *'URIs: http'*'download.proxmox.com/debian/ceph-squid'* ]]
+  [[ "${body}" == *'Suites: trixie'* ]]
+  [[ "${body}" == *'Signed-By: /etc/apt/keyrings/ceph.gpg'* ]]
+}
+
+@test "70-ssh-sudo does not take a commented key for an active one" {
+  seed_user alice
+  mkdir -p "${PVE_CONFIG_ROOT}/home/alice/.ssh"
+  printf '# %s\n' "${PVE_ADMIN_KEY_SOURCE}" \
+    >"${PVE_CONFIG_ROOT}/home/alice/.ssh/authorized_keys"
+
+  run run_phase1_stage 70-ssh-sudo.sh
+  [ "$status" -ne 0 ]
+  [ ! -e "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/99-hardening.conf" ]
+}
+
+@test "70-ssh-sudo keeps an Include that names another policy file" {
+  seed_admin_access
+  mkdir -p "${PVE_CONFIG_ROOT}/etc/ssh"
+  printf 'Include /etc/ssh/site-policy.conf\nPort 22\n' \
+    >"${PVE_CONFIG_ROOT}/etc/ssh/sshd_config"
+
+  run run_phase1_stage 70-ssh-sudo.sh
+  [ "$status" -eq 0 ]
+  local body
+  body=$(cat "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config")
+  [[ "${body}" == *'Include /etc/ssh/site-policy.conf'* ]]
+  [[ "${body}" == *'Include /etc/ssh/sshd_config.d/*.conf'* ]]
+}
+
+@test "90-zulip arms the shutdown unit in this boot" {
+  zulip_secrets
+  run_phase1_stage 90-zulip.sh
+  [[ "$(mock_calls)" == *'systemctl start -- zulip-shutdown-notify.service'* ]]
+}

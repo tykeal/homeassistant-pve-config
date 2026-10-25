@@ -595,6 +595,46 @@ _validator_missing() {
   return 1
 }
 
+# Points every Include that referred to the host's sshd_config.d at the
+# scratch copy of it, leaving the filename or glob it named -- and any other
+# operand on the line -- exactly as it was.
+_sshd_redirect_includes() {
+  local body=$1 src=$2 conf_d=$3
+  local bare='/etc/ssh/sshd_config.d'
+  local line trimmed out=''
+  while IFS= read -r line || [[ -n ${line} ]]; do
+    trimmed=${line#"${line%%[![:space:]]*}"}
+    if [[ ${trimmed} == [Ii]nclude[[:space:]]* ]]; then
+      line=${line//"${src}/"/"${conf_d}/"}
+      # Also the unprefixed path, which is what the directive says on a real
+      # host and what this toolkit writes into it under a sysroot too.
+      line=${line//"${bare}/"/"${conf_d}/"}
+    fi
+    out+="${line}"$'\n'
+  done <<<"${body}"
+  printf '%s' "${out%$'\n'}"
+}
+
+# Whether the assembled configuration actually pulls the candidate in. An
+# Include naming one file rather than the whole directory does not, and
+# validating a fragment on the strength of an Include that excludes it is
+# how a host ends up reporting itself hardened and still taking passwords.
+_sshd_includes_candidate() {
+  local body=$1 candidate=$2
+  local line trimmed operand glob match
+  while IFS= read -r line || [[ -n ${line} ]]; do
+    trimmed=${line#"${line%%[![:space:]]*}"}
+    [[ ${trimmed} == [Ii]nclude[[:space:]]* ]] || continue
+    operand=${trimmed#*[[:space:]]}
+    for glob in ${operand}; do
+      for match in ${glob}; do
+        [[ ${match} == "${candidate}" ]] && return 0
+      done
+    done
+  done <<<"${body}"
+  return 1
+}
+
 # Assembles the configuration sshd would actually read: the host's own
 # sshd_config, its Include redirected into a scratch tree, every other
 # fragment it would pull in, and the candidate in place of the one being
@@ -622,20 +662,26 @@ _sshd_effective_config() {
   main="${dir}/sshd_config"
   local host_main="${root}/etc/ssh/sshd_config"
   if [[ -f ${host_main} ]]; then
-    _slurp body "${host_main}"
-    if [[ ${body} =~ (^|$'\n')[[:space:]]*[Ii]nclude[[:space:]] ]]; then
-      body=$(printf '%s' "${body}" |
-        sed -E "s|^([[:space:]]*[Ii]nclude[[:space:]]+).*sshd_config\.d/.*|\1${conf_d}/*.conf|")
-      body+=$'\n'
-    elif dry_run_enabled; then
-      # The caller adds the Include before installing. During a dry run it
-      # has not, so the assembled configuration stands in for the one a real
-      # run would validate rather than failing on a file nothing wrote yet.
-      log_info "${host_main} has no Include line; one would be added"
-      body="Include ${conf_d}/*.conf"$'\n'"${body}"
-    else
-      log_error "${host_main} has no Include line, so $(basename -- "${target}") would never be read"
-      return 1
+    local original=''
+    _slurp original "${host_main}"
+    body=$(_sshd_redirect_includes "${original}" "${src}" "${conf_d}")
+    body+=$'\n'
+    # Rewriting the directory an Include points at, rather than the whole
+    # directive, is what keeps this honest: a host that includes one named
+    # file rather than the whole directory still includes only that file
+    # here, and the check below notices that the candidate is not among
+    # them instead of approving a fragment sshd would never read.
+    if ! _sshd_includes_candidate "${body}" "${conf_d}/${base}"; then
+      if dry_run_enabled; then
+        # The caller adds the Include before installing; during a dry run it
+        # has not, so the assembled configuration stands in for the one a
+        # real run would check rather than failing on a file nothing wrote.
+        log_info "${host_main} does not include ${base}; an Include would be added"
+        body="Include ${conf_d}/*.conf"$'\n'"${body}"
+      else
+        log_error "${host_main} does not include ${base}, so sshd would never read it"
+        return 1
+      fi
     fi
   else
     body="Include ${conf_d}/*.conf"$'\n'
@@ -643,6 +689,17 @@ _sshd_effective_config() {
 
   printf '%s' "${body}" >"${main}" || return 1
   printf '%s\n' "${main}"
+}
+
+_sshd_canonical_value() {
+  local value=${1,,}
+  case ${value} in
+    prohibit-password | without-password) printf 'without-password\n' ;;
+    forced-commands-only) printf 'forced-commands-only\n' ;;
+    true) printf 'yes\n' ;;
+    false) printf 'no\n' ;;
+    *) printf '%s\n' "${value}" ;;
+  esac
 }
 
 # sshd keeps the *first* value it obtains for a keyword, so a fragment that
@@ -674,7 +731,10 @@ _sshd_candidate_takes_effect() {
     # Only keywords sshd reports back are checked; a repeated one such as
     # HostKey has no single effective value to compare against.
     [[ -n ${actual} ]] || continue
-    if [[ ${actual,,} != "${value,,}" ]]; then
+    # sshd reports some values under their canonical spelling rather than
+    # the accepted synonym a file used: prohibit-password comes back as
+    # without-password, and the booleans as yes and no.
+    if [[ $(_sshd_canonical_value "${actual}") != "$(_sshd_canonical_value "${value}")" ]]; then
       log_error "sshd resolves ${keyword} to '${actual}' rather than the '${value}' this file asks for; something read earlier wins."
       return 1
     fi

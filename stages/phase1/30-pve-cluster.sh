@@ -53,8 +53,9 @@ dropin_body="[Service]
 ExecStartPre=/usr/local/lib/pve-config/wait-for-ip.sh
 "
 
-if [[ $(write_file "${dropin}" "${dropin_body}" 0644) == changed ||
-${helper_state} == changed ]]; then
+dropin_state=unchanged
+state_of dropin_state write_file "${dropin}" "${dropin_body}" 0644
+if [[ ${dropin_state} == changed || ${helper_state} == changed ]]; then
   systemd_daemon_reload >/dev/null
 fi
 

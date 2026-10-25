@@ -93,7 +93,12 @@ dump_file() {
 if [[ ${want_dump} -eq 1 ]]; then
   dump_file "${file}"
   for key in "${!resolved[@]}"; do
-    printf '%s %s\n' "${key}" "${resolved[${key}]}"
+    value=${resolved[${key}]}
+    # The real binary reports the canonical spelling, not the synonym a
+    # file happened to use.
+    [[ ${key} == permitrootlogin && ${value} == prohibit-password ]] &&
+      value='without-password'
+    printf '%s %s\n' "${key}" "${value}"
   done
   exit 0
 fi

@@ -155,6 +155,10 @@ pve_node_rename() {
   mkdir -- "${nodes_dir}/${to}" ||
     die "Unable to create the node directory ${to}; it may have appeared in the meantime."
   if ! (shopt -s dotglob nullglob && cp -a -- "${nodes_dir}/${from}"/* "${nodes_dir}/${to}/"); then
+    # A half-populated destination is worse than none: the caller skips the
+    # migration when the destination exists, so the next run would report
+    # success with the certificates still only under the old name.
+    rm -rf -- "${nodes_dir:?}/${to}"
     die "Unable to copy the node directory ${from} to ${to}; the host's node identity is unchanged."
   fi
   rm -rf -- "${nodes_dir:?}/${from}" ||

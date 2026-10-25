@@ -83,12 +83,56 @@ ensure_dir "${SYSROOT}/etc/network" 0755 >/dev/null
 # those networks down while vmbr0 still came up with an address, so nothing
 # later in the stage would notice the loss.
 unmanaged_stanzas() {
-  local line name method managed
+  local line name method managed body_lines=0
+  local current='' current_method=''
   local -a fields=()
   [[ -f ${interfaces_path} ]] || return 0
+
+  # An iface stanza is only exempt when it is truly bare: a `manual` stanza
+  # carrying `up ip addr add ...` or an mtu is configuration like any other.
+  flush() {
+    [[ -n ${current} ]] || return 0
+    case ${current} in
+      vmbr* | bond* | *.* | *:*) ;;
+      *)
+        if [[ ${current_method} == manual || -z ${current_method} ]] &&
+          [[ ${body_lines} -eq 0 ]]; then
+          current=''
+          return 0
+        fi
+        ;;
+    esac
+    printf '%s\n' "${current}"
+    current=''
+  }
+
   while IFS= read -r line || [[ -n ${line} ]]; do
+    local indented=0
+    [[ ${line} == [[:space:]]* ]] && indented=1
     line=${line#"${line%%[![:space:]]*}"}
+    [[ -z ${line} || ${line} == '#'* ]] && continue
+
+    if [[ ${indented} -eq 1 && -n ${current} ]]; then
+      body_lines=$((body_lines + 1))
+      continue
+    fi
+
+    # The file this stage writes sources /etc/network/interfaces.d and
+    # nothing else, so any other include would be dropped with it.
+    if [[ ${line} == source[[:space:]]* || ${line} == source-directory[[:space:]]* ]]; then
+      read -r -a fields <<<"${line}"
+      case ${fields[1]:-} in
+        /etc/network/interfaces.d/* | /etc/network/interfaces.d) ;;
+        *) printf '%s\n' "${line}" ;;
+      esac
+      continue
+    fi
+
     [[ ${line} == iface[[:space:]]* ]] || continue
+    flush
+    body_lines=0
+    current=''
+    current_method=''
     read -r -a fields <<<"${line}"
     name=${fields[1]:-}
     method=${fields[3]:-}
@@ -99,17 +143,10 @@ unmanaged_stanzas() {
       [[ ${name} == "${port}" ]] && managed=1
     done
     [[ ${managed} -eq 1 ]] && continue
-    # A bare `manual` stanza for a port this host is not using describes
-    # nothing and costs nothing to drop. A method, a VLAN, an alias or
-    # another bridge or bond is somebody's configuration.
-    case ${name} in
-      vmbr* | bond* | *.* | *:*) ;;
-      *)
-        [[ ${method} == manual || -z ${method} ]] && continue
-        ;;
-    esac
-    printf '%s\n' "${name}"
+    current=${name}
+    current_method=${method}
   done <"${interfaces_path}"
+  flush
 }
 
 mapfile -t UNMANAGED < <(unmanaged_stanzas)

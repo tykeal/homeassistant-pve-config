@@ -34,8 +34,10 @@ stale_body=''
 # The enterprise source needs a subscription. Left in place it makes every
 # `apt-get update` fail with a 401, which is the single most common
 # complaint about a fresh Proxmox install.
+source_state=unchanged
 for stale in pve-enterprise.sources pve-enterprise.list; do
-  if [[ $(apt_source_remove "${SOURCES_DIR}/${stale}") == changed ]]; then
+  state_of source_state apt_source_remove "${SOURCES_DIR}/${stale}"
+  if [[ ${source_state} == changed ]]; then
     changed=1
   fi
 done
@@ -48,7 +50,8 @@ Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg
 "
 
 ensure_dir "${SOURCES_DIR}" 0755 >/dev/null
-if [[ $(apt_source_install "${SOURCES_DIR}/proxmox.sources" "${proxmox_source}") == changed ]]; then
+state_of source_state apt_source_install "${SOURCES_DIR}/proxmox.sources" "${proxmox_source}"
+if [[ ${source_state} == changed ]]; then
   changed=1
 fi
 
@@ -69,7 +72,8 @@ if [[ -f ${ceph_source} ]]; then
   _slurp ceph_body "${ceph_source}"
   if [[ ${ceph_body} == *enterprise* ]]; then
     ceph_body=$(ceph_to_no_subscription "${ceph_body}")
-    if [[ $(apt_source_install "${ceph_source}" "${ceph_body}") == changed ]]; then
+    state_of source_state apt_source_install "${ceph_source}" "${ceph_body}"
+    if [[ ${source_state} == changed ]]; then
       changed=1
     fi
   fi
@@ -91,28 +95,48 @@ for stale in ceph.list ceph-enterprise.list; do
     while IFS= read -r entry || [[ -n ${entry} ]]; do
       entry=${entry#"${entry%%[![:space:]]*}"}
       [[ ${entry} == deb[[:space:]]* ]] || continue
+
+      # A one-line entry may carry bracketed options between `deb` and the
+      # URI. Splitting on whitespace without lifting them out first turns
+      # the options into the URI and the URI into the suite, which is how a
+      # migration ends up writing a source that points nowhere.
+      options=''
+      if [[ ${entry} == *'['*']'* ]]; then
+        options=${entry#*[}
+        options=${options%%]*}
+        entry="${entry%%[*}${entry#*]}"
+      fi
       read -r -a entry_fields <<<"${entry}"
       uri=${entry_fields[1]:-}
       ceph_suite=${entry_fields[2]:-}
       [[ -n ${uri} && -n ${ceph_suite} ]] || continue
       uri=$(ceph_to_no_subscription "${uri}")
+
+      signed_by='/usr/share/keyrings/proxmox-archive-keyring.gpg'
+      for option in ${options}; do
+        [[ ${option} == signed-by=* ]] && signed_by=${option#signed-by=}
+      done
+
       migrated="Types: deb
 URIs: ${uri}
 Suites: ${ceph_suite}
 Components: no-subscription
-Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg
+Signed-By: ${signed_by}
 "
       break
     done <<<"${stale_body}"
-    if [[ -n ${migrated} ]]; then
-      log_info "migrating ${stale} to ${ceph_source}"
-      if [[ $(apt_source_install "${ceph_source}" "${migrated}") == changed ]]; then
-        changed=1
-      fi
+    if [[ -z ${migrated} ]]; then
+      die "Unable to read a usable entry out of ${stale_path}; leaving it in place. Replace it with a no-subscription Ceph source by hand."
+    fi
+    log_info "migrating ${stale} to ${ceph_source}"
+    state_of source_state apt_source_install "${ceph_source}" "${migrated}"
+    if [[ ${source_state} == changed ]]; then
+      changed=1
     fi
   fi
 
-  if [[ $(apt_source_remove "${stale_path}") == changed ]]; then
+  state_of source_state apt_source_remove "${stale_path}"
+  if [[ ${source_state} == changed ]]; then
     changed=1
   fi
 done

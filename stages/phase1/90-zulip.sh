@@ -144,10 +144,13 @@ UNIT
 shutdown_unit+=$'\n'
 
 units_changed=0
-if [[ $(write_file "${units_dir}/zulip-boot-notify.service" "${boot_unit}" 0644) == changed ]]; then
+unit_state=unchanged
+state_of unit_state write_file "${units_dir}/zulip-boot-notify.service" "${boot_unit}" 0644
+if [[ ${unit_state} == changed ]]; then
   units_changed=1
 fi
-if [[ $(write_file "${units_dir}/zulip-shutdown-notify.service" "${shutdown_unit}" 0644) == changed ]]; then
+state_of unit_state write_file "${units_dir}/zulip-shutdown-notify.service" "${shutdown_unit}" 0644
+if [[ ${unit_state} == changed ]]; then
   units_changed=1
 fi
 
@@ -157,5 +160,9 @@ fi
 
 service_enable zulip-boot-notify.service >/dev/null
 service_enable zulip-shutdown-notify.service >/dev/null
+# Enabling arms it for the next boot, but its notification runs in ExecStop,
+# so without starting it now the first shutdown after provisioning -- the
+# reboot this phase asks for -- would go out in silence.
+service_start zulip-shutdown-notify.service >/dev/null
 
 log_info "Zulip boot and shutdown notices enabled for the ${stream} stream"

@@ -28,9 +28,11 @@ write_file "${SYSROOT}/etc/hostname" "${PVE_HOSTNAME}"$'\n' 0644 >/dev/null
 # and main.cf is the operator's file: only the one directive that names this
 # host is converged, wherever in the file it happens to sit.
 postfix_main="${SYSROOT}/etc/postfix/main.cf"
+postfix_state=unchanged
 if [[ -f ${postfix_main} ]]; then
-  if [[ $(ensure_exact_line "${postfix_main}" '^[[:space:]]*myhostname[[:space:]]*=' \
-    "myhostname = ${PVE_FQDN}") == changed ]]; then
+  state_of postfix_state ensure_exact_line "${postfix_main}" \
+    '^[[:space:]]*myhostname[[:space:]]*=' "myhostname = ${PVE_FQDN}"
+  if [[ ${postfix_state} == changed ]]; then
     log_info "postfix now announces itself as ${PVE_FQDN}"
   fi
 else

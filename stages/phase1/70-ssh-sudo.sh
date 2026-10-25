@@ -33,12 +33,22 @@ assert_admin_access() {
     [[ -f ${file} ]] ||
       die "${user} has no ${file}; run the 60-admin-users stage before hardening SSH."
     _slurp installed "${file}"
+    # Active entries only. A commented out key is not one this host would
+    # accept, and taking it for one would disable passwords behind a login
+    # nobody has.
+    local -A active=()
+    local entry identity
+    while IFS= read -r entry || [[ -n ${entry} ]]; do
+      _is_comment "${entry}" && continue
+      identity=$(_ssh_key_identity "${entry}") || continue
+      active["${identity}"]=1
+    done <<<"${installed}"
     keys=$(admin_keys_for "${user}")
     while IFS= read -r key || [[ -n ${key} ]]; do
       [[ -n ${key} ]] || continue
       key=$(_ssh_key_identity "${key}") || continue
-      [[ ${installed} == *"${key}"* ]] ||
-        die "${user}'s configured key is not in ${file}; run the 60-admin-users stage before hardening SSH."
+      [[ -n ${active[${key}]+set} ]] ||
+        die "${user}'s configured key is not active in ${file}; run the 60-admin-users stage before hardening SSH."
     done <<<"${keys}"
   done
 }
@@ -57,7 +67,9 @@ fi
 sshd_main="${SYSROOT}/etc/ssh/sshd_config"
 if [[ -f ${sshd_main} ]] &&
   ! grep -Eq '^[[:space:]]*[Ii]nclude[[:space:]]+.*sshd_config\.d' "${sshd_main}"; then
-  ensure_exact_line "${sshd_main}" '^[[:space:]]*[Ii]nclude[[:space:]]' \
+  # Matched on sshd_config.d specifically: an Include naming some other
+  # policy file is somebody's access control and is not ours to remove.
+  ensure_exact_line "${sshd_main}" '^[[:space:]]*[Ii]nclude[[:space:]]+.*sshd_config\.d' \
     'Include /etc/ssh/sshd_config.d/*.conf' prepend >/dev/null
 fi
 

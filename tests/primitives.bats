@@ -433,7 +433,7 @@ setup() {
 
   [ "$status" -ne 0 ]
   [ ! -e "${target}" ]
-  [[ "$output" == *'no Include line'* ]]
+  [[ "$output" == *'does not include'* ]]
 }
 
 # --- node identity --------------------------------------------------------
@@ -489,4 +489,35 @@ mark_pmxcfs() {
     bash -c 'PVE_CONFIG_LIB_DIR='"${REPO_ROOT}"'/lib source '"${REPO_ROOT}"'/lib/stage.sh'
   [ "$status" -ne 0 ]
   [[ "$output" == *'does not look like a Proxmox VE host'* ]]
+}
+
+@test "install_validated refuses a fragment an Include names past" {
+  # `Include .../sshd_config.d/site.conf` reads one named file, not the
+  # directory, so the hardening fragment would never be read.
+  mkdir -p "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d"
+  printf 'Include %s/etc/ssh/sshd_config.d/site.conf\n' \
+    "${PVE_CONFIG_ROOT}" >"${PVE_CONFIG_ROOT}/etc/ssh/sshd_config"
+  printf 'Port 22\n' >"${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/site.conf"
+
+  local target="${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/99-hardening.conf"
+  run install_validated "${target}" 'PasswordAuthentication no
+' 0644 validate_sshd_config
+
+  [ "$status" -ne 0 ]
+  [ ! -e "${target}" ]
+  [[ "$output" == *'does not include'* ]]
+}
+
+@test "install_validated accepts the canonical spelling of a value" {
+  # sshd reports PermitRootLogin prohibit-password as without-password.
+  mkdir -p "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d"
+  printf 'Include %s/etc/ssh/sshd_config.d/*.conf\n' \
+    "${PVE_CONFIG_ROOT}" >"${PVE_CONFIG_ROOT}/etc/ssh/sshd_config"
+
+  local target="${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/99-hardening.conf"
+  run install_validated "${target}" 'PermitRootLogin prohibit-password
+' 0644 validate_sshd_config
+
+  [ "$status" -eq 0 ]
+  [ -f "${target}" ]
 }
