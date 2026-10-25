@@ -155,3 +155,39 @@ setup() {
   run find "${PVE_CONFIG_STATE_DIR}" -name '.*' -type f
   [ -z "$output" ]
 }
+
+@test "the configuring version is recorded beside the markers" {
+  state_record_version
+  [ "$(cat "${PVE_CONFIG_STATE_DIR}/version")" = "${PVE_CONFIG_VERSION}" ]
+
+  run state_recorded_version
+  [ "$status" -eq 0 ]
+  [ "$output" = "${PVE_CONFIG_VERSION}" ]
+}
+
+@test "recording the version twice leaves one file and no churn" {
+  state_record_version
+  state_record_version
+  run find "${PVE_CONFIG_STATE_DIR}" -maxdepth 1 -name 'version*' -type f
+  [ "${#lines[@]}" -eq 1 ]
+}
+
+@test "a dry run records no version" {
+  PVE_CONFIG_DRY_RUN=1 run state_record_version
+  [ "$status" -eq 0 ]
+  [ ! -e "${PVE_CONFIG_STATE_DIR}/version" ]
+}
+
+@test "state_recorded_version fails when nothing was recorded" {
+  run state_recorded_version
+  [ "$status" -ne 0 ]
+}
+
+@test "the version file is not mistaken for a stage marker" {
+  state_record_version
+  state_mark_done 'phase1__10-host'
+
+  run state_list
+  [ "${#lines[@]}" -eq 1 ]
+  [[ "${lines[0]}" == 1*10-host* ]]
+}

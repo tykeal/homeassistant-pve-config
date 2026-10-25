@@ -34,6 +34,45 @@ source_driver() {
   [[ "$output" == *'--dry-run'* ]]
   [[ "$output" == *'--config PATH'* ]]
   [[ "$output" == *'--non-interactive'* ]]
+  [[ "$output" == *'--version'* ]]
+}
+
+@test "--version prints the version and exits 0 without root" {
+  run "${DRIVER}" --version
+  [ "$status" -eq 0 ]
+  [ "$output" = "pve-config $(sed -n "s/^PVE_CONFIG_VERSION='\(.*\)'$/\1/p" \
+    "${REPO_ROOT}/lib/version.sh")" ]
+}
+
+@test "the committed tree carries the 0.0.0 placeholder" {
+  # The release workflow stamps the real version in while it builds the
+  # tarball. A real version committed here would ship inside an immutable
+  # release and could never be corrected in place.
+  #
+  # The tarball ships this suite so an operator can re-run it, and that
+  # tree is correctly stamped, so the guard only applies to a git
+  # checkout. In a worktree .git is a file rather than a directory.
+  [ -e "${REPO_ROOT}/.git" ] || skip 'not a git checkout'
+  run grep -c "^PVE_CONFIG_VERSION='0\.0\.0'$" "${REPO_ROOT}/lib/version.sh"
+  [ "$status" -eq 0 ]
+  [ "$output" -eq 1 ]
+}
+
+@test "a real run records the configuring version" {
+  make_stage 1 '10-host.sh' >/dev/null
+
+  source_driver
+  run main
+  [ "$status" -eq 0 ]
+  [ "$(cat "${PVE_CONFIG_STATE_DIR}/version")" = "${PVE_CONFIG_VERSION}" ]
+}
+
+@test "a dry run records no version" {
+  make_stage 1 '10-host.sh' >/dev/null
+
+  run "${DRIVER}" --dry-run
+  [ "$status" -eq 0 ]
+  [ ! -e "${PVE_CONFIG_STATE_DIR}/version" ]
 }
 
 @test "--list says so plainly when no stages are installed" {

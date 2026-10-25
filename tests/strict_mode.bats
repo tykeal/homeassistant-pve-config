@@ -130,3 +130,21 @@ strict() {
     [ "$status" -eq 0 ]
   done < <(find "${REPO_ROOT}" -name '.git' -prune -o -type f -name '*.sh' -print)
 }
+
+@test "version recording survives strict mode" {
+  # Derived rather than hard-coded: a release tarball ships this suite
+  # with lib/version.sh already stamped, so asserting '0.0.0' would fail
+  # for every operator re-running the suite from a release.
+  local expected
+  expected=$(sed -n "s/^PVE_CONFIG_VERSION='\(.*\)'$/\1/p" \
+    "${REPO_ROOT}/lib/version.sh")
+  run strict "
+    source '${REPO_ROOT}/lib/version.sh'
+    source '${REPO_ROOT}/lib/version.sh'
+    state_record_version
+    state_record_version
+    state_recorded_version
+  "
+  [ "$status" -eq 0 ]
+  [ "$output" = "${expected}" ]
+}

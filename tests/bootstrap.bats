@@ -20,7 +20,7 @@ make_source_tree() {
   printf '#!/usr/bin/env bash\n# driver v%s\n' "${1:-1}" >"${SRC}/pve-config.sh"
   printf '#!/usr/bin/env bash\n' >"${SRC}/bootstrap.sh"
   local lib
-  for lib in common config detect state schema; do
+  for lib in common version config detect state schema; do
     printf '#!/usr/bin/env bash\n' >"${SRC}/lib/${lib}.sh"
   done
   printf '#!/usr/bin/env bash\n' >"${SRC}/stages/phase1/10-host.sh"
@@ -70,6 +70,7 @@ seed_install() {
   [ -x "${PVE_CONFIG_DIR}/pve-config.sh" ]
   [ -x "${PVE_CONFIG_DIR}/bootstrap.sh" ]
   [ -f "${PVE_CONFIG_DIR}/lib/common.sh" ]
+  [ -f "${PVE_CONFIG_DIR}/lib/version.sh" ]
   [ -f "${PVE_CONFIG_DIR}/lib/schema.sh" ]
   [ -x "${PVE_CONFIG_DIR}/stages/phase1/10-host.sh" ]
   [ -f "${PVE_CONFIG_DIR}/examples/pve-config.conf.example" ]
@@ -108,6 +109,20 @@ seed_install() {
   [ "$(cat "${PVE_CONFIG_DIR}/pve-config.sh")" = 'old driver' ]
   [ "$(cat "${PVE_CONFIG_DIR}/pve-config.conf")" = "PVE_DOMAIN='kept.example'" ]
   [ -f "${PVE_CONFIG_DIR}/state/phase1__10-host.done" ]
+  [ ! -e "${PVE_CONFIG_DIR}.bootstrap" ]
+}
+
+@test "an archive missing lib/version.sh is refused" {
+  # The driver sources it unconditionally, so a tree without it installs
+  # cleanly and then cannot start.
+  seed_install
+  rm "${SRC}/lib/version.sh"
+  make_archive
+
+  run_bootstrap
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'lib/version.sh'* ]]
+  [ "$(cat "${PVE_CONFIG_DIR}/pve-config.sh")" = 'old driver' ]
   [ ! -e "${PVE_CONFIG_DIR}.bootstrap" ]
 }
 

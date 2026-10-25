@@ -27,7 +27,7 @@ mock_calls() {
 # Sources the libraries into the current test shell.
 load_libs() {
   local lib
-  for lib in common config detect state schema pkg users service pve; do
+  for lib in common version config detect state schema pkg users service pve; do
     # shellcheck disable=SC1090
     source "${REPO_ROOT}/lib/${lib}.sh"
   done
