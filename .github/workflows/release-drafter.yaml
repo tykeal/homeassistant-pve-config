@@ -19,6 +19,11 @@ on:
   push:
     branches:
       - main
+  # Lets a stale or mis-versioned draft be regenerated without pushing a
+  # commit to 'main'. Labels applied to a pull request after it has
+  # merged never reach the draft on their own, because nothing re-runs
+  # the drafter once that merge push has been handled.
+  workflow_dispatch:
 
 permissions: {}
 
