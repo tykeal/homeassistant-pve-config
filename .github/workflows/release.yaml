@@ -462,6 +462,40 @@ jobs:
           fi
           echo "Tag ${TAG} still names the verified commit ${SHA}."
 
+      # The draft is shared with release-drafter, which can retag an
+      # existing draft on a later merge. A run that attached assets and
+      # then failed before promotion leaves them on a draft that may
+      # subsequently be renamed to the NEXT version, so the next tag's
+      # run would find its own assets sitting beside a previous
+      # version's and publish both, immutably, under one tag. Demand an
+      # exact asset list rather than a merely sufficient one.
+      - name: 'Require exactly this tag''s assets on the release'
+        shell: bash
+        env:
+          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          GH_REPO: "${{ github.repository }}"
+          TAG: "${{ needs.tag-validate.outputs.tag }}"
+        run: |
+          # Require exactly this tag's assets on the release
+          set -euo pipefail
+          EXPECTED=$(printf '%s\n' \
+            "pve-config-${TAG}.tar.gz" \
+            "pve-config-${TAG}.tar.gz.sha256" \
+            | LC_ALL=C sort)
+          ACTUAL=$(gh release view "${TAG}" --json assets \
+            --jq '.assets[].name' | LC_ALL=C sort)
+          if [ "${EXPECTED}" != "${ACTUAL}" ]; then
+            echo "::error::Release ${TAG} does not carry exactly its own" \
+              "assets. Expected:"
+            printf '%s\n' "${EXPECTED}"
+            echo 'Found:'
+            printf '%s\n' "${ACTUAL}"
+            echo "::error::Delete the unexpected assets from the DRAFT" \
+              "and re-run; publishing would lock them in place."
+            exit 1
+          fi
+          echo "Release ${TAG} carries exactly its own two assets."
+
       # Publishing is the point of no return: the release and every
       # attached asset become immutable here.
       - name: 'Promote draft release'
