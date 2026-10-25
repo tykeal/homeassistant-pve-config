@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Andrew Grimberg <tykeal@bardicgrove.org>
+# SPDX-License-Identifier: Apache-2.0
+
+# Appends to the passwd and group fixtures the toolkit reads, and fails on
+# an account that already exists exactly as the real tool does. The ids are
+# the test runner's own, so the ownership checks in lib/users.sh converge
+# without the test needing to be root.
+# shellcheck source=tests/helpers/mocks/_record
+source "$(dirname -- "$0")/_record"
+
+shell=/bin/bash
+name=''
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -m) ;;
+    -s)
+      shell=$2
+      shift
+      ;;
+    -*) ;;
+    *) name=$1 ;;
+  esac
+  shift
+done
+
+[[ -n ${name} ]] || exit 1
+[[ -n ${PVE_CONFIG_PASSWD:-} ]] || exit 0
+
+if awk -F: -v n="${name}" '$1 == n { found = 1 } END { exit !found }' \
+  "${PVE_CONFIG_PASSWD}" 2>/dev/null; then
+  printf 'useradd: user %s already exists\n' "${name}" >&2
+  exit 9
+fi
+
+uid=$(id -u)
+gid=$(id -g)
+home="${PVE_CONFIG_MOCK_HOME_BASE:-/home}/${name}"
+printf '%s:x:%s:%s::%s:%s\n' "${name}" "${uid}" "${gid}" "${home}" "${shell}" \
+  >>"${PVE_CONFIG_PASSWD}"
+if [[ -n ${PVE_CONFIG_GROUP:-} ]]; then
+  printf '%s:x:%s:\n' "${name}" "${gid}" >>"${PVE_CONFIG_GROUP}"
+fi

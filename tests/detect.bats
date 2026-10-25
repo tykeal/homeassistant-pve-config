@@ -1,4 +1,8 @@
 #!/usr/bin/env bats
+# Every @test runs in its own subshell, so the exports these tests use to
+# vary the detected host facts cannot leak into one another; shellcheck's
+# subshell-scope warnings describe a hazard that does not exist here.
+# shellcheck disable=SC2030,SC2031
 # SPDX-FileCopyrightText: 2026 Andrew Grimberg <tykeal@bardicgrove.org>
 # SPDX-License-Identifier: Apache-2.0
 
@@ -80,6 +84,50 @@ setup() {
   local sysnet="${FIXTURES}/net"
   mkdir -p "${sysnet}/lo" "${sysnet}/vmbr0"
   PVE_CONFIG_SYSNET="${sysnet}" run detect_physical_nics
+  [ "$status" -ne 0 ]
+  [ -z "$output" ]
+}
+
+# --- uplink selection -----------------------------------------------------
+
+@test "detect_uplink_nics picks the single interface a host has" {
+  seed_nics eno1
+  seed_default_route eno1
+  run detect_uplink_nics
+  [ "$status" -eq 0 ]
+  [ "$output" = 'eno1' ]
+}
+
+@test "detect_uplink_nics picks only the port the default route uses" {
+  seed_nics eno1 eno2
+  seed_default_route eno2
+  run detect_uplink_nics
+  [ "$status" -eq 0 ]
+  [ "$output" = 'eno2' ]
+}
+
+@test "detect_uplink_nics ignores the storage and WAN ports of a larger host" {
+  seed_nics eno1 eno2 enp3s0f0 enp3s0f1
+  seed_default_route eno1
+  run detect_uplink_nics
+  [ "$status" -eq 0 ]
+  [ "${#lines[@]}" -eq 1 ]
+  [ "$output" = 'eno1' ]
+}
+
+@test "detect_uplink_nics resolves a bridge back to the ports it holds" {
+  seed_nics eno1 eno2
+  seed_bridge vmbr0 eno1
+  seed_default_route vmbr0
+  run detect_uplink_nics
+  [ "$status" -eq 0 ]
+  [ "$output" = 'eno1' ]
+}
+
+@test "detect_uplink_nics reports nothing when there is no default route" {
+  seed_nics eno1 eno2
+  seed_default_route
+  run detect_uplink_nics
   [ "$status" -ne 0 ]
   [ -z "$output" ]
 }

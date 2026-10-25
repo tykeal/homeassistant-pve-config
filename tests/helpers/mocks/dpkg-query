@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Andrew Grimberg <tykeal@bardicgrove.org>
+# SPDX-License-Identifier: Apache-2.0
+
+# Answers from the package list the apt-get mock maintains.
+# shellcheck source=tests/helpers/mocks/_record
+source "$(dirname -- "$0")/_record"
+
+package=''
+for arg in "$@"; do
+  [[ ${arg} == -* ]] && continue
+  package=${arg}
+done
+
+[[ -n ${package} ]] || exit 1
+mock_state_has packages "${package}" || exit 1
+printf 'install ok installed'

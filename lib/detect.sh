@@ -12,6 +12,20 @@ _detect_sysnet() { printf '%s\n' "${PVE_CONFIG_SYSNET:-/sys/class/net}"; }
 _detect_meminfo() { printf '%s\n' "${PVE_CONFIG_MEMINFO:-/proc/meminfo}"; }
 _detect_os_release() { printf '%s\n' "${PVE_CONFIG_OS_RELEASE:-/etc/os-release}"; }
 
+# The kernel's default routes, one per line, in `ip -o route` form.
+# PVE_CONFIG_DEFAULT_ROUTES names a file holding canned output instead, so
+# uplink selection can be exercised without a routing table to arrange.
+_detect_default_routes() {
+  local override=${PVE_CONFIG_DEFAULT_ROUTES:-}
+  if [[ -n ${override} ]]; then
+    [[ -r ${override} ]] || return 1
+    cat -- "${override}"
+    return 0
+  fi
+  command -v ip >/dev/null 2>&1 || return 1
+  ip -4 -o route show default 2>/dev/null
+}
+
 detect_hostname_short() {
   local name=''
   name=$(hostname -s 2>/dev/null) || name=''
@@ -61,6 +75,73 @@ detect_physical_nics() {
     found=1
   done
   eval "${restore}"
+  [[ ${found} -eq 1 ]]
+}
+
+# The ports a bridge currently holds, read from sysfs.
+detect_bridge_ports() {
+  local bridge=$1 sysnet path name found=0 restore
+  sysnet=$(_detect_sysnet)
+  [[ -d "${sysnet}/${bridge}/brif" ]] || return 1
+
+  restore=$(shopt -p nullglob) || true
+  shopt -s nullglob
+  for path in "${sysnet}/${bridge}/brif"/*; do
+    name=$(basename -- "${path}")
+    printf '%s\n' "${name}"
+    found=1
+  done
+  eval "${restore}"
+  [[ ${found} -eq 1 ]]
+}
+
+# The interfaces that carry a default route: the ones this host is actually
+# reachable on.
+#
+# Bridging every port a machine happens to have is not safe. Two live ports
+# in one bridge with STP off is a broadcast storm, and on a machine with a
+# separate storage or WAN port it merges networks that were deliberately
+# kept apart. Only the uplink belongs in the management bridge.
+#
+# On a host this toolkit has already configured the default route sits on
+# the bridge itself, so the bridge is resolved back to the ports it holds
+# and a re-run derives the same answer it did the first time.
+detect_uplink_nics() {
+  local line dev found=0
+  local -a routes=() physical=() ports=()
+  mapfile -t routes < <(_detect_default_routes) || return 1
+  [[ ${#routes[@]} -gt 0 ]] || return 1
+
+  mapfile -t physical < <(detect_physical_nics 2>/dev/null) || true
+
+  local -A seen=()
+  local candidate port
+  for line in ${routes[@]+"${routes[@]}"}; do
+    [[ ${line} == *' dev '* ]] || continue
+    dev=${line#* dev }
+    dev=${dev%% *}
+    [[ -n ${dev} ]] || continue
+
+    local -a resolved=()
+    if mapfile -t ports < <(detect_bridge_ports "${dev}" 2>/dev/null) &&
+      [[ ${#ports[@]} -gt 0 ]]; then
+      resolved=("${ports[@]}")
+    else
+      resolved=("${dev}")
+    fi
+
+    for candidate in "${resolved[@]}"; do
+      [[ -n ${seen[${candidate}]+set} ]] && continue
+      for port in ${physical[@]+"${physical[@]}"}; do
+        if [[ ${port} == "${candidate}" ]]; then
+          seen[${candidate}]=1
+          printf '%s\n' "${candidate}"
+          found=1
+          break
+        fi
+      done
+    done
+  done
   [[ ${found} -eq 1 ]]
 }
 

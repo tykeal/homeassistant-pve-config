@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Andrew Grimberg <tykeal@bardicgrove.org>
+# SPDX-License-Identifier: Apache-2.0
+
+# Stands in for ifupdown2's syntax check. It accepts the stanza keywords the
+# toolkit emits and rejects anything else, so a candidate that would strand
+# the host never reaches /etc/network/interfaces.
+# shellcheck source=tests/helpers/mocks/_record
+source "$(dirname -- "$0")/_record"
+
+file=''
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -i | --interfaces)
+      file=$2
+      shift
+      ;;
+  esac
+  shift
+done
+
+[[ -n ${file} ]] || exit 0
+[[ -r ${file} ]] || {
+  printf 'ifquery: %s: cannot read\n' "${file}" >&2
+  exit 1
+}
+
+known='auto allow-hotplug iface source source-directory address netmask gateway
+bridge-ports bridge-stp bridge-fd bridge-vlan-aware bridge-vids mtu hwaddress
+dns-nameservers dns-search up down pre-up post-down'
+
+lineno=0
+while IFS= read -r line || [[ -n ${line} ]]; do
+  lineno=$((lineno + 1))
+  trimmed=${line#"${line%%[![:space:]]*}"}
+  [[ -z ${trimmed} || ${trimmed} == '#'* ]] && continue
+  keyword=${trimmed%%[[:space:]]*}
+  if ! grep -qw -- "${keyword}" <<<"${known}"; then
+    printf 'error: %s: line %s: unknown keyword %s\n' \
+      "${file}" "${lineno}" "${keyword}" >&2
+    exit 1
+  fi
+done <"${file}"
+exit 0

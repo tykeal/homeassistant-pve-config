@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Andrew Grimberg <tykeal@bardicgrove.org>
+# SPDX-License-Identifier: Apache-2.0
+
+# Stands in for `visudo -c -f FILE`. Only the shapes this toolkit writes are
+# accepted, which is enough to prove a malformed candidate is refused.
+# shellcheck source=tests/helpers/mocks/_record
+source "$(dirname -- "$0")/_record"
+
+file=''
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -f)
+      file=$2
+      shift
+      ;;
+  esac
+  shift
+done
+
+[[ -r ${file} ]] || {
+  printf 'visudo: unable to open %s\n' "${file}" >&2
+  exit 1
+}
+
+lineno=0
+while IFS= read -r line || [[ -n ${line} ]]; do
+  lineno=$((lineno + 1))
+  trimmed=${line#"${line%%[![:space:]]*}"}
+  [[ -z ${trimmed} || ${trimmed} == '#'* ]] && continue
+  case ${trimmed} in
+    'Defaults'* | '%'*' '*'='* | *' ALL='*) continue ;;
+  esac
+  printf '>>> %s: syntax error near line %s <<<\n' "${file}" "${lineno}" >&2
+  exit 1
+done <"${file}"
+printf 'parsed OK\n'
+exit 0

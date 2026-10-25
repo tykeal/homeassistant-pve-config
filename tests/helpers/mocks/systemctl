@@ -2,7 +2,19 @@
 # SPDX-FileCopyrightText: 2026 Andrew Grimberg <tykeal@bardicgrove.org>
 # SPDX-License-Identifier: Apache-2.0
 
-# Records the invocation and succeeds. Stage tests assert on the log rather
-# than on a Proxmox host that is not there.
-printf '%s %s\n' "$(basename -- "$0")" "$*" >>"${PVE_CONFIG_MOCK_LOG:-/dev/null}"
-exit 0
+# Records the invocation and keeps just enough unit state that a stage can
+# be asked twice and converge the second time.
+# shellcheck source=tests/helpers/mocks/_record
+source "$(dirname -- "$0")/_record"
+
+mock_verb_and_target "$@"
+
+case ${MOCK_VERB} in
+  is-active) mock_state_has active "${MOCK_TARGET}" ;;
+  is-enabled) mock_state_has enabled "${MOCK_TARGET}" ;;
+  start | restart | reload | reload-or-restart) mock_state_add active "${MOCK_TARGET}" ;;
+  stop) mock_state_remove active "${MOCK_TARGET}" ;;
+  enable) mock_state_add enabled "${MOCK_TARGET}" ;;
+  disable) mock_state_remove enabled "${MOCK_TARGET}" ;;
+  *) exit 0 ;;
+esac

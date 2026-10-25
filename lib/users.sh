@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Andrew Grimberg <tykeal@bardicgrove.org>
+# SPDX-License-Identifier: Apache-2.0
+
+# System account convergence.
+#
+# The account database is read out of the passwd and group files rather than
+# through getent. Proxmox administrators are local accounts by definition,
+# and reading the files directly is what lets the whole of this module be
+# exercised against a scratch tree.
+
+_users_passwd_file() {
+  printf '%s\n' "${PVE_CONFIG_PASSWD:-$(sysroot)/etc/passwd}"
+}
+
+_users_group_file() {
+  printf '%s\n' "${PVE_CONFIG_GROUP:-$(sysroot)/etc/group}"
+}
+
+_users_field() {
+  local name=$1 field=$2 value
+  value=$(awk -F: -v want="${name}" -v f="${field}" \
+    '$1 == want { print $f; exit }' "$(_users_passwd_file)" 2>/dev/null) || return 1
+  [[ -n ${value} ]] || return 1
+  printf '%s\n' "${value}"
+}
+
+user_exists() {
+  _users_field "$1" 1 >/dev/null 2>&1
+}
+
+user_uid() { _users_field "$1" 3; }
+user_gid() { _users_field "$1" 4; }
+user_shell() { _users_field "$1" 7; }
+
+# The home directory as the passwd database records it, which is a path on
+# the host rather than in the scratch tree. Callers prefix it themselves.
+user_home() { _users_field "$1" 6; }
+
+# Creates the account when it is absent and otherwise converges the login
+# shell. The script this replaces called `useradd -m` unconditionally, which
+# failed on every re-run once the account existed.
+user_converge() {
+  local name=$1 shell=${2:-/bin/bash} current
+
+  if ! user_exists "${name}"; then
+    run_cmd useradd -m -s "${shell}" "${name}" ||
+      die "Unable to create the user ${name}"
+    printf 'changed\n'
+    return 0
+  fi
+
+  current=$(user_shell "${name}") || current=''
+  if [[ ${current} != "${shell}" ]]; then
+    run_cmd usermod -s "${shell}" "${name}" ||
+      die "Unable to set the login shell of ${name}"
+    printf 'changed\n'
+    return 0
+  fi
+
+  printf 'unchanged\n'
+}
+
+# Supplementary membership only. A primary group is set when the account is
+# created and is not what `usermod -aG` manages.
+user_in_group() {
+  local name=$1 group=$2 members member
+  members=$(awk -F: -v g="${group}" '$1 == g { print $4; exit }' \
+    "$(_users_group_file)" 2>/dev/null) || return 1
+  [[ -n ${members} ]] || return 1
+  local -a list=()
+  IFS=',' read -r -a list <<<"${members}"
+  for member in ${list[@]+"${list[@]}"}; do
+    [[ ${member} == "${name}" ]] && return 0
+  done
+  return 1
+}
+
+user_join_group() {
+  local name=$1 group changed=0
+  shift
+  for group in "$@"; do
+    user_in_group "${name}" "${group}" && continue
+    run_cmd usermod -aG "${group}" "${name}" ||
+      die "Unable to add ${name} to the ${group} group"
+    changed=1
+  done
+
+  if [[ ${changed} -eq 1 ]]; then
+    printf 'changed\n'
+  else
+    printf 'unchanged\n'
+  fi
+}
+
+# The identifying part of an authorized_keys entry: the algorithm and the
+# blob, without the trailing comment. Two entries that differ only in their
+# comment are the same key and must not both be installed.
+#
+# This is a shape test, not a validity test. Nothing is installed on the
+# strength of it alone; see ssh_key_is_valid.
+_ssh_key_identity() {
+  local line=$1 field
+  local -a fields=()
+  read -r -a fields <<<"${line}"
+  local i=0
+  for field in ${fields[@]+"${fields[@]}"}; do
+    case ${field} in
+      ssh-* | ecdsa-* | sk-ssh-* | sk-ecdsa-*)
+        if [[ -n ${fields[i + 1]:-} ]]; then
+          printf '%s %s\n' "${field}" "${fields[i + 1]}"
+          return 0
+        fi
+        ;;
+    esac
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# Hands the key to ssh-keygen, which is the only thing that agrees with
+# sshd about what a public key is. A key that merely looks like one -- the
+# right algorithm token in front of truncated base64 -- is accepted
+# everywhere else in this file and rejected by sshd, and installing one
+# before password authentication is turned off locks everybody out.
+#
+# The key goes in on stdin, so no candidate file is created anywhere.
+ssh_key_is_valid() {
+  local key=$1
+  command -v ssh-keygen >/dev/null 2>&1 ||
+    die 'ssh-keygen is not installed; refusing to install an unverified SSH key.'
+  printf '%s\n' "${key}" | ssh-keygen -l -f /dev/stdin >/dev/null 2>&1
+}
+
+_ssh_keys_normalise() {
+  local text=$1 line
+  while IFS= read -r line || [[ -n ${line} ]]; do
+    line=${line#"${line%%[![:space:]]*}"}
+    line=${line%"${line##*[![:space:]]}"}
+    [[ -n ${line} ]] || continue
+    [[ ${line} == '#'* ]] && continue
+    printf '%s\n' "${line}"
+  done <<<"${text}"
+}
+
+# Merges keys into a user's authorized_keys without ever duplicating one,
+# and leaves the directory and file with the ownership and permissions sshd
+# insists on before it will read them.
+authorized_keys_install() {
+  local user=$1 keys=$2
+  local home ssh_dir file uid gid changed=0
+
+  uid=$(user_uid "${user}") || uid=''
+  gid=$(user_gid "${user}") || gid=''
+  home=$(user_home "${user}") || home="/home/${user}"
+  home="$(sysroot)${home}"
+  ssh_dir="${home}/.ssh"
+  file="${ssh_dir}/authorized_keys"
+
+  if [[ $(ensure_dir "${home}" '' "${uid}" "${gid}") == changed ]]; then
+    changed=1
+  fi
+  if [[ $(ensure_dir "${ssh_dir}" 0700 "${uid}" "${gid}") == changed ]]; then
+    changed=1
+  fi
+
+  local merged='' existing identity wanted
+  local -A seen=()
+  if [[ -f ${file} ]]; then
+    while IFS= read -r existing || [[ -n ${existing} ]]; do
+      merged+="${existing}"$'\n'
+      identity=$(_ssh_key_identity "${existing}") || continue
+      seen["${identity}"]=1
+    done <"${file}"
+  fi
+
+  while IFS= read -r wanted || [[ -n ${wanted} ]]; do
+    [[ -n ${wanted} ]] || continue
+    identity=$(_ssh_key_identity "${wanted}") ||
+      die "Not an SSH public key: ${wanted}"
+    ssh_key_is_valid "${wanted}" ||
+      die "ssh-keygen rejects this key for ${user}: ${wanted}"
+    [[ -n ${seen[${identity}]+set} ]] && continue
+    seen["${identity}"]=1
+    merged+="${wanted}"$'\n'
+  done < <(_ssh_keys_normalise "${keys}")
+
+  if [[ $(write_file "${file}" "${merged}" 0600) == changed ]]; then
+    changed=1
+  fi
+  if [[ -n ${uid} && -n ${gid} ]] && [[ -f ${file} ]] &&
+    [[ $(ensure_owner "${file}" "${uid}" "${gid}") == changed ]]; then
+    changed=1
+  fi
+
+  if [[ ${changed} -eq 1 ]]; then
+    printf 'changed\n'
+  else
+    printf 'unchanged\n'
+  fi
+}
+
+# A key source is either the key itself or a path to a file holding one or
+# more. Both forms exist because a literal keeps the deployment in one file
+# while a path keeps a 700-character RSA key out of it.
+admin_key_source_resolve() {
+  local source=$1 body
+  [[ -n ${source} ]] || return 1
+
+  if _ssh_key_identity "${source}" >/dev/null 2>&1 || [[ ${source} == *$'\n'* ]]; then
+    printf '%s\n' "${source}"
+    return 0
+  fi
+
+  local path=${source}
+  [[ ${path} == /* ]] && path="$(sysroot)${path}"
+  [[ -f ${path} ]] || die "Admin key source is neither a public key nor a readable file: ${source}"
+  _slurp body "${path}"
+  [[ -n ${body} ]] || die "Admin key source file is empty: ${source}"
+  printf '%s' "${body}"
+}
+
+# The admin usernames, in the order the operator listed them.
+admin_users() {
+  local user
+  for user in ${PVE_ADMIN_USERS:-}; do
+    [[ ${user} =~ ^[a-z_][a-z0-9_-]*$ ]] ||
+      die "Not a usable username in PVE_ADMIN_USERS: ${user}"
+    printf '%s\n' "${user}"
+  done
+}
+
+# Per-user keys win over the shared source, so a deployment with several
+# administrators does not have to give them all the same key.
+admin_keys_for() {
+  local user=$1 upper override
+  upper=${user^^}
+  upper=${upper//-/_}
+  override="PVE_ADMIN_KEY_${upper}"
+  if [[ -n ${!override:-} ]]; then
+    admin_key_source_resolve "${!override}"
+    return 0
+  fi
+  [[ -n ${PVE_ADMIN_KEY_SOURCE:-} ]] ||
+    die "No SSH key for ${user}: set ${override} or PVE_ADMIN_KEY_SOURCE."
+  admin_key_source_resolve "${PVE_ADMIN_KEY_SOURCE}"
+}
+
+# Resolves and verifies every administrator's keys before anything is
+# installed, so a deployment that would end up unreachable fails while the
+# operator is still able to log in. A shared PVE_ADMIN_KEY_SOURCE is
+# therefore optional: what matters is that each listed administrator ends
+# up covered, by whichever source.
+#
+# Prints each user and their key count; dies on the first problem.
+admin_keys_require() {
+  local -a users=()
+  mapfile -t users < <(admin_users)
+  [[ ${#users[@]} -gt 0 ]] || die 'PVE_ADMIN_USERS resolved to no usernames.'
+
+  local user keys line count
+  for user in "${users[@]}"; do
+    keys=$(admin_keys_for "${user}")
+    count=0
+    while IFS= read -r line; do
+      [[ -n ${line} ]] || continue
+      _ssh_key_identity "${line}" >/dev/null ||
+        die "Not an SSH public key, for ${user}: ${line}"
+      ssh_key_is_valid "${line}" ||
+        die "ssh-keygen rejects a key configured for ${user}: ${line}"
+      count=$((count + 1))
+    done < <(_ssh_keys_normalise "${keys}")
+    [[ ${count} -gt 0 ]] ||
+      die "No usable SSH public key is configured for ${user}."
+    printf '%s %s\n' "${user}" "${count}"
+  done
+}

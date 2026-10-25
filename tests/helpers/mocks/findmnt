@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Andrew Grimberg <tykeal@bardicgrove.org>
+# SPDX-License-Identifier: Apache-2.0
+
+# Answers from a fixture list of mount points, so a test can model /etc/pve
+# being the pmxcfs filesystem or merely a directory of the same name.
+# shellcheck source=tests/helpers/mocks/_record
+source "$(dirname -- "$0")/_record"
+
+target=${*: -1}
+mounts="${PVE_CONFIG_MOCK_STATE}/mounts"
+
+[[ -r ${mounts} ]] || exit 1
+while IFS='|' read -r path fstype; do
+  [[ ${path} == "${target}" ]] || continue
+  printf '%s\n' "${fstype}"
+  exit 0
+done <"${mounts}"
+exit 1

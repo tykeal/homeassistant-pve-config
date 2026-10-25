@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Andrew Grimberg <tykeal@bardicgrove.org>
+# SPDX-License-Identifier: Apache-2.0
+
+# Stands in for `sshd -t -f FILE`. It rejects an unknown keyword the way the
+# real binary does, which is what the validation tests need: a candidate
+# that would lock the operator out must never reach /etc/ssh.
+# shellcheck source=tests/helpers/mocks/_record
+source "$(dirname -- "$0")/_record"
+
+file=''
+want_test=0
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -t) want_test=1 ;;
+    -f)
+      file=$2
+      shift
+      ;;
+  esac
+  shift
+done
+
+[[ ${want_test} -eq 1 ]] || exit 0
+[[ -r ${file} ]] || {
+  printf 'sshd: %s: No such file\n' "${file}" >&2
+  exit 1
+}
+
+known='Include AcceptEnv AllowGroups AllowUsers AuthorizedKeysFile ChallengeResponseAuthentication
+GatewayPorts HostKey KbdInteractiveAuthentication ListenAddress LogLevel
+PasswordAuthentication PermitRootLogin Port PubkeyAuthentication Subsystem
+UsePAM X11Forwarding'
+
+check_file() {
+  local path=$1 lineno=0 line trimmed keyword rest glob
+  while IFS= read -r line || [[ -n ${line} ]]; do
+    lineno=$((lineno + 1))
+    trimmed=${line#"${line%%[![:space:]]*}"}
+    [[ -z ${trimmed} || ${trimmed} == '#'* ]] && continue
+    keyword=${trimmed%%[[:space:]]*}
+    if ! grep -qiw -- "${keyword}" <<<"${known}"; then
+      printf '%s: line %s: Bad configuration option: %s\n' \
+        "${path}" "${lineno}" "${keyword}" >&2
+      return 1
+    fi
+    # Fragments are part of the effective configuration, so a bad option in
+    # one has to be reported just as the real binary reports it.
+    if [[ ${keyword} == [Ii]nclude ]]; then
+      rest=${trimmed#"${keyword}"}
+      rest=${rest#"${rest%%[![:space:]]*}"}
+      for glob in ${rest}; do
+        for included in ${glob}; do
+          [[ -r ${included} ]] || continue
+          check_file "${included}" || return 1
+        done
+      done
+    fi
+  done <"${path}"
+}
+
+check_file "${file}" || exit 1
+exit 0
