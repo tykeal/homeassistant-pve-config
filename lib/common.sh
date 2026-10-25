@@ -631,12 +631,17 @@ _sshd_redirect_includes() {
   local root
   root=$(sysroot)
   local line trimmed keyword operand rewritten out=''
+  local -a operands=()
   while IFS= read -r line || [[ -n ${line} ]]; do
     trimmed=${line#"${line%%[![:space:]]*}"}
     if [[ ${trimmed} == [Ii]nclude[[:space:]]* ]]; then
       keyword=${trimmed%%[[:space:]]*}
       rewritten=''
-      for operand in ${trimmed#"${keyword}"}; do
+      # read, not an unquoted expansion: the operand is a pattern naming
+      # files on the host, and letting the shell expand it here would
+      # replace it with whatever happens to match outside the scratch tree.
+      read -r -a operands <<<"${trimmed#"${keyword}"}"
+      for operand in ${operands[@]+"${operands[@]}"}; do
         case ${operand} in
           "${src}"/*) operand="${conf_d}/${operand#"${src}/"}" ;;
           "${bare}"/*) operand="${conf_d}/${operand#"${bare}/"}" ;;
@@ -661,12 +666,13 @@ _sshd_redirect_includes() {
 # how a host ends up reporting itself hardened and still taking passwords.
 _sshd_includes_candidate() {
   local body=$1 candidate=$2
-  local line trimmed operand glob match
+  local line trimmed glob match
+  local -a operands=()
   while IFS= read -r line || [[ -n ${line} ]]; do
     trimmed=${line#"${line%%[![:space:]]*}"}
     [[ ${trimmed} == [Ii]nclude[[:space:]]* ]] || continue
-    operand=${trimmed#*[[:space:]]}
-    for glob in ${operand}; do
+    read -r -a operands <<<"${trimmed#*[[:space:]]}"
+    for glob in ${operands[@]+"${operands[@]}"}; do
       for match in ${glob}; do
         [[ ${match} == "${candidate}" ]] && return 0
       done
@@ -849,6 +855,7 @@ _sshd_emit_directives() {
   _SSHD_SEEN[${real}]=1
 
   local line keyword value operand resolved target
+  local -a operands=()
   while IFS= read -r line || [[ -n ${line} ]]; do
     line=${line#"${line%%[![:space:]]*}"}
     [[ -z ${line} || ${line} == '#'* ]] && continue
@@ -858,7 +865,8 @@ _sshd_emit_directives() {
     value=${value%"${value##*[![:space:]]}"}
     case ${keyword,,} in
       include)
-        for operand in ${value}; do
+        read -r -a operands <<<"${value}"
+        for operand in ${operands[@]+"${operands[@]}"}; do
           resolved=$(_sshd_resolve_include "${operand}")
           # Word splitting and globbing are what resolve the pattern sshd
           # would resolve; the operand came from a configuration file this

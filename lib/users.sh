@@ -76,6 +76,27 @@ user_in_group() {
   return 1
 }
 
+# Every group the account belongs to: the primary one named by its passwd
+# entry, and each group that lists it as a member.
+user_groups() {
+  local name=$1 gid
+  gid=$(user_gid "${name}") || gid=''
+  local file
+  file=$(_users_group_file)
+  awk -F: -v n="${name}" -v g="${gid}" '
+    $3 == g { print $1; next }
+    {
+      split($4, members, ",")
+      for (i in members) {
+        if (members[i] == n) {
+          print $1
+          next
+        }
+      }
+    }
+  ' "${file}" 2>/dev/null
+}
+
 user_join_group() {
   local name=$1 group changed=0
   shift

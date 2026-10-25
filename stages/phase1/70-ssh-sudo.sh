@@ -78,11 +78,81 @@ assert_authorized_keys_path() {
   done < <(_sshd_config_directives "${main}")
 }
 
+# AllowUsers, DenyUsers, AllowGroups and DenyGroups decide who sshd will
+# even talk to, before any key is considered. A host that admits only root
+# would reject every administrator configured here, and disabling password
+# authentication on top of that leaves nobody able to log in at all. None
+# of these four are permitted inside a Match block, so the unconditional
+# part of the configuration is the whole story.
+_ssh_name_matches() {
+  local name=$1 pattern=$2
+  # A pattern may be qualified with the host it applies from; the account
+  # it admits is the part before the '@'.
+  pattern=${pattern%%@*}
+  [[ -n ${pattern} ]] || return 1
+  # shellcheck disable=SC2053 # the pattern is one, and matching it is the point
+  [[ ${name} == ${pattern} ]]
+}
+
+assert_ssh_admits_admins() {
+  local main="${SYSROOT}/etc/ssh/sshd_config"
+  [[ -f ${main} ]] || return 0
+
+  local -a allow_users=() deny_users=() allow_groups=() deny_groups=()
+  local file criteria keyword value
+  while IFS=$'\x1f' read -r file criteria keyword value; do
+    [[ -n ${criteria} ]] && continue
+    case ${keyword} in
+      allowusers) read -r -a allow_users <<<"${value}" ;;
+      denyusers) read -r -a deny_users <<<"${value}" ;;
+      allowgroups) read -r -a allow_groups <<<"${value}" ;;
+      denygroups) read -r -a deny_groups <<<"${value}" ;;
+    esac
+  done < <(_sshd_config_directives "${main}")
+
+  local user pattern group admitted
+  for user in "${USERS[@]}"; do
+    for pattern in ${deny_users[@]+"${deny_users[@]}"}; do
+      _ssh_name_matches "${user}" "${pattern}" &&
+        die "${main} denies ${user} with 'DenyUsers ${pattern}', so hardening would leave them unable to log in."
+    done
+    if [[ ${#allow_users[@]} -gt 0 ]]; then
+      admitted=0
+      for pattern in "${allow_users[@]}"; do
+        _ssh_name_matches "${user}" "${pattern}" && admitted=1
+      done
+      [[ ${admitted} -eq 1 ]] ||
+        die "${main} admits only '${allow_users[*]}', which does not include ${user}; hardening would leave them unable to log in."
+    fi
+
+    [[ ${#deny_groups[@]} -gt 0 || ${#allow_groups[@]} -gt 0 ]] || continue
+    local -a groups=()
+    mapfile -t groups < <(user_groups "${user}")
+    for pattern in ${deny_groups[@]+"${deny_groups[@]}"}; do
+      for group in ${groups[@]+"${groups[@]}"}; do
+        _ssh_name_matches "${group}" "${pattern}" &&
+          die "${main} denies ${user}'s group ${group} with 'DenyGroups ${pattern}', so hardening would leave them unable to log in."
+      done
+    done
+    if [[ ${#allow_groups[@]} -gt 0 ]]; then
+      admitted=0
+      for pattern in "${allow_groups[@]}"; do
+        for group in ${groups[@]+"${groups[@]}"}; do
+          _ssh_name_matches "${group}" "${pattern}" && admitted=1
+        done
+      done
+      [[ ${admitted} -eq 1 ]] ||
+        die "${main} admits only the groups '${allow_groups[*]}', none of which ${user} is in; hardening would leave them unable to log in."
+    fi
+  done
+}
+
 if dry_run_enabled; then
   log_info 'would check that every administrator can already log in with a key'
 else
   assert_admin_access
   assert_authorized_keys_path
+  assert_ssh_admits_admins
 fi
 
 # --- sshd -----------------------------------------------------------------

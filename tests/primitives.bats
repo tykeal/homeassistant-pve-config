@@ -644,3 +644,18 @@ mark_pmxcfs() {
   [ "$status" -eq 0 ]
   [ -f "${target}" ]
 }
+
+@test "an Include pattern is redirected, not expanded where it stands" {
+  mkdir -p "${PVE_CONFIG_ROOT}/scratch" "${BATS_TEST_TMPDIR}/sshd_config.d"
+  : >"${BATS_TEST_TMPDIR}/sshd_config.d/50-site.conf"
+
+  local out
+  out=$(cd "${BATS_TEST_TMPDIR}" &&
+    _sshd_redirect_includes 'Include sshd_config.d/*.conf' \
+      "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d" "${PVE_CONFIG_ROOT}/scratch")
+
+  # The pattern names files sshd reads, so it has to reach the assembled
+  # tree intact instead of being resolved against the working directory.
+  [[ "${out}" == *'*.conf' ]]
+  [[ "${out}" != *50-site.conf* ]]
+}

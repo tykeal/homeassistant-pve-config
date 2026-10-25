@@ -1176,3 +1176,52 @@ zulip_secrets() {
   [ "$status" -eq 0 ]
   [[ "$(mock_calls)" == *'ifquery -a -i'* ]]
 }
+
+@test "70-ssh-sudo hardens a host whose fragment directory is not empty" {
+  seed_admin_access
+  mkdir -p "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d"
+  printf 'Include /etc/ssh/sshd_config.d/*.conf\n' \
+    >"${PVE_CONFIG_ROOT}/etc/ssh/sshd_config"
+  printf 'X11Forwarding no\n' \
+    >"${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/50-site.conf"
+
+  run run_phase1_stage 70-ssh-sudo.sh
+  [ "$status" -eq 0 ]
+  [ -f "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/99-hardening.conf" ]
+}
+
+@test "70-ssh-sudo refuses a host that does not admit the administrators" {
+  seed_admin_access
+  mkdir -p "${PVE_CONFIG_ROOT}/etc/ssh"
+  printf 'AllowUsers root\nInclude /etc/ssh/sshd_config.d/*.conf\n' \
+    >"${PVE_CONFIG_ROOT}/etc/ssh/sshd_config"
+
+  run run_phase1_stage 70-ssh-sudo.sh
+  [ "$status" -ne 0 ]
+  [[ "$output" == *AllowUsers* || "$output" == *'admits only'* ]]
+  [ ! -e "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/99-hardening.conf" ]
+}
+
+@test "70-ssh-sudo accepts a host that admits the administrators" {
+  seed_admin_access
+  mkdir -p "${PVE_CONFIG_ROOT}/etc/ssh"
+  printf 'AllowUsers root alice\nInclude /etc/ssh/sshd_config.d/*.conf\n' \
+    >"${PVE_CONFIG_ROOT}/etc/ssh/sshd_config"
+
+  run run_phase1_stage 70-ssh-sudo.sh
+  [ "$status" -eq 0 ]
+  [ -f "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/99-hardening.conf" ]
+}
+
+@test "70-ssh-sudo refuses a host that denies an administrator's group" {
+  seed_admin_access
+  printf 'wheel:x:%s:alice\n' "$(id -g)" >>"${PVE_CONFIG_GROUP}"
+  mkdir -p "${PVE_CONFIG_ROOT}/etc/ssh"
+  printf 'DenyGroups wheel\nInclude /etc/ssh/sshd_config.d/*.conf\n' \
+    >"${PVE_CONFIG_ROOT}/etc/ssh/sshd_config"
+
+  run run_phase1_stage 70-ssh-sudo.sh
+  [ "$status" -ne 0 ]
+  [[ "$output" == *wheel* ]]
+  [ ! -e "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/99-hardening.conf" ]
+}
