@@ -36,7 +36,8 @@ See [Status](#status).
 - A root shell on that host, over the console or SSH. Keep console or
   out-of-band access available: phase 1 rewrites the networking and the SSH
   policy of the machine you are probably sitting on.
-- `curl` and `tar` on the host, which a stock Proxmox install carries.
+- `curl`, `tar` and `sha256sum` on the host, which a stock Proxmox install
+  carries.
 - **A DHCP reservation for the host.** The management bridge takes its
   address from DHCP by design, so the host needs a stable lease. Create the
   reservation against the MAC of the NIC that carries the uplink before you
@@ -55,13 +56,20 @@ Install the toolkit with one command on the host:
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/tykeal/homeassistant-pve-config/main/bootstrap.sh)"
 ```
 
-The installer unpacks the repository into `/root/pve-config` and stops.
-Running the configuration takes a separate, deliberate act.
+The installer unpacks the latest published release into `/root/pve-config`
+and stops. Running the configuration takes a separate, deliberate act.
 
 The installer:
 
-- downloads the repository tarball from codeload, then rejects any archive
-  whose entries escape the extraction root or carry a link
+- resolves the latest published release by following the redirect of
+  `https://github.com/tykeal/homeassistant-pve-config/releases/latest`,
+  which needs no API token and spends no API rate limit
+- downloads `pve-config-<tag>.tar.gz` and `pve-config-<tag>.tar.gz.sha256`
+  from that release, checks that the checksum holds one record naming that
+  one asset and no path of its own, then checks the tarball with
+  `sha256sum -c` and stops before it unpacks anything if the two disagree
+- rejects any archive whose entries escape the extraction root or carry a
+  link
 - assembles `pve-config.sh`, `bootstrap.sh`, `lib/`, `stages/` and
   `examples/` into a staging tree beside the install directory
 - carries `pve-config.conf`, `secrets.env`, `state/` and `keys/` across from
@@ -70,21 +78,94 @@ The installer:
 - marks the driver and the stages executable, creates `state/`, then swaps
   the tree into place by rename
 
-Three environment variables steer it:
+### What the checksum proves
+
+The published checksum comes from the same release as the tarball, so on its
+own it rules out a corrupted or truncated download rather than a hostile
+one. It carries more weight here because this repository has GitHub
+immutable releases turned on: once a release publishes, GitHub locks its
+tag and its uploaded assets, so nobody can swap the pair afterwards. That is why
+the project attaches its own tarball. GitHub excludes the auto-generated
+`/archive/refs/tags/<tag>.tar.gz` from immutability, and the installer never
+uses it.
+
+This is not a signature. An operator who wants a check that does not trust
+the download at all reads the digest somewhere else and passes it as
+`PVE_CONFIG_SHA256`, which the installer treats as the authority. Setting
+that variable to an empty string stops the install, because a pin that
+never got a value proves nothing.
+
+### Settings
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `PVE_CONFIG_REF` | `main` | Git ref to install. Pin a tag or commit for a reproducible build |
+| `PVE_CONFIG_RELEASE` | the latest release | Release tag to install, for example `v0.1.0` |
+| `PVE_CONFIG_SHA256` | unset | Expected sha256 of the tarball, 64 hex characters. Takes precedence over the published checksum and applies in every mode. An empty value is an error, not an absent pin |
+| `PVE_CONFIG_REF` | unset | Git ref to install from codeload. No checksum covers it, so it needs `PVE_CONFIG_SHA256` or the opt-in below |
+| `PVE_CONFIG_ALLOW_UNVERIFIED` | unset | Set to `1`, or pass `--allow-unverified`, to permit an unverified `PVE_CONFIG_REF` install |
 | `PVE_CONFIG_DIR` | `/root/pve-config` | Install directory |
 | `PVE_CONFIG_REPO` | `tykeal/homeassistant-pve-config` | Source repository |
+| `PVE_CONFIG_BOOTSTRAP_ARCHIVE` | unset | Install from a local tarball instead of downloading one |
 
-To pin a ref:
+Setting both `PVE_CONFIG_RELEASE` and `PVE_CONFIG_REF` is a configuration
+error, and the installer stops naming both.
+
+### How each combination behaves
+
+| Settings | Source | Verified against |
+| --- | --- | --- |
+| none | the latest release | the published checksum |
+| `PVE_CONFIG_RELEASE=v0.1.0` | that release | the published checksum |
+| `PVE_CONFIG_RELEASE` and `PVE_CONFIG_SHA256` | that release | your digest; the published checksum is not fetched |
+| `PVE_CONFIG_REF` alone | refused | — |
+| `PVE_CONFIG_REF` and `PVE_CONFIG_ALLOW_UNVERIFIED=1` | codeload | nothing, and the run says so twice |
+| `PVE_CONFIG_REF` and `PVE_CONFIG_SHA256` | codeload | your digest, so the opt-in does not apply |
+| `PVE_CONFIG_BOOTSTRAP_ARCHIVE` | your file | your digest, when you set one |
+
+A local archive needs no opt-in. The installer downloaded nothing, so no
+remote origin needs authenticating; the bytes are ones the operator already
+chose. Set `PVE_CONFIG_SHA256` as well to confirm the file is the one you
+meant.
+
+To install a specific release:
 
 ```shell
-PVE_CONFIG_REF=v1.0.0 bash -c "$(curl -fsSL https://raw.githubusercontent.com/tykeal/homeassistant-pve-config/main/bootstrap.sh)"
+PVE_CONFIG_RELEASE=v0.1.0 bash -c "$(curl -fsSL https://raw.githubusercontent.com/tykeal/homeassistant-pve-config/main/bootstrap.sh)"
 ```
 
-A ref containing a slash works; the installer percent-encodes it.
+### Pinning a digest
+
+Read the digest on your workstation, from the checksum asset of the release
+you intend to install:
+
+```shell
+curl -fsSL https://github.com/tykeal/homeassistant-pve-config/releases/download/v0.1.0/pve-config-v0.1.0.tar.gz.sha256
+```
+
+Then pass it to the host:
+
+```shell
+PVE_CONFIG_RELEASE=v0.1.0 \
+PVE_CONFIG_SHA256=ab64ab65fa9e049a621f7fb181722b90bb6b60e4d3e42a06c001875bef8ac59d \
+  bash -c "$(curl -fsSL https://raw.githubusercontent.com/tykeal/homeassistant-pve-config/main/bootstrap.sh)"
+```
+
+On a workstation with gh 2.81.0 or newer you can also run
+`gh release verify-asset`, which checks the asset against the attestation
+GitHub holds rather than against a checksum from the same download. That is
+a workstation-side step: Debian trixie, the base of Proxmox VE 9,
+ships gh 2.46.0, and that version has no `verify-asset` subcommand.
+
+### Installing a branch during development
+
+```shell
+PVE_CONFIG_REF=feat/my-branch PVE_CONFIG_ALLOW_UNVERIFIED=1 \
+  bash -c "$(curl -fsSL https://raw.githubusercontent.com/tykeal/homeassistant-pve-config/main/bootstrap.sh)"
+```
+
+Codeload publishes no checksum, so nothing verifies this install. The run prints
+a warning before it starts and again after it finishes. A ref containing a
+slash works; the installer percent-encodes it.
 
 `bootstrap.sh --help` prints usage and skips the root check.
 
@@ -552,10 +633,9 @@ writes nothing.
 
 GitHub immutable releases lock a release the moment it publishes. Nobody can
 edit, replace or delete an asset afterwards. Correcting a mistake means
-tagging a new version.
-
-Note that `bootstrap.sh` still fetches the scripts straight from the `main`
-branch rather than from a release tarball.
+tagging a new version. `bootstrap.sh` installs from these assets, which is
+what makes the published checksum worth checking; see
+[What the checksum proves](#what-the-checksum-proves).
 
 ## Contributing
 

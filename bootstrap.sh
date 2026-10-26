@@ -12,8 +12,26 @@
 set -euo pipefail
 
 PVE_CONFIG_REPO=${PVE_CONFIG_REPO:-tykeal/homeassistant-pve-config}
-PVE_CONFIG_REF=${PVE_CONFIG_REF:-main}
+# Empty by default: the installer now takes the latest published release.
+# A ref install bypasses every checksum the project publishes, so asking
+# for one has to be an explicit act rather than the fallback.
+PVE_CONFIG_REF=${PVE_CONFIG_REF:-}
+PVE_CONFIG_RELEASE=${PVE_CONFIG_RELEASE:-}
+# An empty pin and an absent pin have to be told apart. A pin is how an
+# operator asserts trust, so PVE_CONFIG_SHA256=$(cmd) where cmd failed must
+# stop the install rather than quietly install nothing-was-checked.
+if [[ -n ${PVE_CONFIG_SHA256+set} ]]; then
+  BOOTSTRAP_PIN_SUPPLIED=1
+else
+  BOOTSTRAP_PIN_SUPPLIED=0
+fi
+PVE_CONFIG_SHA256=${PVE_CONFIG_SHA256:-}
+PVE_CONFIG_ALLOW_UNVERIFIED=${PVE_CONFIG_ALLOW_UNVERIFIED:-}
 PVE_CONFIG_DIR=${PVE_CONFIG_DIR:-/root/pve-config}
+
+# Set once the source of the tarball has been settled, and read again at
+# the end so the warning survives a long scroll of install output.
+BOOTSTRAP_UNVERIFIED=0
 
 # Only the code is replaced on an upgrade. Anything the operator or an
 # earlier run produced is carried across untouched.
@@ -51,27 +69,253 @@ bootstrap_archive_url() {
     "${PVE_CONFIG_REPO}" "$(bootstrap_encode_ref "${PVE_CONFIG_REF}")"
 }
 
+bootstrap_is_true() {
+  case ${1:-} in
+    1 | y | Y | yes | YES | true | TRUE) return 0 ;;
+  esac
+  return 1
+}
+
+# A tag arrives either from the operator or from a redirect GitHub sent
+# back, and it goes straight into a URL and a filename. Anything outside
+# this set is refused rather than escaped, because a tag that needs
+# escaping is not one this project ever published.
+bootstrap_valid_tag() {
+  local tag=$1
+  [[ ${tag} =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,99}$ ]] || return 1
+  [[ ${tag} != *..* ]] || return 1
+}
+
+# Resolves "latest" by following the redirect that /releases/latest sends,
+# whose effective URL ends in the tag. The REST API would answer the same
+# question, but it costs one of the sixty unauthenticated calls an hour a
+# whole NAT shares, and it would need a JSON parser Proxmox does not ship.
+bootstrap_latest_tag() {
+  local url effective prefix tag
+  url="https://github.com/${PVE_CONFIG_REPO}/releases/latest"
+  prefix="https://github.com/${PVE_CONFIG_REPO}/releases/tag/"
+  if ! effective=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "${url}"); then
+    bootstrap_die "Unable to resolve the latest release of ${PVE_CONFIG_REPO}. Set PVE_CONFIG_RELEASE to a published tag, or check network access to github.com."
+    return 1
+  fi
+  # A repository with no published release lands on the releases index
+  # instead, which names no tag.
+  if [[ ${effective%/} == "https://github.com/${PVE_CONFIG_REPO}/releases" ]]; then
+    bootstrap_die "${PVE_CONFIG_REPO} has no published release to install. Set PVE_CONFIG_REF with PVE_CONFIG_ALLOW_UNVERIFIED=1 to install an unverified ref instead."
+    return 1
+  fi
+  # The whole prefix has to match, not just the /releases/tag/ segment:
+  # any host can serve a path shaped like one, and a redirect somewhere
+  # else must not get to choose which release this host installs.
+  if [[ ${effective} != "${prefix}"* ]]; then
+    bootstrap_die "The latest-release lookup for ${PVE_CONFIG_REPO} ended somewhere unexpected: ${effective}. Refusing to install."
+    return 1
+  fi
+  tag=${effective#"${prefix}"}
+  tag=${tag%%/*}
+  tag=${tag%%\?*}
+  if ! bootstrap_valid_tag "${tag}"; then
+    bootstrap_die "Refusing to use the release tag github.com returned: ${tag}"
+    return 1
+  fi
+  printf '%s\n' "${tag}"
+}
+
+# sha256sum -c checks whatever its input names, and it is happy to check a
+# file that is not the one just downloaded: a record naming /etc/hostname
+# verifies /etc/hostname and reports success. So the shape of the published
+# checksum is settled first, and only a file holding exactly one record
+# naming exactly the expected asset, with no path of its own, is allowed
+# near sha256sum.
+bootstrap_check_checksum_file() {
+  local file=$1 asset=$2 record rest
+  local -a records=()
+
+  if [[ ! -s ${file} ]]; then
+    bootstrap_die "The checksum asset ${asset}.sha256 is empty; it is malformed, not a sign the download went wrong. Refusing to install."
+    return 1
+  fi
+  if ! mapfile -t records <"${file}"; then
+    bootstrap_die "Unable to read the checksum asset ${asset}.sha256."
+    return 1
+  fi
+  if [[ ${#records[@]} -ne 1 ]]; then
+    bootstrap_die "The checksum asset ${asset}.sha256 holds ${#records[@]} records where it must hold one; it is malformed. Refusing to install."
+    return 1
+  fi
+
+  record=${records[0]}
+  rest=${record:64}
+  # sha256sum writes the digest, a space, a mode marker, then the name.
+  if [[ ! ${record:0:64} =~ ^[0-9a-fA-F]{64}$ ]] ||
+    [[ ${rest:0:1} != ' ' ]] ||
+    [[ ${rest:1:1} != ' ' && ${rest:1:1} != '*' ]] ||
+    [[ ${rest:2} != "${asset}" ]]; then
+    bootstrap_die "The checksum asset ${asset}.sha256 does not name ${asset} in the form sha256sum writes; it is malformed. Refusing to install."
+    return 1
+  fi
+}
+
+# Compares an archive against a hex digest. Used for the operator pin; the
+# release asset goes through sha256sum -c instead, so the published file is
+# read as published rather than reformatted on the way in.
+bootstrap_verify_sha256() {
+  local archive=$1 want=$2 got
+  if ! command -v sha256sum >/dev/null 2>&1; then
+    bootstrap_die 'sha256sum is required to verify the download.'
+    return 1
+  fi
+  if ! got=$(sha256sum -- "${archive}"); then
+    bootstrap_die 'Unable to checksum the downloaded archive.'
+    return 1
+  fi
+  got=${got%% *}
+  if [[ ${got,,} != "${want,,}" ]]; then
+    bootstrap_die "Checksum mismatch: expected ${want,,}, got ${got,,}. Refusing to install."
+    return 1
+  fi
+}
+
+# Downloads a published release and proves the bytes are the ones the
+# release carries. The checksum comes from the same origin as the tarball,
+# so on its own it only rules out corruption and truncation. It is worth
+# more than that here because immutable releases lock a published asset:
+# the pair cannot be swapped after the fact. It is still not a signature,
+# and an operator who wants one should pin PVE_CONFIG_SHA256 to a digest
+# read somewhere other than this download.
+bootstrap_fetch_release() {
+  local dest=$1 tag=$2
+  local dir asset base
+  dir=$(dirname -- "${dest}")
+  asset="pve-config-${tag}.tar.gz"
+  base="https://github.com/${PVE_CONFIG_REPO}/releases/download/${tag}"
+
+  bootstrap_log "fetching ${PVE_CONFIG_REPO} release ${tag}"
+  if ! curl -fsSL -o "${dir}/${asset}" "${base}/${asset}"; then
+    bootstrap_die "Unable to download ${base}/${asset}"
+    return 1
+  fi
+
+  # An operator pin is the authority, so the published checksum is not
+  # fetched at all when one is set; fetching it would only raise the
+  # question of which one wins.
+  if [[ ${BOOTSTRAP_PIN_SUPPLIED} == 0 ]]; then
+    if ! curl -fsSL -o "${dir}/${asset}.sha256" "${base}/${asset}.sha256"; then
+      bootstrap_die "Release ${tag} has no ${asset}.sha256 checksum; refusing to install an unverified download."
+      return 1
+    fi
+    if ! command -v sha256sum >/dev/null 2>&1; then
+      bootstrap_die 'sha256sum is required to verify the download.'
+      return 1
+    fi
+    bootstrap_check_checksum_file "${dir}/${asset}.sha256" "${asset}" || return 1
+    # The record names the asset and nothing else, and the staging
+    # directory was created empty for this install, so the bare name can
+    # only resolve to the file just downloaded.
+    if ! (cd -- "${dir}" && sha256sum -c -- "${asset}.sha256" >/dev/null 2>&1); then
+      bootstrap_die "Checksum verification failed for ${asset}; refusing to install."
+      return 1
+    fi
+    bootstrap_log "verified ${asset} against its published checksum"
+  fi
+
+  if ! mv -- "${dir}/${asset}" "${dest}"; then
+    bootstrap_die 'Unable to stage the downloaded archive.'
+    return 1
+  fi
+}
+
+bootstrap_fetch_ref() {
+  local dest=$1 url
+  url=$(bootstrap_archive_url)
+  bootstrap_log "fetching ${PVE_CONFIG_REPO} at ${PVE_CONFIG_REF}"
+  if ! curl -fsSL -o "${dest}" "${url}"; then
+    bootstrap_die "Unable to download ${url}"
+    return 1
+  fi
+}
+
+# Settles which source the install uses, and refuses the combinations that
+# cannot mean one thing. Everything here runs before a single byte is
+# downloaded, so a misconfigured run stops without touching the network.
+bootstrap_check_config() {
+  if [[ -n ${PVE_CONFIG_RELEASE} && -n ${PVE_CONFIG_REF} ]]; then
+    bootstrap_die 'PVE_CONFIG_RELEASE and PVE_CONFIG_REF both set, and they ask for different things. Set PVE_CONFIG_RELEASE for a published release, or PVE_CONFIG_REF for an unverified ref, not both.'
+    return 1
+  fi
+
+  if [[ ${BOOTSTRAP_PIN_SUPPLIED} == 1 ]] &&
+    ! [[ ${PVE_CONFIG_SHA256} =~ ^[0-9a-fA-F]{64}$ ]]; then
+    bootstrap_die 'PVE_CONFIG_SHA256 must be 64 hexadecimal characters: the digest alone, without the filename column sha256sum prints. An empty value counts as malformed, because a pin that did not get set is not a pin.'
+    return 1
+  fi
+
+  if [[ -n ${PVE_CONFIG_RELEASE} ]] && ! bootstrap_valid_tag "${PVE_CONFIG_RELEASE}"; then
+    bootstrap_die "PVE_CONFIG_RELEASE is not a usable tag: ${PVE_CONFIG_RELEASE}"
+    return 1
+  fi
+
+  # A local archive is bytes the operator already holds. There is no remote
+  # origin to authenticate, so the opt-in would buy nothing; a pin still
+  # applies, and is the way to check the file is the one intended.
+  if [[ -n ${PVE_CONFIG_BOOTSTRAP_ARCHIVE:-} ]]; then
+    bootstrap_log "installing from the supplied archive ${PVE_CONFIG_BOOTSTRAP_ARCHIVE}"
+    return 0
+  fi
+
+  [[ -n ${PVE_CONFIG_REF} ]] || return 0
+
+  # A pin makes a ref install verified, so demanding the opt-in as well
+  # would be asking the operator to confirm a risk they already removed.
+  [[ ${BOOTSTRAP_PIN_SUPPLIED} == 0 ]] || return 0
+
+  if ! bootstrap_is_true "${PVE_CONFIG_ALLOW_UNVERIFIED}"; then
+    bootstrap_die "PVE_CONFIG_REF installs from codeload, which publishes no checksum, so nothing proves the download is the code this project released. To install it anyway, set PVE_CONFIG_ALLOW_UNVERIFIED=1 or pass --allow-unverified. To install a verified build instead, unset PVE_CONFIG_REF, or set PVE_CONFIG_SHA256 to the digest you expect."
+    return 1
+  fi
+
+  BOOTSTRAP_UNVERIFIED=1
+  bootstrap_log '****************************************************************'
+  bootstrap_log '*** UNVERIFIED INSTALL                                       ***'
+  bootstrap_log "*** Installing ref ${PVE_CONFIG_REF} from codeload."
+  bootstrap_log '*** No checksum covers this download, so nothing proves it is ***'
+  bootstrap_log '*** the code this project published. Use it for development.  ***'
+  bootstrap_log '****************************************************************'
+}
+
 # PVE_CONFIG_BOOTSTRAP_ARCHIVE lets the tests, and an air-gapped install,
 # supply the tarball instead of fetching it.
 bootstrap_fetch() {
   local dest=$1
+
   if [[ -n ${PVE_CONFIG_BOOTSTRAP_ARCHIVE:-} ]]; then
     if ! cp -- "${PVE_CONFIG_BOOTSTRAP_ARCHIVE}" "${dest}"; then
       bootstrap_die "Unable to read ${PVE_CONFIG_BOOTSTRAP_ARCHIVE}"
       return 1
     fi
-    return 0
+  elif [[ -n ${PVE_CONFIG_REF} ]]; then
+    if ! command -v curl >/dev/null 2>&1; then
+      bootstrap_die 'curl is required.'
+      return 1
+    fi
+    bootstrap_fetch_ref "${dest}" || return 1
+  else
+    if ! command -v curl >/dev/null 2>&1; then
+      bootstrap_die 'curl is required.'
+      return 1
+    fi
+    local tag=${PVE_CONFIG_RELEASE}
+    if [[ -z ${tag} ]]; then
+      tag=$(bootstrap_latest_tag) || return 1
+    fi
+    bootstrap_fetch_release "${dest}" "${tag}" || return 1
   fi
-  local url
-  url=$(bootstrap_archive_url)
-  bootstrap_log "fetching ${PVE_CONFIG_REPO} at ${PVE_CONFIG_REF}"
-  if ! command -v curl >/dev/null 2>&1; then
-    bootstrap_die 'curl is required.'
-    return 1
-  fi
-  if ! curl -fsSL -o "${dest}" "${url}"; then
-    bootstrap_die "Unable to download ${url}"
-    return 1
+
+  # The pin is checked last and in every mode, so it is the final word on
+  # whatever the earlier branch produced.
+  if [[ ${BOOTSTRAP_PIN_SUPPLIED} == 1 ]]; then
+    bootstrap_verify_sha256 "${dest}" "${PVE_CONFIG_SHA256}" || return 1
+    bootstrap_log 'archive matches PVE_CONFIG_SHA256'
   fi
 }
 
@@ -207,6 +451,8 @@ bootstrap_install() {
     return 1
   fi
 
+  bootstrap_check_config || return 1
+
   # Staging sits beside the install directory so the final move is a rename
   # on the same filesystem.
   local staging="${PVE_CONFIG_DIR}.bootstrap"
@@ -240,18 +486,40 @@ bootstrap_next_steps() {
     printf '  chmod 600 secrets.env\n'
   fi
   printf '  ./pve-config.sh --list\n  ./pve-config.sh --dry-run\n  ./pve-config.sh\n\n'
+  # Repeated here because the warning printed before the download has by
+  # now scrolled off the top of a terminal.
+  if [[ ${BOOTSTRAP_UNVERIFIED} == 1 ]]; then
+    printf 'WARNING: this install came from ref %s and no checksum covers it.\n' \
+      "${PVE_CONFIG_REF}"
+    printf 'WARNING: it is unverified. Install a published release on a host you care about.\n\n'
+  fi
 }
 
 bootstrap_usage() {
   cat <<EOF
-Usage: bootstrap.sh [-h|--help]
+Usage: bootstrap.sh [-h|--help] [--allow-unverified]
 
 Installs the pve-config toolkit into ${PVE_CONFIG_DIR} and stops.
 
+With no configuration it installs the latest published release and verifies
+the download against the checksum published alongside it.
+
+Options:
+  --allow-unverified  Permit a PVE_CONFIG_REF install that no checksum covers
+
 Environment:
-  PVE_CONFIG_REF    Git ref to install (default: main)
-  PVE_CONFIG_DIR    Install directory (default: /root/pve-config)
-  PVE_CONFIG_REPO   Source repository (default: tykeal/homeassistant-pve-config)
+  PVE_CONFIG_RELEASE  Release tag to install (default: the latest release)
+  PVE_CONFIG_SHA256   Expected sha256 of the tarball, 64 hex characters.
+                      Takes precedence over the published checksum, and
+                      applies in every mode. An empty value is an error
+  PVE_CONFIG_REF      Git ref to install from codeload. Unverified, so it
+                      needs PVE_CONFIG_SHA256 or PVE_CONFIG_ALLOW_UNVERIFIED=1
+  PVE_CONFIG_ALLOW_UNVERIFIED
+                      Set to 1 to permit an unverified ref install
+  PVE_CONFIG_DIR      Install directory (default: /root/pve-config)
+  PVE_CONFIG_REPO     Source repository (default: tykeal/homeassistant-pve-config)
+  PVE_CONFIG_BOOTSTRAP_ARCHIVE
+                      Install from a local tarball instead of downloading
 EOF
 }
 
@@ -263,6 +531,10 @@ main() {
       -h | --help)
         bootstrap_usage
         return 0
+        ;;
+      --allow-unverified)
+        PVE_CONFIG_ALLOW_UNVERIFIED=1
+        shift
         ;;
       *)
         bootstrap_die "Unknown argument: $1"
