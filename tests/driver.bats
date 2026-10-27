@@ -789,3 +789,37 @@ EOF
   run cat "${ORDER_LOG}"
   [ -z "$output" ]
 }
+
+@test "a stage runs with a normalised trace prefix" {
+  # PS4 is expanded before every traced command, so one that dereferences
+  # a variable prints what that variable holds. A stage handling a
+  # credential must not inherit one of those.
+  local path="${PVE_CONFIG_STAGES_DIR}/phase1/10-ps4.sh"
+  mkdir -p "${PVE_CONFIG_STAGES_DIR}/phase1"
+  # shellcheck disable=SC2016  # the stage prints PS4, it does not expand it here
+  printf '#!/usr/bin/env bash\nprintf "PS4=[%%s]\\n" "${PS4}"\n' >"${path}"
+  chmod +x "${path}"
+
+  export PS4='+${SOMETHING_SENSITIVE:-}: '
+  source_driver
+  run run_stage "${path}"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'PS4=[+ ]'* ]]
+}
+
+@test "an operator can ask for a trace prefix of their own" {
+  # Replacing a deliberate debugging setup without a way back is a
+  # papercut. The override is explicit, and the stages that handle
+  # credentials replace PS4 again themselves whatever it says.
+  local path="${PVE_CONFIG_STAGES_DIR}/phase1/10-ps4.sh"
+  mkdir -p "${PVE_CONFIG_STAGES_DIR}/phase1"
+  # shellcheck disable=SC2016  # the stage prints PS4, it does not expand it here
+  printf '#!/usr/bin/env bash\nprintf "PS4=[%%s]\\n" "${PS4}"\n' >"${path}"
+  chmod +x "${path}"
+
+  export PVE_CONFIG_TRACE_PREFIX='[trace] '
+  source_driver
+  run run_stage "${path}"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'PS4=[[trace] ]'* ]]
+}
