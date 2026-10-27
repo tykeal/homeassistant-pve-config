@@ -4,7 +4,9 @@
 
 # The prelude every stage sources. A stage is a child process with none of
 # the driver's state beyond the environment, so it pulls in the same set of
-# libraries the driver did and in the same order.
+# libraries the driver did and in the same order, plus the community-scripts
+# pins: a stage is what shells out to an upstream helper, and the pins only
+# bind when they are in that stage's environment.
 
 _PVE_STAGE_LIB_DIR=${PVE_CONFIG_LIB_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}
 
@@ -24,6 +26,8 @@ source "${_PVE_STAGE_LIB_DIR}/users.sh"
 source "${_PVE_STAGE_LIB_DIR}/service.sh"
 # shellcheck source=lib/pve.sh
 source "${_PVE_STAGE_LIB_DIR}/pve.sh"
+# shellcheck source=lib/community-scripts.sh
+source "${_PVE_STAGE_LIB_DIR}/community-scripts.sh"
 
 # The management bridge name is fixed by convention rather than configured.
 # Every Proxmox document, every support answer and every one of this

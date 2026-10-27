@@ -279,8 +279,11 @@ The shipped `examples/pve-config.conf.example` also carries keys that phase
 rewrite: `PVE_ACME_ENVIRONMENT`, `PVE_ACME_EMAIL`, `PVE_ACME_DNS_PLUGIN`,
 `PVE_TAILSCALE_HOSTNAME`, `PVE_TAILSCALE_CTID`, `PVE_HAOS_HOSTNAME`,
 `PVE_HAOS_VMID`, `PVE_HAOS_RAM_MB`, `PVE_HAOS_CORES`,
-`PVE_FRIGATE_HOSTNAME`, `PVE_FRIGATE_CTID`, `PVE_COMMUNITY_SCRIPTS_REPO` and
-`PVE_COMMUNITY_SCRIPTS_REF`.
+`PVE_FRIGATE_HOSTNAME` and `PVE_FRIGATE_CTID`.
+
+The community-scripts pins are not among them. They belong to the toolkit
+rather than to a deployment, so they live in `lib/community-scripts.sh`.
+See [Community-scripts pins](#community-scripts-pins).
 
 ### Secret keys
 
@@ -575,6 +578,197 @@ back or delete it first.
   environment, or drop `--non-interactive`.
 - `This does not look like a Proxmox VE host` — the stages found no
   `pveversion`, `pvesh` or `pvecm`.
+
+## Community-scripts pins
+
+Phase 2 creates its guests with the community-scripts helpers. Upstream
+keeps those helpers in two repositories and versions them apart:
+
+| Repository | Holds | Tags |
+| --- | --- | --- |
+| `community-scripts/ProxmoxVE` | the scripts: `ct/`, `vm/`, `install/`, `tools/` | a dated tag most days, lightweight, so upstream can move one |
+| `community-scripts/core` | the engine: `core/build.func`, `ui/*.func`, `pve/backend.func`, `pve/vm-core.func` | none at all |
+
+Both pins live in `lib/community-scripts.sh`, and that file holds nothing
+else. The stage prelude `lib/stage.sh` sources it, so both variables are in
+the environment of every stage, which is what a stage hands to the upstream
+script it shells out to. They are a property of the toolkit rather than of
+a deployment: a given release has to build the same guest at every site, so
+the pins ship with the code and move when someone tests the code against a
+newer pair.
+
+**Both pins are commit SHAs.** A dated tag is a label a human can read, and
+`lib/community-scripts.sh` keeps the one that named the ProxmoxVE commit
+for that reason, but upstream can move a lightweight tag onto another
+commit and can move no SHA anywhere. Both URLs name a SHA, and one
+procedure below covers both repositories.
+
+A `ct/*.sh` script is three lines of preamble that source
+`core/build.func` out of `community-scripts/core`, and that engine then
+fetches the matching `install/*.sh` back out of
+`community-scripts/ProxmoxVE`. The two fetches read two separate
+variables, `COMMUNITY_SCRIPTS_URL` for the scripts and
+`COMMUNITY_SCRIPTS_CORE_URL` for the engine, and each falls back to the tip
+of `main` when its variable is unset. **Pinning the script repository alone
+pins nothing.** The engine would still come from whatever upstream pushed
+that morning, and the engine is what creates the container.
+
+`lib/community-scripts.sh` exports both variables, keeping any value
+already in the environment, so exporting one by hand before a run points
+that run at a fork or at an unreleased branch without an edit.
+
+### Bumping the pins
+
+Both repositories move, and they move at different times. Review them
+together, and treat a bump as one change covering both. A pin is a commit
+SHA in both cases, so one procedure covers the pair. The commands below run
+as written, and set the `NEW_` values themselves.
+
+Start from the SHAs already in `lib/community-scripts.sh`, then pick the
+candidates. The script repository is easiest to read through its dated
+tags, so resolve the chosen tag to the commit it names and carry that
+commit forward; the engine has no tags, so take the tip of `main`:
+
+```shell
+OLD_PVE_SHA=$(sed -n "s/^COMMUNITY_SCRIPTS_PROXMOXVE_COMMIT='\(.*\)'$/\1/p" \
+  lib/community-scripts.sh)
+OLD_CORE_SHA=$(sed -n "s/^COMMUNITY_SCRIPTS_CORE_COMMIT='\(.*\)'$/\1/p" \
+  lib/community-scripts.sh)
+
+# The dated tags on the script repository, newest first. Pick one.
+gh api repos/community-scripts/ProxmoxVE/tags --jq '.[].name' | head -5
+PVE_TAG='2026-10-26'
+
+# The commit that tag names today. This SHA is the pin; the tag goes in
+# the file beside it as a label, because upstream can move the tag.
+NEW_PVE_SHA=$(gh api "repos/community-scripts/ProxmoxVE/commits/${PVE_TAG}" \
+  --jq '.sha')
+
+# The engine's candidate, with the commit it sits on.
+gh api repos/community-scripts/core/commits/main \
+  --jq '.sha, .commit.committer.date, .commit.message'
+NEW_CORE_SHA=$(gh api repos/community-scripts/core/commits/main --jq '.sha')
+```
+
+Review what changed between the SHA in the tree and the candidate SHA, for
+both repositories:
+
+```shell
+gh api "repos/community-scripts/ProxmoxVE/compare/${OLD_PVE_SHA}...${NEW_PVE_SHA}" \
+  --jq '.commits[].commit.message' | head -40
+
+gh api "repos/community-scripts/core/compare/${OLD_CORE_SHA}...${NEW_CORE_SHA}" \
+  --jq '.files[].filename'
+```
+
+Read the engine diff with care. A change to `pve/backend.func` or
+`core/build.func` changes how every container gets built, and upstream
+makes those changes without a release to announce them.
+
+Then edit `lib/community-scripts.sh`, replacing both commit SHAs, the
+ProxmoxVE tag label and the verification date beside each. Confirm that
+each new SHA exists and still carries the paths the guest stages ask for:
+
+```shell
+for url in \
+  "https://raw.githubusercontent.com/community-scripts/core/${NEW_CORE_SHA}/core/build.func" \
+  "https://raw.githubusercontent.com/community-scripts/ProxmoxVE/${NEW_PVE_SHA}/ct/frigate.sh" \
+  "https://raw.githubusercontent.com/community-scripts/ProxmoxVE/${NEW_PVE_SHA}/install/frigate-install.sh" \
+  "https://raw.githubusercontent.com/community-scripts/ProxmoxVE/${NEW_PVE_SHA}/vm/haos-vm.sh" \
+  "https://raw.githubusercontent.com/community-scripts/ProxmoxVE/${NEW_PVE_SHA}/tools/addon/add-tailscale-lxc.sh"; do
+  curl -fsSI -o /dev/null -w "%{http_code} ${url}\n" "${url}"
+done
+```
+
+Five `200` lines mean both commits resolve and still carry the paths.
+Confirm the toolkit now hands those SHAs on:
+
+```shell
+env -u COMMUNITY_SCRIPTS_URL -u COMMUNITY_SCRIPTS_CORE_URL bash -c \
+  'source lib/community-scripts.sh
+   printf "%s\n%s\n" "${COMMUNITY_SCRIPTS_URL}" "${COMMUNITY_SCRIPTS_CORE_URL}"'
+```
+
+Neither URL may end on a branch or tag name. Run the test suite, then
+rebuild a guest on a host you can afford to lose before the bump reaches a
+customer.
+
+### What the pins do not pin
+
+A pinned pair fixes the scripts that run, not the software they install.
+The install scripts fetch packages from Debian, from upstream project
+releases and from container registries, and none of those carry a version
+this repository controls. Two deployments built from the same pins weeks
+apart get the same procedure and different package versions inside the
+guest. Treat the pins as reproducibility of the build, and the guest
+contents as current as of the day you built the guest.
+
+One upstream script carries a further exception, in script code rather
+than in packages. `tools/addon/add-tailscale-lxc.sh` runs its
+Debian and Ubuntu branch through `pct exec "$CTID" -- bash -c '...'`, and
+that block sources `core/core.func` and `lib/tools.func` from the engine
+repository a second time, from inside the container. The block is single
+quoted, so the expansion happens in the container, where
+`COMMUNITY_SCRIPTS_CORE_URL` is not set: `pct exec` carries no environment
+across, and a non-interactive `bash -c` reads no profile. Those two sources
+fall back to `core/main` whatever this toolkit exports on the host, so the
+engine helpers that run inside the container can differ between two runs of
+the same pin.
+
+The pin cannot reach that far by exporting harder. When phase 2 wires the
+addon up it has to fetch the script at the pinned ProxmoxVE SHA and replace
+the `core/main` fallback inside the quoted block with the pinned engine URL
+before running it, or else accept that this one guest drifts and say so.
+Whoever bumps the pins should re-read the block, because upstream may fix
+it.
+
+### Telemetry
+
+The community-scripts engine posts a record of each guest build to the
+community-scripts API. This toolkit leaves that at the upstream default and
+turns nothing off, because the project is free and the counts are what tell
+upstream which scripts people still use. Read what the payload carries and
+decide for the host.
+
+The payload, built in `api/telemetry.func` at the pinned engine commit,
+carries at least a random id and an execution id for the run, the
+application name, the build method and type, disk size, core count, RAM
+size and speed, CPU vendor and model, GPU vendor, model and passthrough
+setting, architecture, platform, kernel version, OS type and version,
+installed application version, Proxmox version, the repository the scripts
+came from, the install duration, an exit code and the result. A failed
+build also carries an error category, the error text, the failing command
+and the line number it came from. That list is representative rather than
+exhaustive; read `api/telemetry.func` at the pinned commit for the field
+set a given pin sends. **Error text and command lines can carry
+host-specific detail**, such as a path, a hostname or an argument the
+script carried.
+
+The two guest paths ask about telemetry differently, and the difference is
+upstream's rather than ours.
+
+The LXC path prompts. `diagnostics_check` runs before a container build,
+and with no `/usr/local/community-scripts/diagnostics` file present it asks
+with a whiptail dialog and writes the answer to that file. Later container
+builds read the file and ask nothing.
+
+The VM path never prompts. `pve/vm-core.func` calls no `diagnostics_check`,
+and `post_to_api_vm` reads the diagnostics file if one exists. With no
+file, the setting stays unset, the engine treats that as `no`, and the VM
+build reports nothing. A host that has only ever built the Home Assistant
+OS VM has sent nothing, whatever it would have answered.
+
+Writing the file before the first guest build is the only thing that
+settles both paths at once, in either direction. To opt a host out:
+
+```shell
+mkdir -p /usr/local/community-scripts
+printf 'DIAGNOSTICS=no\n' >/usr/local/community-scripts/diagnostics
+```
+
+`DIAGNOSTICS=yes` in the same file opts in, which is also what makes a VM
+build report. The engine reads the file on every run, so the same edit
+changes the answer on a host that already has one.
 
 ## Status
 

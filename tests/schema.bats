@@ -39,6 +39,13 @@ setup() {
   # setting that silently does nothing.
   run grep -n "^#\? *PVE_BRIDGE=" "${REPO_ROOT}/examples/pve-config.conf.example"
   [ "$status" -ne 0 ]
+
+  # The community-scripts pins belong to the toolkit, in
+  # lib/community-scripts.sh. A per-deployment key here would be a second
+  # answer to the same question, and the one an operator would edit.
+  run grep -n "^#\? *PVE_COMMUNITY_SCRIPTS_" \
+    "${REPO_ROOT}/examples/pve-config.conf.example"
+  [ "$status" -ne 0 ]
 }
 
 @test "no secret is declared in the configuration schema" {
