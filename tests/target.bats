@@ -495,6 +495,33 @@ guest_commands() {
   [ ! -e "$(guest_file "${CT}" /etc/pve-config.conf)" ]
 }
 
+# `stat -c %a` drops every leading zero, so the modes it reports for 0000
+# and 0070 are `0` and `70`. Both have to be accepted, or rewriting such a
+# file without an explicit mode aborts instead of preserving it.
+@test "a mode stat reported without its leading zeroes is accepted" {
+  local mode
+  for mode in 0 70 644; do
+    target_write_file "${GUEST}" "/etc/mode-bare-${mode}" 'body' "${mode}" >/dev/null
+    [ "$(stat -c '%a' "$(guest_file "${CT}" "/etc/mode-bare-${mode}")")" \
+      = "$(printf '%o' "$((8#${mode}))")" ]
+  done
+}
+
+# `read -d ''` stops at the first NUL, so a file read back on its leading
+# fragment alone would compare equal to content it does not hold.
+@test "a container file holding a NUL byte is refused, not truncated" {
+  seed_guest_file "${CT}" /etc/pve-config.conf 'placeholder'
+  printf 'desired\000stale-suffix' >"$(guest_file "${CT}" /etc/pve-config.conf)"
+
+  run target_slurp body "${GUEST}" /etc/pve-config.conf
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'NUL byte'* ]]
+
+  run target_write_file "${GUEST}" /etc/pve-config.conf 'desired'
+  [ "$status" -ne 0 ]
+  [[ "$output" != *unchanged* ]]
+}
+
 # --- the end-of-command report --------------------------------------------
 
 @test "output that looks like the end-of-command report is kept" {

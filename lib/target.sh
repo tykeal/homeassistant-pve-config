@@ -348,6 +348,19 @@ _target_scratch_file() {
   printf '%s\n' "${tmp}"
 }
 
+# True when a file holds nothing a bash variable cannot carry.
+#
+# `read -r -d ''` stops at the first NUL, so a pulled file containing one
+# would be compared on its leading fragment alone and a file that differs
+# past that point would be reported `unchanged`. A NUL is refused rather
+# than silently truncated.
+_target_file_has_no_nul() {
+  local file=$1 total stripped
+  total=$(wc -c <"${file}") || return 1
+  stripped=$(tr -d '\000' <"${file}" | wc -c) || return 1
+  [[ ${total} -eq ${stripped} ]]
+}
+
 # Reads a file off the target into the named variable, returning non-zero
 # when there is nothing to read.
 #
@@ -383,6 +396,10 @@ target_slurp() {
     rm -f -- "${__tmp}"
     [[ -n ${__out} ]] && log_error "${__out}"
     die "pct could not read ${__path} from $(target_describe "${__target}")"
+  fi
+  if ! _target_file_has_no_nul "${__tmp}"; then
+    rm -f -- "${__tmp}"
+    die "Refusing to read ${__path} from $(target_describe "${__target}"): it contains a NUL byte"
   fi
   _slurp "${__var}" "${__tmp}"
   rm -f -- "${__tmp}"
@@ -426,11 +443,12 @@ _target_refuse_symlink() {
 # and then parses base 0, so an unprefixed 640 already means 0640. Saying so
 # in the value rather than relying on that is cheap, and it refuses a mode
 # that is not octal at all instead of letting pct guess at it. `stat -c %a`
-# drops the leading zero and keeps setuid, setgid and sticky in a fourth
-# digit, which is exactly what this has to carry through intact.
+# drops every leading zero and keeps setuid, setgid and sticky in a fourth
+# digit, so 0000 comes back as `0` and 0070 as `70`. One to four octal
+# digits are accepted so a stat-reported mode round-trips intact.
 _target_perms() {
   local __var=$1 mode=$2
-  [[ ${mode} =~ ^0?[0-7]{3,4}$ ]] ||
+  [[ ${mode} =~ ^0?[0-7]{1,4}$ ]] ||
     die "Not an octal file mode: '${mode}'"
   printf -v "${__var}" '0%o' "$((8#${mode}))"
 }
