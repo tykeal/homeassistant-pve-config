@@ -16,6 +16,10 @@ use_mocks() {
   # be run twice and converge on the second pass.
   export PVE_CONFIG_MOCK_STATE="${BATS_TEST_TMPDIR}/mock-state"
   mkdir -p "${PVE_CONFIG_MOCK_STATE}"
+  # The guest target stages content through mktemp on its way to pct push.
+  # Keeping that inside the test's own directory means a failed case leaves
+  # its evidence with the rest, and leaves nothing behind in /tmp.
+  export TMPDIR="${BATS_TEST_TMPDIR}"
   PATH="${REPO_ROOT}/tests/helpers/mocks:${PATH}"
   export PATH
 }
@@ -27,7 +31,7 @@ mock_calls() {
 # Sources the libraries into the current test shell.
 load_libs() {
   local lib
-  for lib in common version config detect state schema pkg users service pve; do
+  for lib in common version config detect state schema pkg users service pve target; do
     # shellcheck disable=SC1090
     source "${REPO_ROOT}/lib/${lib}.sh"
   done
@@ -159,4 +163,42 @@ run_phase1_stage() {
 
 sysroot_file() {
   printf '%s\n' "${PVE_CONFIG_ROOT}$1"
+}
+
+# --- the simulated container ----------------------------------------------
+
+# Where the pct mock keeps the container's filesystem. A test reads and
+# seeds the guest through these rather than through pct, so an assertion
+# about what ended up in the container does not depend on the same code
+# path that put it there.
+guest_root() {
+  local root="${PVE_CONFIG_MOCK_STATE}/guests/$1/rootfs"
+  if [[ ! -d ${root}/etc ]]; then
+    mkdir -p -- "${root}/etc" "${root}/home"
+    printf 'root:x:0:0::/root:/bin/bash\n' >"${root}/etc/passwd"
+    printf 'root:x:0:\nsudo:x:27:\n' >"${root}/etc/group"
+  fi
+  printf '%s\n' "${root}"
+}
+
+guest_file() {
+  printf '%s\n' "$(guest_root "$1")$2"
+}
+
+# Puts a file in the container as if it had always been there.
+seed_guest_file() {
+  local vmid=$1 path=$2 content=$3 mode=${4:-0644} dest
+  dest=$(guest_file "${vmid}" "${path}")
+  mkdir -p -- "$(dirname -- "${dest}")"
+  printf '%s' "${content}" >"${dest}"
+  chmod -- "${mode}" "${dest}"
+}
+
+# Adds an account to the container's passwd fixture. The ids are the
+# runner's own, matching seed_user, so ownership checks pass unprivileged.
+seed_guest_user() {
+  local vmid=$1 name=$2 shell=${3:-/bin/bash}
+  printf '%s:x:%s:%s::/home/%s:%s\n' \
+    "${name}" "$(id -u)" "$(id -g)" "${name}" "${shell}" \
+    >>"$(guest_file "${vmid}" /etc/passwd)"
 }
