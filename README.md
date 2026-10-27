@@ -703,6 +703,25 @@ apart get the same procedure and different package versions inside the
 guest. Treat the pins as reproducibility of the build, and the guest
 contents as current as of the day you built the guest.
 
+One upstream script carries a further exception, in script code rather
+than in packages. `tools/addon/add-tailscale-lxc.sh` runs its
+Debian and Ubuntu branch through `pct exec "$CTID" -- bash -c '...'`, and
+that block sources `core/core.func` and `lib/tools.func` from the engine
+repository a second time, from inside the container. The block is single
+quoted, so the expansion happens in the container, where
+`COMMUNITY_SCRIPTS_CORE_URL` is not set: `pct exec` carries no environment
+across, and a non-interactive `bash -c` reads no profile. Those two sources
+fall back to `core/main` whatever this toolkit exports on the host, so the
+engine helpers that run inside the container can differ between two runs of
+the same pin.
+
+The pin cannot reach that far by exporting harder. When phase 2 wires the
+addon up it has to fetch the script at the pinned ProxmoxVE SHA and replace
+the `core/main` fallback inside the quoted block with the pinned engine URL
+before running it, or else accept that this one guest drifts and say so.
+Whoever bumps the pins should re-read the block, because upstream may fix
+it.
+
 ### Telemetry
 
 The community-scripts engine posts a record of each guest build to the
