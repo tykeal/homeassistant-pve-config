@@ -405,18 +405,35 @@ target_slurp() {
   rm -f -- "${__tmp}"
 }
 
+# True for a mode that is safe to hand to `$((8#...))`.
+#
+# One to four octal digits, optionally prefixed with a zero. `stat -c '%a'`
+# drops every leading zero, so it reports 0000 as `0` and 0070 as `70`, and
+# both have to pass.
+_is_octal_mode() {
+  [[ $1 =~ ^0?[0-7]{1,4}$ ]]
+}
+
 # The permission bits as the target reports them, or non-zero when the path
 # is not there.
+#
+# A mode leaves this function only once it is known to be octal digits.
+# Every consumer feeds it to `$((8#...))`, and bash arithmetic evaluates an
+# array subscript, so an unvalidated string from a container would run
+# commands as root on the host -- during a dry run as readily as any other
+# time. The guest is not trusted to answer this question sensibly.
 target_mode() {
-  local __var=$1 target=$2 path=$3
+  local __var=$1 target=$2 path=$3 __mode_raw
   _target_valid "${target}"
   if target_is_host "${target}"; then
-    local __m
-    __m=$(stat -c '%a' -- "$(target_path "${target}" "${path}")" 2>/dev/null) || return 1
-    printf -v "${__var}" '%s' "${__m}"
-    return 0
+    __mode_raw=$(stat -c '%a' -- "$(target_path "${target}" "${path}")" 2>/dev/null) || return 1
+  else
+    target_capture __mode_raw "${target}" stat -c '%a' -- "${path}" || return 1
+    _is_octal_mode "${__mode_raw}" ||
+      die "$(target_describe "${target}") reported a mode for ${path} that is not octal: '${__mode_raw}'"
   fi
-  target_capture "${__var}" "${target}" stat -c '%a' -- "${path}"
+  printf -v "${__var}" '%s' "${__mode_raw}"
+  return 0
 }
 
 _target_mode_matches() {
@@ -448,7 +465,7 @@ _target_refuse_symlink() {
 # digits are accepted so a stat-reported mode round-trips intact.
 _target_perms() {
   local __var=$1 mode=$2
-  [[ ${mode} =~ ^0?[0-7]{1,4}$ ]] ||
+  _is_octal_mode "${mode}" ||
     die "Not an octal file mode: '${mode}'"
   printf -v "${__var}" '0%o' "$((8#${mode}))"
 }

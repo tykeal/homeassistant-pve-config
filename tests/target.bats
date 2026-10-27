@@ -509,6 +509,23 @@ guest_commands() {
 
 # `read -d ''` stops at the first NUL, so a file read back on its leading
 # fragment alone would compare equal to content it does not hold.
+# Bash arithmetic evaluates an array subscript, so `$((8#${mode}))` on a
+# string a container chose would run commands as root on the host. The mode
+# is validated where it enters, before any consumer does arithmetic on it.
+@test "a mode a container makes up is refused before arithmetic sees it" {
+  local hostile="x[\$(touch \"${TMPDIR}/pwned\")]"
+  target_capture() { printf -v "$1" '%s' "${hostile}"; }
+
+  run target_mode mode "${GUEST}" /etc/pve-config.conf
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'not octal'* ]]
+  [ ! -e "${TMPDIR}/pwned" ]
+
+  run target_ensure_not_group_other_writable "${GUEST}" /etc/pve-config.conf
+  [ "$status" -ne 0 ]
+  [ ! -e "${TMPDIR}/pwned" ]
+}
+
 @test "a container file holding a NUL byte is refused, not truncated" {
   seed_guest_file "${CT}" /etc/pve-config.conf 'placeholder'
   printf 'desired\000stale-suffix' >"$(guest_file "${CT}" /etc/pve-config.conf)"
