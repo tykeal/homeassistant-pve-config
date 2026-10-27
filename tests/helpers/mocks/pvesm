@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Andrew Grimberg <tykeal@bardicgrove.org>
+# SPDX-License-Identifier: Apache-2.0
+
+# Reports the storages a test says this node has, in the shape pvesm
+# prints them. PVE_CONFIG_MOCK_PVESM_<CONTENT> names them per content
+# type, so a node with one template storage and two container storages --
+# which is the case that must stop rather than guess -- can be arranged.
+# shellcheck source=tests/helpers/mocks/_record
+source "$(dirname -- "$0")/_record"
+
+[[ ${1:-} == status ]] || exit 0
+shift
+
+content=''
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -content | --content)
+      content=${2:-}
+      shift 2
+      ;;
+    *) shift ;;
+  esac
+done
+
+# Set but empty means a node with no storage of that kind, which is a
+# case the toolkit has to report rather than guess around -- so the
+# fallback is on "unset" alone.
+var="PVE_CONFIG_MOCK_PVESM_${content^^}"
+if [[ -n ${!var+set} ]]; then
+  names=${!var}
+else
+  names=${PVE_CONFIG_MOCK_PVESM_STORAGES:-local}
+fi
+
+printf '%-20s %-7s %-7s %15s %15s %15s %7s\n' \
+  Name Type Status Total Used Available '%'
+for name in ${names}; do
+  printf '%-20s %-7s %-7s %15s %15s %15s %7s\n' \
+    "${name}" dir active 104857600 10485760 94371840 10.00%
+done

@@ -258,6 +258,18 @@ The driver resolves these keys on every run.
 | `PVE_ACME_DNS_PLUGIN` | yes | `dnsmadeeasy` | DNS-01 plugin name. DNS Made Easy is the only supported provider, so `dnsmadeeasy` is the only accepted value |
 | `PVE_ACME_ACCEPT_TOS` | yes | `no` | Accept the CA terms of service, which registering an account requires |
 | `PVE_ACME_FORCE_ORDER` | yes | `no` | Order a certificate even when the host holds a current one. Staging only |
+| `PVE_TAILSCALE_ENABLED` | yes | `no` | Build the Tailscale subnet router container |
+| `PVE_TAILSCALE_HOSTNAME` | yes | `ts-`*shorthostname* | Hostname of the subnet router container, and its name in the tailnet |
+| `PVE_TAILSCALE_CTID` | no | first free | Container ID for the router. Unset means 100 when free, otherwise `pvesh get /cluster/nextid` |
+| `PVE_TAILSCALE_ROUTES` | no | detected | Comma-separated subnets to advertise. Unset means the IPv4 subnet of the management bridge (`vmbr0`) |
+| `PVE_TAILSCALE_STORAGE` | no | detected | Fallback storage for both the template and the root disk. It has to accept both content types |
+| `PVE_TAILSCALE_TEMPLATE_STORAGE` | no | detected | Storage for the container template. Unset means `PVE_TAILSCALE_STORAGE`, then the node's only `vztmpl` storage |
+| `PVE_TAILSCALE_CONTAINER_STORAGE` | no | detected | Storage for the root disk. Unset means `PVE_TAILSCALE_STORAGE`, then the node's only `rootdir` storage |
+| `PVE_TAILSCALE_ADOPT_EXISTING` | yes | `no` | Allow `PVE_TAILSCALE_CTID` to point at a container this toolkit did not build |
+| `PVE_TAILSCALE_KEYRING_SHA256` | no | pinned | SHA-256 the Tailscale repository signing key must have. Set this only when Tailscale rotates it |
+| `PVE_TAILSCALE_RAM_MB` | no | scaled | Container memory. Unset means host RAM / 64, clamped to 256..1024 |
+| `PVE_TAILSCALE_CORES` | no | scaled | Container cores. Unset means 1, or 2 on a host with eight or more |
+| `PVE_TAILSCALE_DISK_GB` | no | `2` | Container root disk size |
 
 Derivation of `PVE_BRIDGE_PORTS` fails when the host has no default route,
 or carries more than one. The driver then names what it found and asks,
@@ -280,11 +292,11 @@ the config file or the environment when you need them.
 | `PVE_NETWORK_TAKEOVER` | `no` | Let the network stage replace an `/etc/network/interfaces` that describes more than `lo`, the bridge ports and `vmbr0` |
 | `PVE_ADMIN_KEY_<USERNAME>` | none | Per-user key source, overriding `PVE_ADMIN_KEY_SOURCE`. Uppercase the username and turn any `-` into `_` |
 
-The shipped `examples/pve-config.conf.example` also carries keys that phase
-2 will read. They do nothing today, and the driver preserves them across a
-rewrite: `PVE_TAILSCALE_HOSTNAME`, `PVE_TAILSCALE_CTID`,
-`PVE_HAOS_HOSTNAME`, `PVE_HAOS_VMID`, `PVE_HAOS_RAM_MB`, `PVE_HAOS_CORES`,
-`PVE_FRIGATE_HOSTNAME` and `PVE_FRIGATE_CTID`.
+The shipped `examples/pve-config.conf.example` also carries keys that the
+remaining phase-2 stages will read. They do nothing today, and the driver
+preserves them across a rewrite: `PVE_HAOS_HOSTNAME`, `PVE_HAOS_VMID`,
+`PVE_HAOS_RAM_MB`, `PVE_HAOS_CORES`, `PVE_FRIGATE_HOSTNAME` and
+`PVE_FRIGATE_CTID`.
 
 The community-scripts pins are not among them. They belong to the toolkit
 rather than to a deployment, so they live in `lib/community-scripts.sh`.
@@ -293,8 +305,8 @@ See [Community-scripts pins](#community-scripts-pins).
 ### Secret keys
 
 `examples/secrets.env.example` lists the credentials. Phase 1 reads the
-Zulip three. Stage `10-acme` reads the DNS Made Easy pair. The Tailscale
-key waits on the guest stages.
+Zulip three. Stage `10-acme` reads the DNS Made Easy pair. Stage
+`20-tailscale` reads the Tailscale key.
 
 | Key | Used by | Meaning |
 | --- | --- | --- |
@@ -303,7 +315,7 @@ key waits on the guest stages.
 | `PVE_ZULIP_BOT_API_KEY` | phase 1 | Zulip bot API key |
 | `PVE_DNSMADEEASY_KEY` | `10-acme` | DNS Made Easy API key for the ACME DNS-01 challenge |
 | `PVE_DNSMADEEASY_SECRET` | `10-acme` | DNS Made Easy API secret |
-| `PVE_TAILSCALE_AUTHKEY` | phase 2 | Tailscale pre-authentication key for the LXC |
+| `PVE_TAILSCALE_AUTHKEY` | `20-tailscale` | Tailscale pre-authentication key for the subnet router LXC |
 
 Enabling Zulip without all three of its values aborts the stage. A
 deployment that opts out with `PVE_ZULIP_ENABLED='no'` passes quietly.
@@ -399,6 +411,7 @@ Stages 40 and 50 exit early unless `PVE_NO_SUBSCRIPTION` says `yes`. Stage
 | Stage | Converges |
 | --- | --- |
 | `10-acme` | Optional. Writes the DNS Made Easy credentials to a 0600 file, registers the plugin and the ACME account for the selected directory, points the node at both, then orders a certificate for `PVE_FQDN` when the host lacks a current one |
+| `20-tailscale` | Optional. Builds an unprivileged Debian LXC, installs Tailscale from its own repository, turns on IPv4 forwarding, joins the tailnet and advertises the LAN as a subnet router |
 
 Stage 10 exits early unless `PVE_ACME_ENABLED` says `yes`. It orders from
 the Let's Encrypt staging directory until `PVE_ACME_ENVIRONMENT` says
@@ -459,6 +472,148 @@ Registration accepts the CA terms of service, and `pvenode` asks for that
 answer rather than taking it as an option. The stage stops before
 registering until `PVE_ACME_ACCEPT_TOS` says `yes`, so the acceptance is
 yours.
+
+### The Tailscale subnet router
+
+Stage `20-tailscale` exits early unless `PVE_TAILSCALE_ENABLED` says
+`yes`, because the container it builds advertises your LAN into a tailnet
+and that is not a thing to start doing by default.
+
+It builds the container with community-scripts `ct/debian.sh` at the
+pinned SHA, with `mode=default` set explicitly. The mode matters: the
+engine falls back to a silent run only on the update path, and a create
+with no mode puts a whiptail settings menu on a screen that an unattended
+run does not have. For the same reason the stage resolves the storages
+first and writes them into `/usr/local/community-scripts/default.vars`,
+which is where the engine looks before it offers a menu of its own.
+
+The container runs unprivileged, with nesting on and IPv6 off, and it
+needs `/dev/net/tun`. `var_tun` is a hint to the builder and not a `pct`
+feature, so the stage also converges the two lines that actually grant the
+device into `/etc/pve/lxc/<ctid>.conf`:
+
+```text
+lxc.cgroup2.devices.allow: c 10:200 rwm
+lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file
+```
+
+Converging them covers a container built before this stage existed as well
+as one the builder just made. The stage reboots a running container that
+lacked them once, because the device appears at start. `/etc/pve` is
+pmxcfs, which forces `root:www-data` and `0640` whatever anyone asks for,
+and refuses the usual write-and-rename: the stage appends, as upstream
+does.
+
+#### Which container the stage works on
+
+The stage marks the container it builds with the Proxmox tag
+`pve-config-tailscale`. A tag survives a reboot, a restore and a release
+upgrade, and the stage checks for it before the first change it makes. No
+container it did not build gets a reboot, `/dev/net/tun`, a package
+install or a place on your tailnet.
+
+It picks an id in this order: `PVE_TAILSCALE_CTID` when you pin one; the
+tagged container on this node; 100 when nothing holds it, which is the
+convention; otherwise `pvesh get /cluster/nextid`.
+
+A pinned id whose container exists but carries no tag stops the stage,
+with a message naming the tag. Set `PVE_TAILSCALE_ADOPT_EXISTING=yes` to
+adopt that container deliberately: the stage warns, tags it, and treats
+it as the router from then on. The stage adopts nothing silently.
+
+The search is cluster-wide. The stage reads `pvesh get /cluster/resources
+--type vm` and stops when a tagged router already runs on another node,
+because two routers advertising the same subnet is a routing conflict
+rather than a spare. A listing it cannot read or decode stops the stage
+as well: it will not build a router while unable to tell whether one
+exists.
+
+#### Storage
+
+The stage resolves template storage and root-disk storage apart, because
+the common Proxmox layout keeps templates on `local` and root disks on
+`local-lvm` or a ZFS pool, and no single storage serves both there. It
+takes each from its own key, then from `PVE_TAILSCALE_STORAGE`, then from
+the node's only storage accepting that content type. It checks a name you
+give against `pvesm status -content <type>` before starting any work, so
+an impossible pair gives you a message rather than a half-built
+container.
+
+The community-scripts builder reads its answers from
+`/usr/local/community-scripts/default.vars`. The stage puts its own file
+there for the length of the build and puts yours back afterwards, so the
+storages it chose do not become the default for every later
+community-scripts build on the node.
+
+#### The repository signing key
+
+The stage pins the SHA-256 of the Tailscale repository signing key and
+checks the key it downloads against it, and checks the key already in
+`/usr/share/keyrings/tailscale.gpg` the same way on every run. A key that
+does not match goes in the bin rather than into apt's trust store: apt
+installs packages as root, and a key trusted for being present is a key
+nobody verified. When
+Tailscale rotates the key, verify the new one yourself and set
+`PVE_TAILSCALE_KEYRING_SHA256`.
+
+The stage persists forwarding in
+`/etc/sysctl.d/99-tailscale-forwarding.conf` rather than appending to
+`/etc/sysctl.conf`, and sets it at runtime only when the running value
+differs.
+
+Advertisement is a helper and a unit rather than a one-off argument.
+`/usr/local/bin/ts-advertise-route.sh` runs from
+`ts-advertise-route.service`, a oneshot ordered after
+`network-online.target` and `tailscaled.service`. With
+`PVE_TAILSCALE_ROUTES` set it advertises exactly that list; with it unset
+it derives the connected subnet of whichever interface carries the default
+route, refusing a `tailscale*` interface so the router cannot come to
+advertise its own tunnel. That is what keeps the advertisement right
+across a reboot or a DHCP change, instead of leaving a stale subnet
+advertised to the whole tailnet.
+
+Where the routes came from decides which of those two the helper does. The
+stage bakes a list you configured into the helper, which then advertises
+exactly that, because a list somebody chose is not one to re-derive
+behind their back. A detected list it bakes in nowhere: the helper works
+the subnet out in the container
+at every boot, and the subnet the host detected only gets the first
+advertisement up before the unit has ever run. In that case the two
+values come from two derivations, which is intentional. They agree on any
+node where the router shares the management LAN, and the container's
+answer is the live one — that is exactly what lets a LAN renumber take
+effect without running this toolkit again.
+
+A daemon that holds an identity but has stopped — `tailscale down`, or a
+backend that fell over — is a subnet router routing nothing, so the stage
+does not call it converged. It runs `tailscale up` again with the route
+arguments and **no auth key**, which is what the CLI offers for a machine
+that is already a tailnet member, and reports the run as changed. That
+path never asks for a key, so a spent key you revoked does not block it.
+
+You still have to approve subnet routes in the Tailscale admin console
+before any peer uses them. The stage cannot do that and says so.
+
+#### Key expiry
+
+Neither can it disable key expiry: that is an admin console or API
+setting with no command-line twin. A node whose key expires drops
+off the tailnet months later, with nothing on the node to show why, so
+the stage prints a reminder after a first join. Use a reusable,
+non-ephemeral key and turn key expiry off for the node.
+
+Every configuration key the stage reads is in the schema, so a bad value
+stops the run before the stage builds anything: a container ID that is not a
+number, a route that is not an IPv4 CIDR, a storage name Proxmox would
+reject, a keyring digest that is not a SHA-256, and an
+`PVE_TAILSCALE_ADOPT_EXISTING` that is neither `yes` nor `no`. That last
+one is a gate on a destructive action, so `true` is an error naming the
+value rather than a quiet `no`.
+
+A tailnet with device approval turned on parks the new machine in
+`NeedsMachineAuth`. The stage stops there and says so rather than
+retrying, because another `tailscale up` would spend another key without
+changing anything.
 
 ## Idempotency and safety
 
@@ -852,7 +1007,9 @@ guest. Treat the pins as reproducibility of the build, and the guest
 contents as current as of the day you built the guest.
 
 One upstream script carries a further exception, in script code rather
-than in packages. `tools/addon/add-tailscale-lxc.sh` runs its
+than in packages. This toolkit does not run it — see below — but anyone
+bumping the pins should know why. `tools/addon/add-tailscale-lxc.sh` runs
+its
 Debian and Ubuntu branch through `pct exec "$CTID" -- bash -c '...'`, and
 that block sources `core/core.func` and `lib/tools.func` from the engine
 repository a second time, from inside the container. The block is single
@@ -863,20 +1020,31 @@ fall back to `core/main` whatever this toolkit exports on the host, so the
 engine helpers that run inside the container can differ between two runs of
 the same pin.
 
-The pin cannot reach that far by exporting harder. When phase 2 wires the
-addon up it has to fetch the script at the pinned ProxmoxVE SHA and replace
-the `core/main` fallback inside the quoted block with the pinned engine URL
-before running it, or else accept that this one guest drifts and say so.
-Whoever bumps the pins should re-read the block, because upstream may fix
-it.
+The pin cannot reach that far by exporting harder.
+
+Stage `20-tailscale` sidesteps the problem by not running that script.
+It could not run it in any case: the addon blocks on a `read -rp` y/n
+prompt and then on a whiptail radiolist of container IDs, with no way to
+answer either from the environment. The stage installs Tailscale inline
+instead — the repository keyring and sources file, `apt-get install
+tailscale`, the service, the forwarding setting and the join — which also
+means nothing re-sources the engine from `core/main` inside the
+container. The only thing it fetches from upstream is `ct/debian.sh`,
+through the same pinned URL as every other stage. Whoever bumps the pins
+should still re-read the addon, because upstream may fix it and the
+inline flow may be worth retiring.
 
 ### Telemetry
 
 The community-scripts engine posts a record of each guest build to the
-community-scripts API. This toolkit leaves that at the upstream default and
-turns nothing off, because the project is free and the counts are what tell
-upstream which scripts people still use. Read what the payload carries and
-decide for the host.
+community-scripts API. This toolkit sends no opt-out of its own and
+changes no telemetry setting, because the project is free and the counts
+are what tell upstream which scripts people still use. Running unattended
+still settles the question for you: the engine's prompt cannot reach a
+screen, and its else branch records `DIAGNOSTICS=no`. That is an
+accident of the execution mode, not a choice this toolkit makes, and the
+section below says where the toolkit warns you about it. Read what the
+payload carries and decide for the host.
 
 The payload, built in `api/telemetry.func` at the pinned engine commit,
 carries at least a random id and an execution id for the run, the
@@ -900,6 +1068,14 @@ and with no `/usr/local/community-scripts/diagnostics` file present it asks
 with a whiptail dialog and writes the answer to that file. Later container
 builds read the file and ask nothing.
 
+An unattended run has no terminal for that dialog, so it fails and the
+engine takes its else branch, which records `DIAGNOSTICS=no`. The answer
+comes from the absence of a screen rather than from a decision, so an
+unattended host opts out by default. Stage `20-tailscale` warns before it
+builds when the file is absent, so that the first container build is not
+also the moment this was quietly settled. Write `DIAGNOSTICS=yes` into
+`/usr/local/community-scripts/diagnostics` to opt in deliberately.
+
 The VM path never prompts. `pve/vm-core.func` calls no `diagnostics_check`,
 and `post_to_api_vm` reads the diagnostics file if one exists. With no
 file, the setting stays unset, the engine treats that as `no`, and the VM
@@ -922,9 +1098,10 @@ changes the answer on a host that already has one.
 
 - **Phase 1 — implemented.** The nine host stages above.
 - **Phase 2 — partly implemented.** Stage `10-acme` orders the node
-  certificate. The Tailscale, Home Assistant OS and Frigate guests remain a
-  later effort. Their configuration keys already appear in the example file
-  and survive a rewrite, but no stage reads them yet.
+  certificate and stage `20-tailscale` builds the subnet router. The Home
+  Assistant OS and Frigate guests remain a later effort. Their
+  configuration keys already appear in the example file and survive a
+  rewrite, but no stage reads them yet.
 
 ## Releases
 

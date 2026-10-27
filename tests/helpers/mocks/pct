@@ -23,6 +23,17 @@ if [[ -n ${PVE_CONFIG_MOCK_PCT_FAIL_VMID:-} && ${vmid} == "${PVE_CONFIG_MOCK_PCT
   exit 255
 fi
 
+# Where this node keeps a container's configuration. pmxcfs puts it under
+# /etc/pve; a test points PVE_CONFIG_ROOT at a scratch tree.
+ct_conf() {
+  local id=${1:-${vmid}}
+  printf '%s\n' "${PVE_CONFIG_ROOT:-}/etc/pve/lxc/${id}.conf"
+}
+
+ct_exists() {
+  [[ -f $(ct_conf "${1:-${vmid}}") ]]
+}
+
 guest_root() {
   local dir
   dir=$(mock_state_dir) || return 1
@@ -31,6 +42,11 @@ guest_root() {
     mkdir -p -- "${root}/etc" "${root}/home"
     printf 'root:x:0:0::/root:/bin/bash\n' >"${root}/etc/passwd"
     printf 'root:x:0:\nsudo:x:27:\n' >"${root}/etc/group"
+    # A container knows which Debian it is, and the toolkit reads that
+    # rather than assuming the node's release.
+    printf '%s\n' 'PRETTY_NAME="Debian GNU/Linux 13 (trixie)"' \
+      'NAME="Debian GNU/Linux"' 'ID=debian' 'VERSION_ID="13"' \
+      'VERSION_CODENAME=trixie' >"${root}/etc/os-release"
   fi
   printf '%s\n' "${root}"
 }
@@ -48,6 +64,10 @@ guest_state() {
 is_path_tool() {
   case $1 in
     mkdir | rmdir | chmod | chown | rm | stat | test | cat | touch | ln | readlink) return 0 ;;
+    # sha256sum is given the keyring's path inside the container.
+    sha256sum) return 0 ;;
+    # Only curl's -o operand is an absolute path; the URL is not.
+    curl) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -144,6 +164,43 @@ case ${verb} in
       args=("$@")
     fi
 
+    # A pct that cannot reach the container at all: the command never
+    # runs, and the toolkit sees the transport's status rather than the
+    # command's. Matched on the command line the wrapper was handed.
+    if [[ -n ${PVE_CONFIG_MOCK_PCT_EXEC_FAIL:-} &&
+      " ${*} " == *" ${PVE_CONFIG_MOCK_PCT_EXEC_FAIL} "* ]]; then
+      printf 'pct: unable to open file - No such file or directory\n' >&2
+      exit 255
+    fi
+
+    # A removal that reports success and leaves the file there: an
+    # overlay that swallows the unlink, a bind mount, a filesystem gone
+    # read-only after the fact. A toolkit that believes rm's status
+    # leaves an auth key on disk and says nothing.
+    if [[ -n ${PVE_CONFIG_MOCK_PCT_RM_NOOP:-} && ${1:-} == rm ]]; then
+      for arg in "$@"; do
+        if [[ ${arg} == *"${PVE_CONFIG_MOCK_PCT_RM_NOOP}" ]]; then
+          # Through the wrapper still, so the toolkit sees a command that
+          # ran and reported success rather than a transport failure.
+          args=(true)
+          break
+        fi
+      done
+    fi
+
+    # A removal that is refused inside the container, which is a command
+    # failure rather than a transport one.
+    if [[ -n ${PVE_CONFIG_MOCK_PCT_FAIL_RM:-} && ${1:-} == rm ]]; then
+      for arg in "$@"; do
+        if [[ ${arg} == *"${PVE_CONFIG_MOCK_PCT_FAIL_RM}" ]]; then
+          # A command that ran and failed, which is not the same thing as
+          # a pct that could not reach the container.
+          args=(sh -c "printf \"rm: cannot remove '%s': Operation not permitted\\n\" \"\$1\" >&2; exit 1" rm "${PVE_CONFIG_MOCK_PCT_FAIL_RM}")
+          break
+        fi
+      done
+    fi
+
     # What the simulated container supplies of itself, as opposed to what
     # the toolkit asked for: its account databases, its own scratch state
     # and the log the mocks inside it record to.
@@ -151,10 +208,28 @@ case ${verb} in
       "PVE_CONFIG_PASSWD=${root}/etc/passwd"
       "PVE_CONFIG_GROUP=${root}/etc/group"
       "PVE_CONFIG_MOCK_STATE=${state}"
+      "PVE_CONFIG_MOCK_GUEST_ROOT=${root}"
       "PVE_CONFIG_MOCK_LOG=${PVE_CONFIG_MOCK_LOG:-/dev/null}"
       'PVE_CONFIG_MOCK_HOME_BASE=/home'
       'PVE_CONFIG_ROOT='
     )
+
+    # Fault knobs a test uses to model something going wrong inside the
+    # container. The real pct carries nothing in, so these are listed one
+    # by one rather than leaking the caller's whole environment.
+    for knob in PVE_CONFIG_MOCK_TAILSCALE_UP_FAIL \
+      PVE_CONFIG_MOCK_TAILSCALE_STATE \
+      PVE_CONFIG_MOCK_CURL_FAIL_URL \
+      PVE_CONFIG_MOCK_APT_UPDATE_FAILS \
+      PVE_CONFIG_MOCK_DEFAULT_DEV \
+      PVE_CONFIG_MOCK_BRIDGE_IP \
+      PVE_CONFIG_MOCK_TAILSCALE_STATUS_JSON \
+      PVE_CONFIG_MOCK_TAILSCALE_STATUS_FAIL \
+      PVE_CONFIG_MOCK_KEYRING_PAYLOAD; do
+      if [[ -n ${!knob:-} ]]; then
+        container_env+=("${knob}=${!knob}")
+      fi
+    done
 
     runner=(env)
     [[ ${keep_env} == 0 ]] && runner=(env -i)
@@ -188,6 +263,138 @@ case ${verb} in
       exit 2
     fi
     cp -- "${root}${src}" "${dest}" || exit 2
+    ;;
+  create)
+    # `pct create <vmid> <template> --option value ...`. Enough of it is
+    # modelled that a stage can find the container afterwards and read
+    # back what it asked for.
+    conf=$(ct_conf)
+    if ct_exists; then
+      printf 'CT %s already exists on node\n' "${vmid}" >&2
+      exit 255
+    fi
+    shift 2
+    hostname=''
+    unprivileged=''
+    features=''
+    memory=''
+    cores=''
+    while [[ $# -gt 0 ]]; do
+      case $1 in
+        -hostname | --hostname)
+          hostname=${2:-}
+          shift 2
+          ;;
+        -unprivileged | --unprivileged)
+          unprivileged=${2:-}
+          shift 2
+          ;;
+        -features | --features)
+          features=${2:-}
+          shift 2
+          ;;
+        -memory | --memory)
+          memory=${2:-}
+          shift 2
+          ;;
+        -cores | --cores)
+          cores=${2:-}
+          shift 2
+          ;;
+        *) shift ;;
+      esac
+    done
+    if [[ -z ${hostname} ]]; then
+      printf 'pct create: a hostname is required by this mock\n' >&2
+      exit 255
+    fi
+    mkdir -p -- "$(dirname -- "${conf}")"
+    {
+      printf 'arch: amd64\n'
+      printf 'hostname: %s\n' "${hostname}"
+      [[ -n ${memory} ]] && printf 'memory: %s\n' "${memory}"
+      [[ -n ${cores} ]] && printf 'cores: %s\n' "${cores}"
+      [[ -n ${features} ]] && printf 'features: %s\n' "${features}"
+      [[ -n ${unprivileged} ]] && printf 'unprivileged: %s\n' "${unprivileged}"
+      printf 'ostype: debian\n'
+    } >"${conf}"
+    guest_root >/dev/null
+    ;;
+  status)
+    if ! ct_exists; then
+      printf "Configuration file 'nodes/pve/lxc/%s.conf' does not exist\n" "${vmid}" >&2
+      exit 2
+    fi
+    if mock_state_has running "${vmid}"; then
+      printf 'status: running\n'
+    else
+      printf 'status: stopped\n'
+    fi
+    ;;
+  start | reboot)
+    if ! ct_exists; then
+      printf "Configuration file 'nodes/pve/lxc/%s.conf' does not exist\n" "${vmid}" >&2
+      exit 2
+    fi
+    root=$(guest_root) || exit 1
+    # The configuration is read when the container starts, which is why a
+    # TUN line added to a running container does nothing until it is
+    # restarted. The mock models that: /dev/net/tun appears and
+    # disappears with the mount entry, as of the last start.
+    if grep -q '^lxc\.mount\.entry: /dev/net/tun ' "$(ct_conf)"; then
+      mkdir -p -- "${root}/dev/net"
+      : >"${root}/dev/net/tun"
+    else
+      rm -f -- "${root}/dev/net/tun"
+    fi
+    mock_state_add running "${vmid}"
+    ;;
+  stop | shutdown)
+    ct_exists || exit 2
+    mock_state_remove running "${vmid}"
+    ;;
+  list)
+    printf 'VMID       Status     Lock         Name\n'
+    for conf in "${PVE_CONFIG_ROOT:-}"/etc/pve/lxc/*.conf; do
+      [[ -f ${conf} ]] || continue
+      id=$(basename -- "${conf}")
+      id=${id%.conf}
+      name=$(sed -n 's/^hostname: //p' "${conf}" | head -n 1)
+      if mock_state_has running "${id}"; then
+        printf '%-10s %-10s %-12s %s\n' "${id}" running '' "${name}"
+      else
+        printf '%-10s %-10s %-12s %s\n' "${id}" stopped '' "${name}"
+      fi
+    done
+    ;;
+  config)
+    ct_exists || exit 2
+    cat -- "$(ct_conf)"
+    ;;
+  set)
+    if ! ct_exists; then
+      printf "Configuration file 'nodes/pve/lxc/%s.conf' does not exist\n" "${vmid}" >&2
+      exit 2
+    fi
+    conf=$(ct_conf)
+    shift 2
+    while [[ $# -gt 0 ]]; do
+      case $1 in
+        -tags | --tags)
+          tags=${2:-}
+          # pct refuses a tag list it cannot store, and a mock that took
+          # one would hide the stage handing it something unusable.
+          if [[ -n ${tags} && ! ${tags} =~ ^[A-Za-z0-9_.+-]+(\;[A-Za-z0-9_.+-]+)*$ ]]; then
+            printf "value '%s' does not look like a valid tag list\n" "${tags}" >&2
+            exit 255
+          fi
+          sed -i '/^tags: /d' -- "${conf}"
+          [[ -n ${tags} ]] && printf 'tags: %s\n' "${tags}" >>"${conf}"
+          shift 2
+          ;;
+        *) shift ;;
+      esac
+    done
     ;;
   *) exit 0 ;;
 esac

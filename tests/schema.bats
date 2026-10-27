@@ -302,3 +302,158 @@ resolve_names() {
   run resolve_names
   [ "$status" -eq 0 ]
 }
+
+# --- the Tailscale keys ----------------------------------------------------
+
+# shellcheck disable=SC2016  # the payload must stay literal to be a payload
+@test "a Tailscale route list that is not IPv4 CIDRs is rejected" {
+  local value
+  # A route reaches --advertise-routes and a script generated inside the
+  # container, so a value carrying shell is refused here, not there.
+  for value in '192.168.1.0' '192.168.1.0/33' '256.0.0.0/8' \
+    '10.0.0.0/24,bogus' '10.0.0.0/24;id' '$(id)/24' '10.0.0.0/8/8' \
+    '10.0.0/24' 'fd00::/8'; do
+    run _schema_validate_PVE_TAILSCALE_ROUTES "${value}"
+    [ "$status" -ne 0 ] || {
+      echo "accepted: ${value}"
+      return 1
+    }
+  done
+}
+
+@test "an ordinary Tailscale route list is accepted" {
+  local value
+  for value in '192.168.1.0/24' '10.0.0.0/8,172.16.4.0/22' '0.0.0.0/0' \
+    '10.0.0.0/24, 10.1.0.0/24'; do
+    run _schema_validate_PVE_TAILSCALE_ROUTES "${value}"
+    [ "$status" -eq 0 ] || {
+      echo "rejected: ${value}"
+      return 1
+    }
+  done
+}
+
+# shellcheck disable=SC2016  # the payload must stay literal to be a payload
+@test "an adoption gate that is neither yes nor no is rejected" {
+  local value
+  export PVE_TAILSCALE_CTID=110
+  for value in 'true' 'Yes' 'YES' '1' 'y' 'no thanks' '$(id)'; do
+    run _schema_validate_PVE_TAILSCALE_ADOPT_EXISTING "${value}"
+    [ "$status" -ne 0 ] || {
+      echo "accepted: ${value}"
+      return 1
+    }
+  done
+  run _schema_validate_PVE_TAILSCALE_ADOPT_EXISTING no
+  [ "$status" -eq 0 ]
+  run _schema_validate_PVE_TAILSCALE_ADOPT_EXISTING yes
+  [ "$status" -eq 0 ]
+}
+
+@test "adoption without a container to adopt is rejected" {
+  unset PVE_TAILSCALE_CTID
+  run _schema_validate_PVE_TAILSCALE_ADOPT_EXISTING yes
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'PVE_TAILSCALE_CTID'* ]]
+}
+
+# shellcheck disable=SC2016  # the payload must stay literal to be a payload
+@test "a Tailscale container id that is not a usable VMID is rejected" {
+  local value
+  # The value reaches an arithmetic comparison and a pct argument.
+  for value in '99' '0' 'a[$(id)]' '100; id' '1e3' '-1' ' 100'; do
+    run _schema_validate_PVE_TAILSCALE_CTID "${value}"
+    [ "$status" -ne 0 ] || {
+      echo "accepted: ${value}"
+      return 1
+    }
+  done
+  run _schema_validate_PVE_TAILSCALE_CTID 100
+  [ "$status" -eq 0 ]
+}
+
+# shellcheck disable=SC2016  # the payload must stay literal to be a payload
+@test "a storage name Proxmox would not accept is rejected" {
+  local name value
+  for name in PVE_TAILSCALE_STORAGE PVE_TAILSCALE_TEMPLATE_STORAGE \
+    PVE_TAILSCALE_CONTAINER_STORAGE; do
+    for value in '-local' '1local' 'local lvm' 'local;id' '$(id)' 'local/lvm'; do
+      run "_schema_validate_${name}" "${value}"
+      [ "$status" -ne 0 ] || {
+        echo "accepted: ${name}=${value}"
+        return 1
+      }
+    done
+    run "_schema_validate_${name}" 'local-zfs'
+    [ "$status" -eq 0 ] || {
+      echo "rejected: ${name}=local-zfs"
+      return 1
+    }
+  done
+}
+
+# shellcheck disable=SC2016  # the payload must stay literal to be a payload
+@test "a Tailscale resource size that is not a positive number is rejected" {
+  local name value
+  for name in PVE_TAILSCALE_RAM_MB PVE_TAILSCALE_CORES PVE_TAILSCALE_DISK_GB; do
+    for value in '0' '-1' '1.5' 'a[$(id)]' '256; id' '2G'; do
+      run "_schema_validate_${name}" "${value}"
+      [ "$status" -ne 0 ] || {
+        echo "accepted: ${name}=${value}"
+        return 1
+      }
+    done
+    run "_schema_validate_${name}" '2'
+    [ "$status" -eq 0 ] || {
+      echo "rejected: ${name}=2"
+      return 1
+    }
+  done
+}
+
+@test "a keyring pin that is not a SHA-256 is rejected" {
+  local value
+  for value in 'deadbeef' "$(printf '%064d' 0)x" 'z1c7e09d7e4b1b24d1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1' ''; do
+    run _schema_validate_PVE_TAILSCALE_KEYRING_SHA256 "${value}"
+    [ "$status" -ne 0 ] || {
+      echo "accepted: ${value}"
+      return 1
+    }
+  done
+  run _schema_validate_PVE_TAILSCALE_KEYRING_SHA256 \
+    '3e03dacf222698c60b8e2f990b809ca1b3e104de127767864284e6c228f1fb39'
+  [ "$status" -eq 0 ]
+  # Hex is hex whichever case it is written in.
+  run _schema_validate_PVE_TAILSCALE_KEYRING_SHA256 \
+    '3E03DACF222698C60B8E2F990B809CA1B3E104DE127767864284E6C228F1FB39'
+  [ "$status" -eq 0 ]
+}
+
+@test "schema_resolve rejects a Tailscale route list it cannot read as CIDRs" {
+  export PVE_HOSTNAME='pve1' PVE_DOMAIN='example.test'
+  export PVE_TAILSCALE_ENABLED='yes'
+  export PVE_TAILSCALE_ROUTES='192.168.1.0'
+  run resolve_names
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'PVE_TAILSCALE_ROUTES'* ]]
+}
+
+@test "schema_resolve rejects an adoption gate that is neither yes nor no" {
+  export PVE_HOSTNAME='pve1' PVE_DOMAIN='example.test'
+  export PVE_TAILSCALE_ENABLED='yes'
+  export PVE_TAILSCALE_CTID='110'
+  export PVE_TAILSCALE_ADOPT_EXISTING='true'
+  run resolve_names
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'PVE_TAILSCALE_ADOPT_EXISTING'* ]]
+  [[ "$output" == *'true'* ]]
+}
+
+@test "schema_resolve leaves the optional Tailscale keys unset and unprompted" {
+  export PVE_HOSTNAME='pve1' PVE_DOMAIN='example.test'
+  resolve_names
+  [ -z "${PVE_TAILSCALE_CTID:-}" ]
+  [ -z "${PVE_TAILSCALE_ROUTES:-}" ]
+  [ -z "${PVE_TAILSCALE_TEMPLATE_STORAGE:-}" ]
+  [ "${PVE_TAILSCALE_ADOPT_EXISTING}" = 'no' ]
+}

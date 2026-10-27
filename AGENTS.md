@@ -367,10 +367,34 @@ developer workstation, so verification is layered:
    bats tests/
    ```
 
-3. **Dry run** — Scripts SHOULD support a `--dry-run` flag that prints the
+3. **Red verification** — A test that passes whether or not the code is
+   right reports coverage it does not have. Before claiming a test covers
+   something, break the code and check that the test notices:
+
+   ```bash
+   tests/tools/red-verify.sh lib/tailscale.sh tests/stages_phase2_tailscale.bats \
+     'the name of the test' 'literal text to break' 'what to put there'
+   ```
+
+   It prints `RED` when the test caught the change, `GREEN` when it did
+   not, `NOCHANGE` when the text was not found, `NOMATCH` when the name
+   selected no test, `AMBIGUOUS` when the text or the name picks out more
+   than one thing, and `ERROR` when the run never happened. Treat `GREEN`
+   as a broken test, not a passing one, and treat everything other than
+   `RED` and `GREEN` as "no result yet".
+
+   Those refusals matter more than they look, because each of them once
+   produced a false `RED`. `bats` exits non-zero when a filter selects
+   nothing, so a misspelled test name reports failure while proving
+   nothing. `bats -f` takes a regex, so a loose name such as `builder`
+   runs eight tests and any unrelated failure among them reads as this
+   mutation being caught. The replacement takes the first occurrence
+   only, so text appearing twice breaks whichever site comes first. Give
+   one test name and enough surrounding context to be unique.
+4. **Dry run** — Scripts SHOULD support a `--dry-run` flag that prints the
    commands it would execute without running them. Exercise it before
    proposing a change as complete.
-4. **Host validation** — Changes affecting real Proxmox state MUST be
+5. **Host validation** — Changes affecting real Proxmox state MUST be
    validated by the repository owner on a test host. Agents MUST NOT claim a
    provisioning change is verified based on static analysis alone; say
    explicitly what was and was not tested.

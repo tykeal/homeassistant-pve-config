@@ -111,10 +111,56 @@ PVE_ACME_FORCE_ORDER='no'
 
 # --- Guests ---------------------------------------------------------------
 
-# Hostname for the Tailscale LXC. Its container ID is allocated from the
-# first free ID unless you pin one here.
+# Build the Tailscale subnet router LXC. It needs PVE_TAILSCALE_AUTHKEY in
+# secrets.env, and it advertises your LAN into the tailnet, so it stays off
+# until you ask for it.
+PVE_TAILSCALE_ENABLED='no'
+
+# Hostname for the Tailscale LXC. Its container ID is 100 when that is
+# free, otherwise the first free ID, unless you pin one here. The stage
+# tags the container it builds and adopts the tagged one on a later run,
+# so nothing it did not build is touched.
 PVE_TAILSCALE_HOSTNAME='ts-pve1'
 PVE_TAILSCALE_CTID=''
+
+# Adopt a container this toolkit did not build. Set this to yes only when
+# PVE_TAILSCALE_CTID really does name your subnet router: the stage then
+# reboots it, gives it /dev/net/tun, installs packages in it and joins it
+# to your tailnet.
+PVE_TAILSCALE_ADOPT_EXISTING='no'
+
+# Subnets the router advertises, comma separated. Blank means the IPv4
+# subnet of the management bridge, which is the usual single-LAN case; the
+# helper in the container re-derives it on every boot, so a DHCP change
+# does not leave a stale route advertised.
+PVE_TAILSCALE_ROUTES=''
+
+# Storage for the container's template and root disk. Blank is fine when
+# the node has exactly one storage of each kind; name one when it has
+# several, because the community-scripts builder would otherwise want a
+# menu answered.
+#
+# The two are resolved apart, because the usual Proxmox layout keeps
+# templates on local and root disks on local-lvm or a ZFS pool, and one
+# name cannot serve both there. PVE_TAILSCALE_STORAGE is the fallback for
+# whichever of the two you leave blank, and it has to accept both content
+# types when you use it that way.
+PVE_TAILSCALE_STORAGE=''
+PVE_TAILSCALE_TEMPLATE_STORAGE=''
+PVE_TAILSCALE_CONTAINER_STORAGE=''
+
+# SHA-256 the Tailscale repository signing key must have. The stage pins
+# the current one and refuses a key that does not match it, because apt
+# installs packages as root from the repository it signs. Set this only
+# when Tailscale rotates the key and you have verified the new one.
+PVE_TAILSCALE_KEYRING_SHA256=''
+
+# Resources for the router. Blank RAM and core values are derived from the
+# host's totals, between 256 MB and 1024 MB and one or two cores; the disk
+# defaults to 2 GB.
+PVE_TAILSCALE_RAM_MB=''
+PVE_TAILSCALE_CORES=''
+PVE_TAILSCALE_DISK_GB=''
 
 # Hostname and resources for the Home Assistant OS VM. Blank RAM and core
 # values are derived from the host's totals.
