@@ -26,8 +26,8 @@ builds every site. The toolkit also stays **idempotent**. Each stage
 converges rather than asserts, so a second run against a configured host
 changes nothing.
 
-Phase 1 (the host) ships today. Phase 2 (certificates and guests) does not.
-See [Status](#status).
+Phase 1 (the host) ships today. Phase 2 ships its certificate stage; the
+guests do not. See [Status](#status).
 
 ## Prerequisites
 
@@ -252,6 +252,12 @@ The driver resolves these keys on every run.
 | `PVE_ZULIP_ENABLED` | yes | `no` | Send boot and shutdown notices to Zulip |
 | `PVE_ZULIP_STREAM` | no | the stage falls back to `infrastructure` | Zulip stream for the notices |
 | `PVE_ZULIP_TOPIC` | no | the notifier falls back to the host FQDN | Zulip topic for the notices |
+| `PVE_ACME_ENABLED` | yes | `no` | Order a Let's Encrypt certificate for `PVE_FQDN` over the DNS-01 challenge |
+| `PVE_ACME_ENVIRONMENT` | yes | `staging` | ACME directory to order from: `staging` or `production` |
+| `PVE_ACME_EMAIL` | no | none | Contact address for the ACME account and for expiry warnings |
+| `PVE_ACME_DNS_PLUGIN` | yes | `dnsmadeeasy` | DNS-01 plugin name. DNS Made Easy is the only supported provider, so `dnsmadeeasy` is the only accepted value |
+| `PVE_ACME_ACCEPT_TOS` | yes | `no` | Accept the CA terms of service, which registering an account requires |
+| `PVE_ACME_FORCE_ORDER` | yes | `no` | Order a certificate even when the host holds a current one. Staging only |
 
 Derivation of `PVE_BRIDGE_PORTS` fails when the host has no default route,
 or carries more than one. The driver then names what it found and asks,
@@ -276,9 +282,8 @@ the config file or the environment when you need them.
 
 The shipped `examples/pve-config.conf.example` also carries keys that phase
 2 will read. They do nothing today, and the driver preserves them across a
-rewrite: `PVE_ACME_ENVIRONMENT`, `PVE_ACME_EMAIL`, `PVE_ACME_DNS_PLUGIN`,
-`PVE_TAILSCALE_HOSTNAME`, `PVE_TAILSCALE_CTID`, `PVE_HAOS_HOSTNAME`,
-`PVE_HAOS_VMID`, `PVE_HAOS_RAM_MB`, `PVE_HAOS_CORES`,
+rewrite: `PVE_TAILSCALE_HOSTNAME`, `PVE_TAILSCALE_CTID`,
+`PVE_HAOS_HOSTNAME`, `PVE_HAOS_VMID`, `PVE_HAOS_RAM_MB`, `PVE_HAOS_CORES`,
 `PVE_FRIGATE_HOSTNAME` and `PVE_FRIGATE_CTID`.
 
 The community-scripts pins are not among them. They belong to the toolkit
@@ -287,16 +292,17 @@ See [Community-scripts pins](#community-scripts-pins).
 
 ### Secret keys
 
-`examples/secrets.env.example` lists the credentials. Phase 1 reads only the
-Zulip three; the rest wait on phase 2.
+`examples/secrets.env.example` lists the credentials. Phase 1 reads the
+Zulip three. Stage `10-acme` reads the DNS Made Easy pair. The Tailscale
+key waits on the guest stages.
 
 | Key | Used by | Meaning |
 | --- | --- | --- |
 | `PVE_ZULIP_SITE` | phase 1 | Zulip server URL for the notifier |
 | `PVE_ZULIP_BOT_EMAIL` | phase 1 | Zulip bot address |
 | `PVE_ZULIP_BOT_API_KEY` | phase 1 | Zulip bot API key |
-| `PVE_DNSMADEEASY_KEY` | phase 2 | DNS Made Easy API key for the ACME DNS-01 challenge |
-| `PVE_DNSMADEEASY_SECRET` | phase 2 | DNS Made Easy API secret |
+| `PVE_DNSMADEEASY_KEY` | `10-acme` | DNS Made Easy API key for the ACME DNS-01 challenge |
+| `PVE_DNSMADEEASY_SECRET` | `10-acme` | DNS Made Easy API secret |
 | `PVE_TAILSCALE_AUTHKEY` | phase 2 | Tailscale pre-authentication key for the LXC |
 
 Enabling Zulip without all three of its values aborts the stage. A
@@ -313,8 +319,8 @@ cd /root/pve-config
 
 ### The two phases
 
-Phase 1 configures the host and ends with a reboot you perform. Phase 2 will
-order the ACME certificate and create the guests.
+Phase 1 configures the host and ends with a reboot you perform. Phase 2
+orders the ACME certificate, and will create the guests.
 
 When phase 1 first reaches completion the driver prints a summary — hostname,
 `vmbr0` address, node directory, the state of `pve-cluster`, `pveproxy`,
@@ -387,6 +393,72 @@ overrides the gate, and the driver warns when it does.
 
 Stages 40 and 50 exit early unless `PVE_NO_SUBSCRIPTION` says `yes`. Stage
 90 exits early unless `PVE_ZULIP_ENABLED` says `yes`.
+
+## The phase-2 stages
+
+| Stage | Converges |
+| --- | --- |
+| `10-acme` | Optional. Writes the DNS Made Easy credentials to a 0600 file, registers the plugin and the ACME account for the selected directory, points the node at both, then orders a certificate for `PVE_FQDN` when the host lacks a current one |
+
+Stage 10 exits early unless `PVE_ACME_ENABLED` says `yes`. It orders from
+the Let's Encrypt staging directory until `PVE_ACME_ENVIRONMENT` says
+`production`, because the production directory counts failed orders against
+a weekly limit. Each directory gets its own account — `staging` and
+`production` — so promoting a deployment registers the second account and
+leaves the first in place.
+
+The order is the step that costs a rate limit, so the stage skips it when
+`pvenode cert info` already shows a `pveproxy-ssl.pem` whose SAN covers
+`PVE_FQDN`, issued by the Let's Encrypt directory you selected, and more
+than 30 days from expiry. When that inspection cannot answer — the command
+failed, said nothing, or answered with something the toolkit cannot read —
+the stage stops rather than ordering, because an order it did not need
+spends a rate limit and would do so again on every run.
+`PVE_ACME_FORCE_ORDER='yes'` orders anyway; the toolkit refuses that
+combination against production.
+
+Which command runs follows what the host holds, because `pvenode` draws
+the same distinctions. A host with nothing to serve gets `acme cert
+order`. One already serving a certificate for this name from this
+directory, inside the renewal window, gets `acme cert renew`: `acme cert
+order` declines to overwrite a certificate that already exists, so asking
+for one here leaves a host that never converges. One serving a
+certificate for another name, or from the other directory, gets `acme
+cert order --force 1`, since that overwrite is the only way a deployment
+promoted to production stops serving its staging certificate. That
+replacement is not the forced order `PVE_ACME_FORCE_ORDER` controls: the
+knob asks for an order the host does not need, and stays staging only.
+
+The stage reads what `pvenode` reports with `perl` and `JSON::PP`, a core
+module every Proxmox host already carries, rather than picking JSON apart
+in the shell. The decoder takes the document on standard input, straight
+from the command that printed it, and takes the field names as
+parameters, so nothing the host says is ever code and a NUL byte cannot
+vanish on the way. Any field of the wrong shape — a `null` or a number
+where a string belongs, bytes that are not UTF-8, a filename listed twice
+— counts as an answer the toolkit did not get.
+
+The stage compares the plugin on two things: the credentials `pvenode`
+stored, and the provider that plugin names. A plugin naming another
+provider gets rewritten rather than accepted, because the provider
+chooses which DNS hook runs with these credentials, and `pvenode acme
+cert order` orders afresh on every ask. A node left naming the wrong
+provider would order and fail on every run.
+
+Every reading of the host works the same way, and tells three answers
+apart: yes, no, and "could not tell". Only a `no` the toolkit actually
+read leads to a change. A listing, an account, a plugin configuration or
+a node setting it could not read stops the stage, because registering,
+reconfiguring or ordering on the strength of an unanswered question is
+how a transient failure turns into a duplicate account or a spent rate
+limit. An empty answer is not an unreadable one: a fresh host, with no
+accounts, no plugin and no ACME certificate, reads as "nothing here yet"
+and converges normally.
+
+Registration accepts the CA terms of service, and `pvenode` asks for that
+answer rather than taking it as an option. The stage stops before
+registering until `PVE_ACME_ACCEPT_TOS` says `yes`, so the acceptance is
+yours.
 
 ## Idempotency and safety
 
@@ -476,9 +548,18 @@ file.
 A stage that needs a credential at runtime keeps its own copy. Stage 90
 writes the Zulip site, bot address, bot API key, stream and topic to
 `/etc/pve-config/zulip.env` at mode 0600, inside a 0700 directory, because
-the notifier systemd starts has to read them. Editing or emptying
-`secrets.env` leaves that copy as it stands; re-run the stage to rewrite it,
-and rotate the credential at Zulip when you retire it.
+the notifier systemd starts has to read them. Stage `10-acme` writes the
+DNS Made Easy key and secret the same way, to
+`/etc/pve-config/dnsmadeeasy.conf`, and hands `pvenode` that path rather
+than the values: `pvenode acme plugin set --data` reads the file itself, so
+the command line carries a path and nothing else. The file stays out of
+`/etc/pve`, where pmxcfs serves every file as `root:www-data` 0640 and
+ignores `chmod`. The stage checks the owner of both the directory and the
+file before it writes and again after, and refuses a path root does not
+own: a mode protects nothing when somebody else can change it back.
+Editing or emptying `secrets.env` leaves those copies as
+they stand; re-run the stage to rewrite one, and rotate the credential at
+its provider when you retire it.
 
 The toolkit checks the file before reading it. It hard-fails when the file
 is a symlink, when the path names something other than a regular file, when
@@ -497,12 +578,33 @@ around secret handling, because `set -x` would print a credential that
 redaction never sees. Stages that write credentials to disk — the Zulip
 environment file, for one — write them at 0600 under a 0700 directory.
 
+The driver exports the secrets it loads, so every command a stage runs
+inherits them. Stage `10-acme` reads the DNS Made Easy pair through its own
+loader, which exports nothing. It takes the exported pair into plain shell
+variables and unsets it before it sources a library, because sourcing one
+starts a child process of its own. Neither `pvenode` nor the DNS hook it
+calls sees a credential in its environment. The stage also replaces `PS4`,
+the prefix `set -x` prints, since an inherited `PS4` can name a variable
+and print what it holds. `PVE_CONFIG_TRACE_PREFIX` gives an operator their
+own prefix back for ordinary stages, and this one ignores it.
+
+`PVE_DNSMADEEASY_KEY` and `PVE_DNSMADEEASY_SECRET` set in the environment
+win over the same keys in `secrets.env`, so a rotation that has not reached
+the file yet still reaches the provider. The driver then writes that value
+into `secrets.env`, so exporting one is how a credential gets in rather
+than a way to keep it out. Setting either to an empty value stops the
+stage rather than falling back to the file: an empty credential is a
+mistake worth hearing about.
+
 You can also supply any secret as an environment variable. That does not
 keep it off disk. When `secrets.env` already names the key, the driver
-records your exported value and writes it back to that file; and stage 90
+records your exported value and writes it back to that file; stage 90
 copies the Zulip credentials to `/etc/pve-config/zulip.env` whichever way
-they arrived. An environment override stays off disk only for a key that
-appears in neither file and that no stage persists.
+they arrived; and stage `10-acme` writes
+`/etc/pve-config/dnsmadeeasy.conf` and leaves `pvenode` holding a base64
+copy under `/etc/pve/priv/acme/plugins.cfg`. Rotate a credential at its
+provider to retire it. An environment override stays off disk only for a
+key that appears in neither file and that no stage persists.
 
 ## Dry run
 
@@ -547,6 +649,52 @@ Deleting a marker by hand has the same effect as `--force` for that stage.
 The driver stops at the first failure and leaves later stages untouched. Fix
 the cause and re-run `./pve-config.sh`; it skips the completed stages and
 picks up where it stopped.
+
+### Tracing a run
+
+```shell
+bash -x ./pve-config.sh --stage 10-acme --force
+```
+
+Stages run as child processes, and each one starts with `PS4`, the prefix
+`set -x` prints, set to bash's own `+ `. Bash expands `PS4` before every
+traced command, so a prefix naming a variable prints what that variable
+holds, and a stage handling a credential would print it.
+
+Set `PVE_CONFIG_TRACE_PREFIX` to keep a prefix of your own:
+
+```shell
+PVE_CONFIG_TRACE_PREFIX='+${BASH_SOURCE##*/}:${LINENO}: ' \
+  bash -x ./pve-config.sh --stage 20-network --force
+```
+
+That switch belongs to one run rather than to the configuration: it
+changes nothing about the host, and a debugging prefix belongs in neither
+`pve-config.conf` nor the state the driver writes back.
+
+The override stops at the stages that handle credentials. Stage `10-acme`
+normalises `PS4` itself whatever you set, and leaves it normalised while a
+credential is reachable, so the override cannot re-open that hole.
+
+One case stays outside what the stage can defend. A shell that already has
+tracing on before `10-acme` starts — `SHELLOPTS=xtrace` in the
+environment, say — traces the first command of the stage with whatever
+`PS4` it inherited, and that happens before any line of the stage runs.
+If the DNS credentials arrived in the environment as well, that first
+trace line has already seen them.
+
+The stage refuses that combination. Tracing already on, plus
+`PVE_DNSMADEEASY_KEY` or `PVE_DNSMADEEASY_SECRET` in the environment, stops
+the run before it configures anything, and tells you to rotate those
+credentials. Reaching that point takes control of the environment of the
+root shell, which also hands an attacker `PATH`, `BASH_ENV` and
+`LD_PRELOAD`; the refusal exists to stop the leak repeating on every
+remaining command, and to say out loud what already happened.
+
+Credentials in the 0600 secrets file avoid this entirely, which is one
+more reason to supply them that way. A traced run reads
+them from the file into variables the stage keeps out of every trace, and
+nothing exposes them to a prefix.
 
 ### Bootstrap failed mid-swap
 
@@ -773,10 +921,10 @@ changes the answer on a host that already has one.
 ## Status
 
 - **Phase 1 — implemented.** The nine host stages above.
-- **Phase 2 — not yet implemented.** The ACME certificate and the Tailscale,
-  Home Assistant OS and Frigate guests remain a later effort. Their
-  configuration keys already appear in the example file and survive a
-  rewrite, but no stage reads them yet.
+- **Phase 2 — partly implemented.** Stage `10-acme` orders the node
+  certificate. The Tailscale, Home Assistant OS and Frigate guests remain a
+  later effort. Their configuration keys already appear in the example file
+  and survive a rewrite, but no stage reads them yet.
 
 ## Releases
 

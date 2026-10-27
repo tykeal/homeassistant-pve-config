@@ -311,7 +311,17 @@ run_stage() {
     fi
   fi
 
-  if ! bash "${path}"; then
+  # PS4 is normalised rather than inherited. It is expanded for every
+  # traced command, so a PS4 holding a parameter expansion prints whatever
+  # that parameter holds -- including a credential a stage is handling --
+  # the moment anybody runs this toolkit with tracing on. The default is
+  # what bash itself uses, so a run that set no prefix looks unchanged.
+  #
+  # PVE_CONFIG_TRACE_PREFIX is there for the operator who set a prefix on
+  # purpose and wants it back. It is deliberate, and it reaches no secret:
+  # the stages that handle credentials replace PS4 again themselves and
+  # keep it replaced for as long as a credential is reachable.
+  if ! PS4=${PVE_CONFIG_TRACE_PREFIX-'+ '} bash "${path}"; then
     log_error "stage ${id} failed"
     return 1
   fi

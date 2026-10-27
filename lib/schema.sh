@@ -33,6 +33,12 @@ PVE_BRIDGE_GATEWAY|no|no||Default gateway for vmbr0, only read when the mode is 
 PVE_NETWORK_WAIT_SECONDS|no|yes|_schema_default_wait|Seconds to wait for vmbr0 to pick up an address
 PVE_NO_SUBSCRIPTION|no|yes|_schema_default_yes|Use the no-subscription repository and suppress the subscription notice
 PVE_SUDO_SSH_AGENT|no|yes|_schema_default_yes|Allow sudo to accept a forwarded SSH agent key
+PVE_ACME_ENABLED|no|yes|_schema_default_no|Order a certificate for this host over the DNS-01 challenge
+PVE_ACME_ENVIRONMENT|no|yes|_schema_default_staging|ACME directory to order from, staging or production
+PVE_ACME_EMAIL|no|no||Contact address for the ACME account and for expiry warnings
+PVE_ACME_DNS_PLUGIN|no|yes|_schema_default_dnsmadeeasy|DNS-01 plugin name; dnsmadeeasy is the only supported provider
+PVE_ACME_ACCEPT_TOS|no|yes|_schema_default_no|Accept the CA terms of service, which registering an ACME account requires
+PVE_ACME_FORCE_ORDER|no|yes|_schema_default_no|Order a certificate even when a current one is present, staging only
 PVE_ZULIP_ENABLED|no|yes|_schema_default_no|Send boot and shutdown notices to Zulip
 PVE_ZULIP_STREAM|no|no||Zulip stream for boot and shutdown notices
 PVE_ZULIP_TOPIC|no|no||Zulip topic for boot and shutdown notices
@@ -43,6 +49,13 @@ _schema_default_yes() { printf 'yes\n'; }
 _schema_default_no() { printf 'no\n'; }
 _schema_default_dhcp() { printf 'dhcp\n'; }
 _schema_default_wait() { printf '60\n'; }
+
+# Staging, every time, until a deployment asks for production. The
+# production directory counts failed orders against a weekly limit, so a
+# first run that is wrong there costs the deployment a week; the same run
+# against staging costs nothing.
+_schema_default_staging() { printf 'staging\n'; }
+_schema_default_dnsmadeeasy() { printf 'dnsmadeeasy\n'; }
 
 # The uplink, and only the uplink. Bridging every port the host happens to
 # have risks an L2 loop between two live ports and merges networks that
@@ -151,6 +164,70 @@ _schema_validate_PVE_NETWORK_WAIT_SECONDS() {
   # operand as code. A plain count of seconds is the only thing it may be.
   if [[ ! ${value} =~ ^(0|[1-9][0-9]*)$ ]] || ((10#${value} > 86400)); then
     printf 'a wait is a whole number of seconds, from 0 to 86400\n'
+    return 1
+  fi
+}
+
+# A stage reads a flag by comparing it with yes, so anything else disables
+# the feature. "true", "1" and "Yes" all read as "off", which is the one
+# way a deployment ends up with no certificate and no complaint.
+_schema_yes_no_valid() {
+  [[ $1 == yes || $1 == no ]]
+}
+
+# shellcheck disable=SC2329  # called indirectly, by name, from schema_resolve
+_schema_validate_PVE_ACME_ENABLED() {
+  _schema_yes_no_valid "$1" && return 0
+  printf 'it is yes or no\n'
+  return 1
+}
+
+# shellcheck disable=SC2329  # called indirectly, by name, from schema_resolve
+_schema_validate_PVE_ACME_ACCEPT_TOS() {
+  _schema_yes_no_valid "$1" && return 0
+  printf 'it is yes or no\n'
+  return 1
+}
+
+# shellcheck disable=SC2329  # called indirectly, by name, from schema_resolve
+_schema_validate_PVE_ACME_ENVIRONMENT() {
+  [[ $1 == staging || $1 == production ]] && return 0
+  printf 'the ACME environment is staging or production\n'
+  return 1
+}
+
+# DNS Made Easy is the only provider the certificate stage supports.
+# Naming another one here would otherwise be found out by pvenode, after
+# phase 2 had started.
+# shellcheck disable=SC2329  # called indirectly, by name, from schema_resolve
+_schema_validate_PVE_ACME_DNS_PLUGIN() {
+  [[ $1 == dnsmadeeasy ]] && return 0
+  printf 'DNS Made Easy is the only supported provider, so this is dnsmadeeasy\n'
+  return 1
+}
+
+# shellcheck disable=SC2329  # called indirectly, by name, from schema_resolve
+_schema_validate_PVE_ACME_EMAIL() {
+  local value=$1
+  if [[ ${value} =~ [[:space:]] ]] || [[ ${value} != *@*.* ]] ||
+    [[ ${value} == @* || ${value} == *@ ]]; then
+    printf 'an ACME contact is an email address, as name@example.net\n'
+    return 1
+  fi
+}
+
+# Declared after PVE_ACME_ENVIRONMENT, so the environment this run chose is
+# already resolved and the pair can be judged together. A forced order
+# against production spends one of a weekly allowance of them.
+# shellcheck disable=SC2329  # called indirectly, by name, from schema_resolve
+_schema_validate_PVE_ACME_FORCE_ORDER() {
+  local value=$1
+  if ! _schema_yes_no_valid "${value}"; then
+    printf 'it is yes or no\n'
+    return 1
+  fi
+  if [[ ${value} == yes && ${PVE_ACME_ENVIRONMENT:-staging} == production ]]; then
+    printf 'a forced order is permitted against the staging directory only; PVE_ACME_ENVIRONMENT is production\n'
     return 1
   fi
 }

@@ -12,6 +12,12 @@ export REPO_ROOT
 use_mocks() {
   export PVE_CONFIG_MOCK_LOG="${BATS_TEST_TMPDIR}/mock-calls.log"
   : >"${PVE_CONFIG_MOCK_LOG}"
+  # What a mocked host command inherited. It lives beside the call log,
+  # outside the state directory the convergence fingerprint covers, so a
+  # test can assert on an environment without that assertion becoming
+  # state.
+  export PVE_CONFIG_MOCK_ENV_LOG="${BATS_TEST_TMPDIR}/mock-env.log"
+  : >"${PVE_CONFIG_MOCK_ENV_LOG}"
   # The stateful mocks keep their fixtures here, which is what lets a stage
   # be run twice and converge on the second pass.
   export PVE_CONFIG_MOCK_STATE="${BATS_TEST_TMPDIR}/mock-state"
@@ -28,10 +34,24 @@ mock_calls() {
   cat "${PVE_CONFIG_MOCK_LOG}" 2>/dev/null || true
 }
 
+# Makes one path look as though another user owns it, for the length of the
+# test. The stand-in `stat` is kept out of the shared mock directory, so a
+# test that does not ask for this sees the real one.
+use_foreign_owner() {
+  export PVE_CONFIG_MOCK_FOREIGN_PATH=$1
+  PATH="${REPO_ROOT}/tests/helpers/mocks-foreign:${PATH}"
+  export PATH
+}
+
+# The environment every mocked host command was started with.
+mock_env() {
+  cat "${PVE_CONFIG_MOCK_ENV_LOG}" 2>/dev/null || true
+}
+
 # Sources the libraries into the current test shell.
 load_libs() {
   local lib
-  for lib in common version config detect state schema pkg users service pve target; do
+  for lib in common version config detect state schema pkg users service pve target acme; do
     # shellcheck disable=SC1090
     source "${REPO_ROOT}/lib/${lib}.sh"
   done
@@ -155,10 +175,19 @@ seed_user() {
     "${name}" "$(id -u)" "$(id -g)" "${name}" "${shell}" >>"${PVE_CONFIG_PASSWD}"
 }
 
-# Runs one of the real phase 1 stages as the driver would: a child process
-# with nothing but the exported environment.
+# Runs one of the real stages as the driver would: a child process with
+# nothing but the exported environment.
+run_stage_file() {
+  local phase=$1 file=$2
+  bash "${REPO_ROOT}/stages/phase${phase}/${file}"
+}
+
 run_phase1_stage() {
-  bash "${REPO_ROOT}/stages/phase1/$1"
+  run_stage_file 1 "$1"
+}
+
+run_phase2_stage() {
+  run_stage_file 2 "$1"
 }
 
 sysroot_file() {

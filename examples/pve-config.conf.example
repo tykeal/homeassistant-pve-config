@@ -81,17 +81,33 @@ PVE_SUDO_SSH_AGENT='yes'
 
 # --- Certificates ---------------------------------------------------------
 
+# Order a Let's Encrypt certificate for PVE_FQDN over the DNS-01 challenge.
+# Leave this at no when something else terminates TLS for this host.
+PVE_ACME_ENABLED='no'
+
 # ACME environment: staging or production. Staging is the default because
 # Let's Encrypt rate limits are unforgiving and a failed first attempt on
-# production can lock a deployment out for a week.
+# production can lock a deployment out for a week. Move to production once
+# a staging order has succeeded.
 PVE_ACME_ENVIRONMENT='staging'
 
 # Contact address for the ACME account and for expiry warnings.
 PVE_ACME_EMAIL='admin@example.net'
 
-# DNS-01 plugin name registered with pvenode. Credentials for it belong in
-# secrets.env.
+# DNS-01 plugin name registered with pvenode. DNS Made Easy is the only
+# supported provider, so dnsmadeeasy is the only accepted value, and its
+# credentials belong in secrets.env.
 PVE_ACME_DNS_PLUGIN='dnsmadeeasy'
+
+# Registering an ACME account accepts the CA terms of service. Read them at
+# https://letsencrypt.org/repository/ and set this to yes; the certificate
+# stage stops before registration while it is no.
+PVE_ACME_ACCEPT_TOS='no'
+
+# Order a certificate even when the host already holds a current one. This
+# is for cycling a staging order while you get the DNS right, so the
+# toolkit refuses it when PVE_ACME_ENVIRONMENT is production.
+PVE_ACME_FORCE_ORDER='no'
 
 # --- Guests ---------------------------------------------------------------
 

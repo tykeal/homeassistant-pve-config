@@ -6,6 +6,14 @@
 # directory the stateful ones keep their fixtures in.
 printf '%s %s\n' "$(basename -- "$0")" "$*" >>"${PVE_CONFIG_MOCK_LOG:-/dev/null}"
 
+# Every environment variable this process inherited, so a test can prove a
+# credential reached no child of a stage whatever command that child was.
+# It goes beside the call log rather than in the state directory, which is
+# fingerprinted for convergence.
+if [[ -n ${PVE_CONFIG_MOCK_ENV_LOG:-} ]]; then
+  env >>"${PVE_CONFIG_MOCK_ENV_LOG}"
+fi
+
 mock_state_dir() {
   [[ -n ${PVE_CONFIG_MOCK_STATE:-} ]] || return 1
   mkdir -p -- "${PVE_CONFIG_MOCK_STATE}"
