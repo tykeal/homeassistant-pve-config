@@ -113,11 +113,11 @@ PVE_FRIGATE_CTID=''
 
 # --- Community scripts ----------------------------------------------------
 
-# The guest stages drive the community-scripts ProxmoxVE helpers. Pin the
-# ref so a deployment is reproducible; an upstream change to main must never
-# alter what a rebuild produces.
-PVE_COMMUNITY_SCRIPTS_REPO='community-scripts/ProxmoxVE'
-PVE_COMMUNITY_SCRIPTS_REF='main'
+# The guest stages drive the community-scripts helpers, and the two
+# repositories they come from are pinned in lib/community-scripts.sh rather
+# than here. The pins belong to the toolkit, not to a deployment: every site
+# a given release builds has to get the same scripts, so they ship with the
+# code and move when the code is tested against a newer pair.
 
 # --- Notifications --------------------------------------------------------
 
