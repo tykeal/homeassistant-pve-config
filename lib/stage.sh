@@ -26,6 +26,8 @@ source "${_PVE_STAGE_LIB_DIR}/users.sh"
 source "${_PVE_STAGE_LIB_DIR}/service.sh"
 # shellcheck source=lib/pve.sh
 source "${_PVE_STAGE_LIB_DIR}/pve.sh"
+# shellcheck source=lib/target.sh
+source "${_PVE_STAGE_LIB_DIR}/target.sh"
 # shellcheck source=lib/community-scripts.sh
 source "${_PVE_STAGE_LIB_DIR}/community-scripts.sh"
 

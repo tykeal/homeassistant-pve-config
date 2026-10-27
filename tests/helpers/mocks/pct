@@ -2,7 +2,192 @@
 # SPDX-FileCopyrightText: 2026 Andrew Grimberg <tykeal@bardicgrove.org>
 # SPDX-License-Identifier: Apache-2.0
 
-# Records the invocation and succeeds. Stage tests assert on the log rather
-# than on a Proxmox host that is not there.
-printf '%s %s\n' "$(basename -- "$0")" "$*" >>"${PVE_CONFIG_MOCK_LOG:-/dev/null}"
-exit 0
+# Records the invocation and simulates just enough of a container that the
+# guest target can be exercised: a root filesystem per vmid, and commands
+# that actually run against it.
+#
+# `exec` runs the wrapper script for real, so the quoting across the pct
+# boundary is the quoting a real container would see. Arguments that name a
+# path are relocated under the simulated root first, which is what lets a
+# non-root runner with no Proxmox tooling watch a stage converge.
+# shellcheck source=tests/helpers/mocks/_record
+source "$(dirname -- "$0")/_record"
+
+verb=${1:-}
+vmid=${2:-}
+
+# A container this host cannot reach. The toolkit has to tell this apart
+# from a command that ran and failed, so the mock reproduces both.
+if [[ -n ${PVE_CONFIG_MOCK_PCT_FAIL_VMID:-} && ${vmid} == "${PVE_CONFIG_MOCK_PCT_FAIL_VMID}" ]]; then
+  printf "Configuration file 'nodes/pve/lxc/%s.conf' does not exist\n" "${vmid}" >&2
+  exit 255
+fi
+
+guest_root() {
+  local dir
+  dir=$(mock_state_dir) || return 1
+  local root="${dir}/guests/${vmid}/rootfs"
+  if [[ ! -d ${root}/etc ]]; then
+    mkdir -p -- "${root}/etc" "${root}/home"
+    printf 'root:x:0:0::/root:/bin/bash\n' >"${root}/etc/passwd"
+    printf 'root:x:0:\nsudo:x:27:\n' >"${root}/etc/group"
+  fi
+  printf '%s\n' "${root}"
+}
+
+guest_state() {
+  local dir
+  dir=$(mock_state_dir) || return 1
+  mkdir -p -- "${dir}/guests/${vmid}/state"
+  printf '%s\n' "${dir}/guests/${vmid}/state"
+}
+
+# Tools whose operands are paths in the container rather than opaque
+# values. `useradd -s /bin/bash` names a shell the container will record,
+# not a file this mock should relocate, so the list is deliberately short.
+is_path_tool() {
+  case $1 in
+    mkdir | rmdir | chmod | chown | rm | stat | test | cat | touch | ln | readlink) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# --perms as pct itself reads it: a value with no leading zero gets one,
+# and the result is parsed base 0 -- octal, or hexadecimal with an 0x
+# prefix. A mock more forgiving than the real tool hides the bugs it exists
+# to catch, so an unparsable mode fails here as it would there.
+apply_perms() {
+  local path=$1 perms=$2 mode
+  [[ ${perms} == 0* ]] || perms="0${perms}"
+  case ${perms} in
+    0[xX]*)
+      [[ ${perms} =~ ^0[xX][0-9a-fA-F]+$ ]] || {
+        printf "invalid mode: '%s'\n" "$2" >&2
+        exit 2
+      }
+      mode=$((perms))
+      ;;
+    *)
+      [[ ${perms} =~ ^0[0-7]+$ ]] || {
+        printf "invalid mode: '%s'\n" "$2" >&2
+        exit 2
+      }
+      mode=$((8#${perms}))
+      ;;
+  esac
+  chmod -- "$(printf '%04o' "${mode}")" "${path}"
+}
+
+case ${verb} in
+  exec)
+    root=$(guest_root) || exit 1
+    state=$(guest_state) || exit 1
+    shift 2
+
+    # pct keeps the caller's environment unless told otherwise, and
+    # lxc-attach --clear-env wipes it. A mock that always inherited would
+    # let a leak of host secrets into the container pass unnoticed, so the
+    # option is honoured here exactly as pct honours it.
+    keep_env=1
+    while [[ $# -gt 0 && $1 != '--' ]]; do
+      case $1 in
+        --keep-env)
+          keep_env=${2:-1}
+          shift 2
+          ;;
+        --keep-env=*)
+          keep_env=${1#*=}
+          shift
+          ;;
+        *) shift ;;
+      esac
+    done
+    [[ ${1:-} == '--' ]] && shift
+    # Anything that is not the toolkit's wrapper is recorded and nothing
+    # more, which is all the older stage tests ever wanted from this mock.
+    [[ ${1:-} == '/bin/sh' && ${2:-} == '-c' ]] || exit 0
+    script=$3
+    tag=$4
+    token=${5:-}
+    envc=${6:-0}
+    shift 6
+
+    # Lets a test drive the case where pct reports success without the
+    # wrapper ever having run.
+    if [[ ${PVE_CONFIG_MOCK_PCT_NO_SENTINEL:-0} == 1 ]]; then
+      exit 0
+    fi
+
+    # The wrapper's own environment arguments, passed through untouched
+    # apart from PATH: the tools this container has are the mocks, so that
+    # is where its PATH points.
+    guest_env=()
+    while [[ ${envc} -gt 0 ]]; do
+      case ${1-} in
+        PATH=*) guest_env+=("PATH=$(dirname -- "$0"):${PATH}") ;;
+        *) guest_env+=("${1-}") ;;
+      esac
+      shift
+      envc=$((envc - 1))
+    done
+
+    args=()
+    if is_path_tool "${1:-}"; then
+      for arg in "$@"; do
+        if [[ ${arg} == /* ]]; then
+          args+=("${root}${arg}")
+        else
+          args+=("${arg}")
+        fi
+      done
+    else
+      args=("$@")
+    fi
+
+    # What the simulated container supplies of itself, as opposed to what
+    # the toolkit asked for: its account databases, its own scratch state
+    # and the log the mocks inside it record to.
+    container_env=(
+      "PVE_CONFIG_PASSWD=${root}/etc/passwd"
+      "PVE_CONFIG_GROUP=${root}/etc/group"
+      "PVE_CONFIG_MOCK_STATE=${state}"
+      "PVE_CONFIG_MOCK_LOG=${PVE_CONFIG_MOCK_LOG:-/dev/null}"
+      'PVE_CONFIG_MOCK_HOME_BASE=/home'
+      'PVE_CONFIG_ROOT='
+    )
+
+    runner=(env)
+    [[ ${keep_env} == 0 ]] && runner=(env -i)
+
+    "${runner[@]}" "${container_env[@]}" \
+      /bin/sh -c "${script}" "${tag}" "${token}" "${#guest_env[@]}" \
+      ${guest_env[@]+"${guest_env[@]}"} ${args[@]+"${args[@]}"}
+    ;;
+  push)
+    root=$(guest_root) || exit 1
+    src=${3:-}
+    dest=${4:-}
+    perms=''
+    while [[ $# -gt 0 ]]; do
+      if [[ $1 == --perms ]]; then
+        perms=${2:-}
+      fi
+      shift
+    done
+    [[ -f ${src} ]] || exit 2
+    mkdir -p -- "$(dirname -- "${root}${dest}")"
+    cp -- "${src}" "${root}${dest}" || exit 2
+    [[ -n ${perms} ]] && apply_perms "${root}${dest}" "${perms}"
+    ;;
+  pull)
+    root=$(guest_root) || exit 1
+    src=${3:-}
+    dest=${4:-}
+    if [[ ! -f ${root}${src} ]]; then
+      printf 'unable to open file - No such file or directory\n' >&2
+      exit 2
+    fi
+    cp -- "${root}${src}" "${dest}" || exit 2
+    ;;
+  *) exit 0 ;;
+esac

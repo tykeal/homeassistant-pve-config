@@ -123,6 +123,34 @@ strict() {
   [ -z "$output" ]
 }
 
+@test "the execution target survives strict mode" {
+  use_mocks
+  isolate_system
+  # A guest operation is a nested shell inside a command substitution
+  # inside errexit, which is where a helper that only works with errexit
+  # off would fall over.
+  run bash -euo pipefail -c "
+    for lib in common state pkg users service pve target; do
+      source \"${REPO_ROOT}/lib/\${lib}.sh\"
+    done
+    guest=\$(target_guest 101)
+    target_write_file \"\${guest}\" /etc/t 'body' 0640 >/dev/null
+    target_write_file \"\${guest}\" /etc/t 'body' 0640 >/dev/null
+    target_ensure_line_in_file \"\${guest}\" /etc/t 'extra' >/dev/null
+    target_ensure_line_in_file \"\${guest}\" /etc/t 'extra' >/dev/null
+    target_user_converge \"\${guest}\" deploy >/dev/null
+    target_user_converge \"\${guest}\" deploy >/dev/null
+    target_user_join_group \"\${guest}\" deploy sudo >/dev/null
+    target_pkg_install \"\${guest}\" curl >/dev/null
+    target_service_enable \"\${guest}\" unit >/dev/null
+    target_test \"\${guest}\" f /etc/absent || true
+    printf 'done\\n'
+  "
+  [ "$status" -eq 0 ]
+  # Log output is on stderr, which run folds into $output here.
+  [ "${lines[${#lines[@]} - 1]}" = 'done' ]
+}
+
 @test "every shipped shell file parses" {
   local file
   while IFS= read -r file; do

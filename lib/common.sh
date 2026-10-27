@@ -222,22 +222,59 @@ _slurp() {
   printf -v "${__target}" '%s' "${__body}"
 }
 
-# Appends a line only when an equivalent one is absent. Comparison collapses
+# The decisions below are made on a file's contents rather than on a path,
+# so that a guest's file -- which is read out of the container rather than
+# opened -- is judged by exactly the same rules as the host's. A container
+# that answered these questions differently would reacquire the duplicate
+# PAM line this whole approach exists to prevent.
+#
+# A body ends with the newline its last line carries, so one trailing
+# newline is dropped before splitting: without that, every file would appear
+# to end in a line that is not there.
+
+# True when an equivalent line is already present. Comparison collapses
 # whitespace runs and is literal throughout, so regex metacharacters match
-# as themselves and a commented out variant does not count as present. This
-# is what stops a repeated run stacking duplicate PAM entries.
+# as themselves and a commented out variant does not count as present.
+_line_present_in_body() {
+  local body=$1 want existing
+  [[ -n ${body} ]] || return 1
+  want=$(_squash_ws "$2")
+  while IFS= read -r existing || [[ -n ${existing} ]]; do
+    if [[ $(_squash_ws "${existing}") == "${want}" ]]; then
+      return 0
+    fi
+  done <<<"${body%$'\n'}"
+  return 1
+}
+
+_line_appended_body() {
+  local __var=$1 body=$2 line=$3 position=$4 __updated
+  case ${position} in
+    prepend)
+      __updated="${line}"$'\n'"${body}"
+      ;;
+    append)
+      if [[ -n ${body} && ${body} != *$'\n' ]]; then
+        __updated="${body}"$'\n'"${line}"$'\n'
+      else
+        __updated="${body}${line}"$'\n'
+      fi
+      ;;
+    *) die "ensure_line_in_file: unknown position '${position}'" ;;
+  esac
+  printf -v "${__var}" '%s' "${__updated}"
+}
+
+# Appends a line only when an equivalent one is absent. This is what stops a
+# repeated run stacking duplicate PAM entries.
 ensure_line_in_file() {
   local path=$1 line=$2 position=${3:-append}
-  local want existing
-  want=$(_squash_ws "${line}")
+  local body=''
+  _slurp body "${path}"
 
-  if [[ -f ${path} ]]; then
-    while IFS= read -r existing || [[ -n ${existing} ]]; do
-      if [[ $(_squash_ws "${existing}") == "${want}" ]]; then
-        printf 'unchanged\n'
-        return 0
-      fi
-    done <"${path}"
+  if _line_present_in_body "${body}" "${line}"; then
+    printf 'unchanged\n'
+    return 0
   fi
 
   if dry_run_enabled; then
@@ -248,23 +285,8 @@ ensure_line_in_file() {
 
   _refuse_symlink "${path}"
 
-  local body=''
-  _slurp body "${path}"
-
   local updated
-  case ${position} in
-    prepend)
-      updated="${line}"$'\n'"${body}"
-      ;;
-    append)
-      if [[ -n ${body} && ${body} != *$'\n' ]]; then
-        updated="${body}"$'\n'"${line}"$'\n'
-      else
-        updated="${body}${line}"$'\n'
-      fi
-      ;;
-    *) die "ensure_line_in_file: unknown position '${position}'" ;;
-  esac
+  _line_appended_body updated "${body}" "${line}" "${position}"
 
   _atomic_install "${path}" "${updated}"
   log_info "added line to ${path}"
@@ -532,29 +554,26 @@ _is_comment() {
   [[ ${text} == '#'* ]]
 }
 
-# Leaves exactly one active line matching a pattern, wherever the file had
-# them before. ensure_line_in_file only appends when nothing matches, which
-# is why a `sed -i '1a ...'` replacement needs this instead: the duplicates
-# an earlier run left behind have to be removed, not merely not added to.
+# The file as it would be with exactly one active line matching the
+# pattern, wherever the file had them before.
 #
 # Commented out variants are left alone, so an operator's note about why a
 # line was disabled survives.
 #
 # position is append, prepend, or after-first, the last of which reproduces
 # the placement a PAM stack expects without reproducing the duplication.
-ensure_exact_line() {
-  local path=$1 match=$2 line=$3 position=${4:-append}
-  _refuse_symlink "${path}"
-
+_exact_line_body() {
+  local __var=$1 body=$2 match=$3 line=$4 position=$5
   local -a kept=()
   local existing
-  if [[ -f ${path} ]]; then
+
+  if [[ -n ${body} ]]; then
     while IFS= read -r existing || [[ -n ${existing} ]]; do
       if ! _is_comment "${existing}" && [[ ${existing} =~ ${match} ]]; then
         continue
       fi
       kept+=("${existing}")
-    done <"${path}"
+    done <<<"${body%$'\n'}"
   fi
 
   case ${position} in
@@ -575,13 +594,25 @@ ensure_exact_line() {
     *) die "ensure_exact_line: unknown position '${position}'" ;;
   esac
 
-  local rebuilt=''
+  local __rebuilt=''
   for existing in "${kept[@]}"; do
-    rebuilt+="${existing}"$'\n'
+    __rebuilt+="${existing}"$'\n'
   done
+  printf -v "${__var}" '%s' "${__rebuilt}"
+}
 
-  local original=''
+# Leaves exactly one active line matching a pattern. ensure_line_in_file
+# only appends when nothing matches, which is why a `sed -i '1a ...'`
+# replacement needs this instead: the duplicates an earlier run left behind
+# have to be removed, not merely not added to.
+ensure_exact_line() {
+  local path=$1 match=$2 line=$3 position=${4:-append}
+  _refuse_symlink "${path}"
+
+  local original='' rebuilt
   _slurp original "${path}"
+  _exact_line_body rebuilt "${original}" "${match}" "${line}" "${position}"
+
   if [[ ${rebuilt} == "${original}" ]]; then
     printf 'unchanged\n'
     return 0

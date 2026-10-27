@@ -17,12 +17,36 @@ _users_group_file() {
   printf '%s\n' "${PVE_CONFIG_GROUP:-$(sysroot)/etc/group}"
 }
 
-_users_field() {
-  local name=$1 field=$2 value
+# The passwd and group databases are parsed from their contents rather than
+# from a path, so a container's copy -- which is read out through pct -- is
+# understood by exactly the same code as the host's.
+_passwd_field_from_body() {
+  local body=$1 name=$2 field=$3 value
   value=$(awk -F: -v want="${name}" -v f="${field}" \
-    '$1 == want { print $f; exit }' "$(_users_passwd_file)" 2>/dev/null) || return 1
+    '$1 == want { print $f; exit }' <<<"${body}" 2>/dev/null) || return 1
   [[ -n ${value} ]] || return 1
   printf '%s\n' "${value}"
+}
+
+# Supplementary membership only. A primary group is set when the account is
+# created and is not what `usermod -aG` manages.
+_group_has_member() {
+  local body=$1 group=$2 name=$3 members member
+  members=$(awk -F: -v g="${group}" '$1 == g { print $4; exit }' \
+    <<<"${body}" 2>/dev/null) || return 1
+  [[ -n ${members} ]] || return 1
+  local -a list=()
+  IFS=',' read -r -a list <<<"${members}"
+  for member in ${list[@]+"${list[@]}"}; do
+    [[ ${member} == "${name}" ]] && return 0
+  done
+  return 1
+}
+
+_users_field() {
+  local name=$1 field=$2 body=''
+  _slurp body "$(_users_passwd_file)"
+  _passwd_field_from_body "${body}" "${name}" "${field}"
 }
 
 user_exists() {
@@ -61,19 +85,10 @@ user_converge() {
   printf 'unchanged\n'
 }
 
-# Supplementary membership only. A primary group is set when the account is
-# created and is not what `usermod -aG` manages.
 user_in_group() {
-  local name=$1 group=$2 members member
-  members=$(awk -F: -v g="${group}" '$1 == g { print $4; exit }' \
-    "$(_users_group_file)" 2>/dev/null) || return 1
-  [[ -n ${members} ]] || return 1
-  local -a list=()
-  IFS=',' read -r -a list <<<"${members}"
-  for member in ${list[@]+"${list[@]}"}; do
-    [[ ${member} == "${name}" ]] && return 0
-  done
-  return 1
+  local name=$1 group=$2 body=''
+  _slurp body "$(_users_group_file)"
+  _group_has_member "${body}" "${group}" "${name}"
 }
 
 # Every group the account belongs to: the primary one named by its passwd
