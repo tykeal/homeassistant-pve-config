@@ -635,8 +635,8 @@ cached_image() {
   [ "$status" -ne 0 ]
   run grep -F 'qm disk import' <(mock_calls)
   [ "$status" -ne 0 ]
-  run grep -F '--boot order=scsi0' <(mock_calls)
-  [ "$status" -ne 0 ]
+  run grep -F -- '--boot order=scsi0' <(mock_calls)
+  [ "$status" -eq 1 ]
 }
 
 @test "a disk an earlier run imported is attached rather than imported again" {
