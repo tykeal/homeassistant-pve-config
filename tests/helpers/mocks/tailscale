@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Andrew Grimberg <tykeal@bardicgrove.org>
+# SPDX-License-Identifier: Apache-2.0
+
+# Enough of the tailscale CLI that a subnet router can be converged twice.
+#
+# The failure modes are modelled, not just the happy path: a daemon that
+# is not running, a login attempt with no usable key, a `set` before the
+# machine has joined a tailnet, and a container with no /dev/net/tun. A
+# mock that said yes to all of those would pass whether the stage got the
+# ordering right or not.
+# shellcheck source=tests/helpers/mocks/_record
+source "$(dirname -- "$0")/_record"
+
+guest_root() {
+  printf '%s\n' "${PVE_CONFIG_MOCK_GUEST_ROOT:-}"
+}
+
+daemon_running() {
+  mock_state_has active tailscaled
+}
+
+logged_in() {
+  mock_state_has tailnet up
+}
+
+# `tailscale down` stops the backend; it does not log the machine out.
+# The identity stays, which is why another auth key is the wrong answer
+# to this state and `tailscale up` with no key is the right one.
+stopped() {
+  mock_state_has tailnet stopped
+}
+
+no_daemon() {
+  printf 'failed to connect to local tailscaled; it does not appear to be running\n' >&2
+  exit 1
+}
+
+verb=${1:-}
+shift || true
+
+case ${verb} in
+  status)
+    daemon_running || no_daemon
+    # The daemon is there and the query still fails: a socket permission
+    # problem, a daemon mid-restart. The toolkit must not read that as
+    # "not logged in" and spend a key on it.
+    if [[ ${PVE_CONFIG_MOCK_TAILSCALE_STATUS_FAIL:-0} == 1 ]]; then
+      printf 'failed to get status: rpc error\n' >&2
+      exit 1
+    fi
+    # A document a test supplies whole: malformed, truncated, or carrying
+    # the field twice or nested inside a peer.
+    if [[ -n ${PVE_CONFIG_MOCK_TAILSCALE_STATUS_JSON+set} ]]; then
+      printf '%s\n' "${PVE_CONFIG_MOCK_TAILSCALE_STATUS_JSON}"
+      exit 0
+    fi
+    state=NeedsLogin
+    if logged_in; then
+      state=Running
+      stopped && state=Stopped
+    fi
+    # A tailnet with device approval turned on parks a new machine here.
+    if [[ -n ${PVE_CONFIG_MOCK_TAILSCALE_STATE:-} ]]; then
+      state=${PVE_CONFIG_MOCK_TAILSCALE_STATE}
+    fi
+    # --peers=false is what the toolkit asks for, and the reply it gets
+    # has to be one it can read. A tailnet's peer names are chosen by
+    # other people, so the document deliberately carries a field whose
+    # value looks like the one being parsed.
+    peers='"Peer":{"nodekey:deadbeef":{"HostName":"BackendState\":\"Running","TailscaleIPs":["100.64.0.2"]}},'
+    for arg in "$@"; do
+      case ${arg} in
+        --peers=false) peers='' ;;
+      esac
+    done
+    # The peer block comes first on purpose: a parser that takes the
+    # first thing resembling the field would read a peer's hostname.
+    printf '{"Version":"1.80.0",%s"BackendState":"%s","Self":{"HostName":"ts-test"}}\n' \
+      "${peers}" "${state}"
+    ;;
+  up)
+    daemon_running || no_daemon
+
+    if [[ ${PVE_CONFIG_MOCK_TAILSCALE_UP_FAIL:-0} == 1 ]]; then
+      printf 'backend error: invalid key: unauthorized\n' >&2
+      exit 1
+    fi
+
+    root=$(guest_root)
+    if [[ ! -e ${root}/dev/net/tun ]]; then
+      printf 'tailscaled: no /dev/net/tun in this container\n' >&2
+      exit 1
+    fi
+
+    key=''
+    routes=''
+    for arg in "$@"; do
+      case ${arg} in
+        --auth-key=* | --authkey=*) key=${arg#*=} ;;
+        --advertise-routes=*) routes=${arg#*=} ;;
+      esac
+    done
+
+    if ! logged_in; then
+      if [[ -z ${key} ]]; then
+        printf 'backend error: no auth key and this machine is not logged in\n' >&2
+        exit 1
+      fi
+      case ${key} in
+        file:*)
+          path=${key#file:}
+          if [[ ! -f ${root}${path} ]]; then
+            printf 'invalid --auth-key: reading %s: no such file or directory\n' "${path}" >&2
+            exit 1
+          fi
+          key=$(head -n 1 -- "${root}${path}")
+          ;;
+      esac
+      if [[ ${key} != tskey-* ]]; then
+        printf 'backend error: invalid key: unauthorized\n' >&2
+        exit 1
+      fi
+      mock_state_add tailnet up
+    fi
+
+    # Whether it had to log in or was already logged in and merely down,
+    # `up` is what starts the backend again.
+    mock_state_remove tailnet stopped
+
+    if [[ -n ${routes} ]]; then
+      dir=$(mock_state_dir) || exit 1
+      printf '%s\n' "${routes}" >"${dir}/tailscale_routes"
+    fi
+    ;;
+  set)
+    daemon_running || no_daemon
+    if ! logged_in; then
+      printf 'backend error: cannot set preferences before logging in\n' >&2
+      exit 1
+    fi
+    for arg in "$@"; do
+      case ${arg} in
+        --advertise-routes=*)
+          dir=$(mock_state_dir) || exit 1
+          printf '%s\n' "${arg#*=}" >"${dir}/tailscale_routes"
+          ;;
+      esac
+    done
+    ;;
+  down)
+    daemon_running || no_daemon
+    # Not a logout: the machine keeps its identity and stops routing.
+    mock_state_add tailnet stopped
+    ;;
+  version)
+    printf '1.80.0\n'
+    ;;
+  *)
+    printf 'tailscale: unknown subcommand %s\n' "${verb}" >&2
+    exit 1
+    ;;
+esac

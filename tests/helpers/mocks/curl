@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Andrew Grimberg <tykeal@bardicgrove.org>
+# SPDX-License-Identifier: Apache-2.0
+
+# A curl that reaches no network.
+#
+# CI has none, so anything this mock does not recognise fails the way curl
+# fails when a name will not resolve. That is deliberate: a mock that
+# answered every URL with success would let an unpinned fetch, or a fetch
+# nobody meant to make, pass the suite unnoticed.
+#
+# file:// is served from the filesystem, which is how a test points the
+# community-scripts pins at a fixture tree.
+# shellcheck source=tests/helpers/mocks/_record
+source "$(dirname -- "$0")/_record"
+
+output=''
+url=''
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -o | --output)
+      output=${2:-}
+      shift 2
+      ;;
+    --output=*)
+      output=${1#*=}
+      shift
+      ;;
+    -*) shift ;;
+    *)
+      url=$1
+      shift
+      ;;
+  esac
+done
+
+if [[ -z ${url} ]]; then
+  printf 'curl: no URL specified\n' >&2
+  exit 2
+fi
+
+# Lets a test drive the failure path of any particular fetch.
+if [[ -n ${PVE_CONFIG_MOCK_CURL_FAIL_URL:-} && ${url} == *"${PVE_CONFIG_MOCK_CURL_FAIL_URL}"* ]]; then
+  printf 'curl: (22) The requested URL returned error: 404\n' >&2
+  exit 22
+fi
+
+emit() {
+  if [[ -n ${output} ]]; then
+    mkdir -p -- "$(dirname -- "${output}")"
+    cat >"${output}"
+  else
+    cat
+  fi
+}
+
+case ${url} in
+  file://*)
+    path=${url#file://}
+    if [[ ! -f ${path} ]]; then
+      printf "curl: (37) Couldn't open file %s\n" "${path}" >&2
+      exit 37
+    fi
+    emit <"${path}"
+    ;;
+  https://pkgs.tailscale.com/stable/debian/*.noarmor.gpg)
+    # Stands in for the repository keyring. The real one is binary; this
+    # one is not, because nothing in the toolkit may read these bytes
+    # into a shell variable and a mock that invited it to would be
+    # hiding the truncation that follows.
+    # A test can serve different bytes to model an intercepted or
+    # rotated key; the stage has a digest to check either against.
+    printf '%s\n' \
+      "${PVE_CONFIG_MOCK_KEYRING_PAYLOAD:-pve-config test fixture: Tailscale repository signing key}" |
+      emit
+    ;;
+  *)
+    printf 'curl: (6) Could not resolve host: %s\n' "${url}" >&2
+    exit 6
+    ;;
+esac

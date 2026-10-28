@@ -39,6 +39,18 @@ PVE_ACME_EMAIL|no|no||Contact address for the ACME account and for expiry warnin
 PVE_ACME_DNS_PLUGIN|no|yes|_schema_default_dnsmadeeasy|DNS-01 plugin name; dnsmadeeasy is the only supported provider
 PVE_ACME_ACCEPT_TOS|no|yes|_schema_default_no|Accept the CA terms of service, which registering an ACME account requires
 PVE_ACME_FORCE_ORDER|no|yes|_schema_default_no|Order a certificate even when a current one is present, staging only
+PVE_TAILSCALE_ENABLED|no|yes|_schema_default_no|Build a Tailscale subnet router container for this node
+PVE_TAILSCALE_HOSTNAME|no|yes|_schema_derive_tailscale_hostname|Hostname for the Tailscale subnet router container
+PVE_TAILSCALE_CTID|no|no||Container ID for the Tailscale subnet router; blank means 100, or the next free ID
+PVE_TAILSCALE_ADOPT_EXISTING|no|yes|_schema_default_no|Let the Tailscale stage take over a container it did not build, which PVE_TAILSCALE_CTID must then name
+PVE_TAILSCALE_ROUTES|no|no||Subnets the router advertises, comma separated; blank means the IPv4 subnet of vmbr0
+PVE_TAILSCALE_STORAGE|no|no||Storage for both the router's template and its root disk; blank means the node's only one of each kind
+PVE_TAILSCALE_TEMPLATE_STORAGE|no|no||Storage for the router's container template; blank falls back to PVE_TAILSCALE_STORAGE
+PVE_TAILSCALE_CONTAINER_STORAGE|no|no||Storage for the router's root disk; blank falls back to PVE_TAILSCALE_STORAGE
+PVE_TAILSCALE_RAM_MB|no|no||Memory for the router in MB; blank scales to the host, between 256 and 1024
+PVE_TAILSCALE_CORES|no|no||CPU cores for the router; blank scales to the host, one or two
+PVE_TAILSCALE_DISK_GB|no|no||Root disk size for the router in GB; blank means 2
+PVE_TAILSCALE_KEYRING_SHA256|no|no||SHA-256 the Tailscale repository signing key must have; blank means the digest pinned in this toolkit
 PVE_ZULIP_ENABLED|no|yes|_schema_default_no|Send boot and shutdown notices to Zulip
 PVE_ZULIP_STREAM|no|no||Zulip stream for boot and shutdown notices
 PVE_ZULIP_TOPIC|no|no||Zulip topic for boot and shutdown notices
@@ -232,6 +244,139 @@ _schema_validate_PVE_ACME_FORCE_ORDER() {
   fi
 }
 
+# shellcheck disable=SC2329  # called indirectly, by name, from schema_resolve
+_schema_validate_PVE_TAILSCALE_ENABLED() {
+  _schema_yes_no_valid "$1" && return 0
+  printf 'it is yes or no\n'
+  return 1
+}
+
+# The adoption gate decides whether this toolkit may reboot, re-device,
+# install into and join to a tailnet a container somebody else built. A
+# value that is neither yes nor no is refused rather than read as no, so
+# an operator who wrote `true` is told why the refusal happened.
+# shellcheck disable=SC2329  # called indirectly, by name, from schema_resolve
+_schema_validate_PVE_TAILSCALE_ADOPT_EXISTING() {
+  local value=$1
+  if ! _schema_yes_no_valid "${value}"; then
+    printf 'it is yes or no\n'
+    return 1
+  fi
+  if [[ ${value} == yes && -z ${PVE_TAILSCALE_CTID:-} ]]; then
+    printf 'it only has meaning with PVE_TAILSCALE_CTID set to the container to adopt; adoption is never automatic\n'
+    return 1
+  fi
+}
+
+# shellcheck disable=SC2329  # called indirectly, by name, from schema_resolve
+_schema_validate_PVE_TAILSCALE_CTID() {
+  local value=$1
+  if [[ ! ${value} =~ ^[0-9]+$ ]]; then
+    printf 'a container id is a number\n'
+    return 1
+  fi
+  if ((value < 100 || value > 999999999)); then
+    printf 'Proxmox container ids run from 100 to 999999999\n'
+    return 1
+  fi
+}
+
+# Storage names reach `pvesm`, the community-scripts answers file and a
+# `pct create` argument, so they are held to the shape Proxmox gives them.
+# shellcheck disable=SC2329  # called indirectly, by name, from schema_resolve
+_schema_validate_PVE_TAILSCALE_STORAGE() {
+  _schema_storage_name_valid "$1"
+}
+
+# shellcheck disable=SC2329  # called indirectly, by name, from schema_resolve
+_schema_validate_PVE_TAILSCALE_TEMPLATE_STORAGE() {
+  _schema_storage_name_valid "$1"
+}
+
+# shellcheck disable=SC2329  # called indirectly, by name, from schema_resolve
+_schema_validate_PVE_TAILSCALE_CONTAINER_STORAGE() {
+  _schema_storage_name_valid "$1"
+}
+
+_schema_storage_name_valid() {
+  local value=$1
+  if [[ ! ${value} =~ ^[A-Za-z][A-Za-z0-9._-]*$ ]]; then
+    printf 'a Proxmox storage name starts with a letter and holds letters, digits, dots, hyphens and underscores\n'
+    return 1
+  fi
+}
+
+# The routes go into --advertise-routes and into a script generated in the
+# container, so they are checked here rather than only at the point of use.
+# shellcheck disable=SC2329  # called indirectly, by name, from schema_resolve
+_schema_validate_PVE_TAILSCALE_ROUTES() {
+  local value=$1 route
+  local -r octet='(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])'
+  local -r prefix='(3[0-2]|[12]?[0-9])'
+  local -a parts=()
+  IFS=',' read -r -a parts <<<"${value}"
+  for route in ${parts[@]+"${parts[@]}"}; do
+    route=${route//[[:space:]]/}
+    [[ -n ${route} ]] || continue
+    if [[ ! ${route} =~ ^${octet}\.${octet}\.${octet}\.${octet}/${prefix}$ ]]; then
+      printf '%s is not an IPv4 CIDR, for example 192.168.1.0/24\n' "${route}"
+      return 1
+    fi
+  done
+}
+
+# shellcheck disable=SC2329  # called indirectly, by name, from schema_resolve
+_schema_validate_PVE_TAILSCALE_RAM_MB() {
+  _schema_positive_number "$1" 'a memory size in MB'
+}
+
+# shellcheck disable=SC2329  # called indirectly, by name, from schema_resolve
+_schema_validate_PVE_TAILSCALE_CORES() {
+  _schema_positive_number "$1" 'a core count'
+}
+
+# shellcheck disable=SC2329  # called indirectly, by name, from schema_resolve
+_schema_validate_PVE_TAILSCALE_DISK_GB() {
+  _schema_positive_number "$1" 'a disk size in GB'
+}
+
+_schema_positive_number() {
+  local value=$1 what=$2
+  if [[ ! ${value} =~ ^[0-9]+$ ]] || ((value < 1)); then
+    printf 'it is %s, a whole number of at least 1\n' "${what}"
+    return 1
+  fi
+}
+
+# The pinned digest is the trust root for everything apt installs in the
+# router, so a value that is not a SHA-256 is refused before it can be
+# compared against anything.
+# shellcheck disable=SC2329  # called indirectly, by name, from schema_resolve
+_schema_validate_PVE_TAILSCALE_KEYRING_SHA256() {
+  local value=${1,,}
+  if [[ ! ${value} =~ ^[0-9a-f]{64}$ ]]; then
+    printf 'a SHA-256 digest is 64 hexadecimal digits\n'
+    return 1
+  fi
+}
+
+# The container hostname becomes a DNS label and a Tailscale machine name.
+# The upstream builder lowercases it and strips the spaces out, so a name
+# that needs either is not the name the operator will get; it is refused
+# here instead, while there is somebody to retype it.
+# shellcheck disable=SC2329  # called indirectly, by name, from schema_resolve
+_schema_validate_PVE_TAILSCALE_HOSTNAME() {
+  local value=$1
+  if [[ ${#value} -gt 63 ]]; then
+    printf 'a hostname is at most 63 characters\n'
+    return 1
+  fi
+  if [[ ! ${value} =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
+    printf 'a container hostname is lowercase letters, digits and hyphens, and starts and ends with a letter or a digit\n'
+    return 1
+  fi
+}
+
 # Applies a key's validator, if it declares one. Empty is left to the
 # required check, which reports a missing value far better than a validator
 # can.
@@ -263,6 +408,18 @@ _schema_derive_fqdn() {
     return 0
   fi
   detect_fqdn "${PVE_DOMAIN:-}"
+}
+
+# The subnet router is named after the node it routes for, so a tailnet
+# with several of them says which is which. Derived rather than asked
+# for, because the answer is only ever the host's name with a prefix.
+# shellcheck disable=SC2329  # called indirectly, by name, from schema_resolve
+_schema_derive_tailscale_hostname() {
+  local short=${PVE_HOSTNAME:-}
+  [[ -n ${short} ]] || short=$(detect_hostname_short 2>/dev/null) || short=''
+  [[ -n ${short} ]] || return 1
+  short=${short,,}
+  printf '%s\n' "ts-${short:0:60}"
 }
 
 # Resolves every key in the schema in the order it is declared, so a

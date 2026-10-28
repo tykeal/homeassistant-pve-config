@@ -275,6 +275,13 @@ acme_account_name() {
 #   1  the document was read and does not have it
 #   2  anything else, including a document that will not decode, a field
 #      of the wrong shape, and a perl that is not there at all
+#
+# lib/tailscale.sh carries a second program of its own rather than
+# extending this one. That is deliberate: it needs to refuse a duplicated
+# key, which JSON::PP cannot report, and to walk an array of cluster
+# resources, and neither belongs in the decoder this secret-bearing path
+# depends on. The two share acme_require_json_decoder and the pipeline
+# shape below; the comment above _TAILSCALE_JSON_PROGRAM has the detail.
 read -r -d '' _ACME_JSON_PROGRAM <<'PERL' || true
 use strict;
 use warnings;

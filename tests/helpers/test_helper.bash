@@ -206,6 +206,11 @@ guest_root() {
     mkdir -p -- "${root}/etc" "${root}/home"
     printf 'root:x:0:0::/root:/bin/bash\n' >"${root}/etc/passwd"
     printf 'root:x:0:\nsudo:x:27:\n' >"${root}/etc/group"
+    # A container knows which Debian it is, and the toolkit reads that
+    # rather than assuming the node's release.
+    printf '%s\n' 'PRETTY_NAME="Debian GNU/Linux 13 (trixie)"' \
+      'NAME="Debian GNU/Linux"' 'ID=debian' 'VERSION_ID="13"' \
+      'VERSION_CODENAME=trixie' >"${root}/etc/os-release"
   fi
   printf '%s\n' "${root}"
 }

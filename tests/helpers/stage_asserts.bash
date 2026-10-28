@@ -52,6 +52,18 @@ MOCK_READ_ONLY_PATTERNS=(
   '^findmnt( -[^ ]+)* .*'
   '^mountpoint -q .*'
   '^ssh-keygen -l -f /dev/stdin$'
+  '^pct (list|status [0-9]+)$'
+  '^pct pull [0-9]+ /[^ ]+ [^ ]+$'
+  '^pvesh get /cluster/nextid$'
+  '^pvesh get /cluster/resources( |$).*'
+  '^pvesm status( |$).*'
+  '^sysctl -n .*'
+  '^tailscale status( |$).*'
+  # A command run inside a container is recorded whole, the toolkit's
+  # wrapper and its five environment assignments included. Naming the
+  # command that follows TERM=dumb is what keeps this a list of read-only
+  # invocations rather than a licence for pct exec.
+  '^pct exec [0-9]+ --keep-env 0 -- /bin/sh -c .* TERM=dumb (test|stat|sha256sum|dpkg-query|sysctl -n|tailscale status|systemctl is-active|systemctl is-enabled) .*$'
 )
 
 assert_no_mutating_calls() {

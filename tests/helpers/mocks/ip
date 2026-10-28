@@ -35,6 +35,11 @@ case "$*" in
     ;;
   *'route show dev vmbr0')
     [[ -n ${bridge_ip} ]] || exit 0
+    # A host whose route table says something the caller did not expect.
+    if [[ -n ${PVE_CONFIG_MOCK_BRIDGE_ROUTE:-} ]]; then
+      echo "${PVE_CONFIG_MOCK_BRIDGE_ROUTE} proto kernel scope link src ${bridge_ip}"
+      exit 0
+    fi
     echo '192.0.2.0/24 proto kernel scope link src '"${bridge_ip}"
     ;;
   *)

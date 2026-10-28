@@ -2,7 +2,78 @@
 # SPDX-FileCopyrightText: 2026 Andrew Grimberg <tykeal@bardicgrove.org>
 # SPDX-License-Identifier: Apache-2.0
 
-# Records the invocation and succeeds. Stage tests assert on the log rather
-# than on a Proxmox host that is not there.
-printf '%s %s\n' "$(basename -- "$0")" "$*" >>"${PVE_CONFIG_MOCK_LOG:-/dev/null}"
+# Records the invocation and answers the handful of queries a stage makes.
+# Stage tests assert on the log rather than on a Proxmox host that is not
+# there.
+# shellcheck source=tests/helpers/mocks/_record
+source "$(dirname -- "$0")/_record"
+
+# The one query that has to answer with something: the next free guest id.
+# A toolkit that read nothing here would allocate nothing, so the mock
+# gives the number a cluster would, and a test can move it.
+if [[ ${1:-} == get && ${2:-} == /cluster/nextid ]]; then
+  printf '%s\n' "${PVE_CONFIG_MOCK_NEXTID:-101}"
+  exit 0
+fi
+
+# The cluster-wide guest listing, as JSON.
+#
+# Built from the container configurations this node has, plus whatever a
+# test says lives on another node. A mock that answered with a fixed
+# document would never show a stage reading the wrong field, so the tags
+# and the ids here are the ones the rest of the mocks wrote.
+if [[ ${1:-} == get && ${2:-} == /cluster/resources ]]; then
+  if [[ ${PVE_CONFIG_MOCK_CLUSTER_FAIL:-0} == 1 ]]; then
+    printf '500 unable to read cluster resources\n' >&2
+    exit 2
+  fi
+  if [[ -n ${PVE_CONFIG_MOCK_CLUSTER_JSON+set} ]]; then
+    printf '%s\n' "${PVE_CONFIG_MOCK_CLUSTER_JSON}"
+    exit 0
+  fi
+
+  node=''
+  if dir=$(mock_state_dir) && [[ -f ${dir}/hostname ]]; then
+    node=$(cat "${dir}/hostname")
+  fi
+  [[ -n ${node} ]] || node=$(hostname -s 2>/dev/null) || node=pve
+  node=${node%%.*}
+
+  first=1
+  printf '['
+  for conf in "${PVE_CONFIG_ROOT:-}"/etc/pve/lxc/*.conf; do
+    [[ -f ${conf} ]] || continue
+    id=$(basename -- "${conf}")
+    id=${id%.conf}
+    name=$(sed -n 's/^hostname: //p' "${conf}" | head -n 1)
+    tags=$(sed -n 's/^tags: //p' "${conf}" | head -n 1)
+    [[ ${first} == 1 ]] || printf ','
+    first=0
+    printf '{"type":"lxc","vmid":%s,"node":"%s","name":"%s"' \
+      "${id}" "${node}" "${name}"
+    # tags is simply absent on an untagged guest, which is what the real
+    # listing does and what the toolkit has to cope with.
+    [[ -n ${tags} ]] && printf ',"tags":"%s"' "${tags}"
+    printf '}'
+  done
+  # "vmid:node" pairs a test uses to put a tagged router on another node.
+  for remote in ${PVE_CONFIG_MOCK_CLUSTER_REMOTE:-}; do
+    [[ ${first} == 1 ]] || printf ','
+    first=0
+    printf '{"type":"lxc","vmid":%s,"node":"%s","name":"ts-remote","tags":"%s"}' \
+      "${remote%%:*}" "${remote##*:}" "${PVE_CONFIG_MOCK_CLUSTER_REMOTE_TAG:-pve-config-tailscale}"
+  done
+  # "vmid:node" pairs a test uses to put a virtual machine on an id, which
+  # a container can then not have: guest ids are unique across a cluster
+  # and across both guest types.
+  for vm in ${PVE_CONFIG_MOCK_CLUSTER_VMS:-}; do
+    [[ ${first} == 1 ]] || printf ','
+    first=0
+    printf '{"type":"qemu","vmid":%s,"node":"%s","name":"a-virtual-machine"}' \
+      "${vm%%:*}" "${vm##*:}"
+  done
+  printf ']\n'
+  exit 0
+fi
+
 exit 0
