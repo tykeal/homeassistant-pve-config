@@ -51,6 +51,16 @@ PVE_TAILSCALE_RAM_MB|no|no||Memory for the router in MB; blank scales to the hos
 PVE_TAILSCALE_CORES|no|no||CPU cores for the router; blank scales to the host, one or two
 PVE_TAILSCALE_DISK_GB|no|no||Root disk size for the router in GB; blank means 2
 PVE_TAILSCALE_KEYRING_SHA256|no|no||SHA-256 the Tailscale repository signing key must have; blank means the digest pinned in this toolkit
+PVE_HAOS_ENABLED|no|yes|_schema_default_no|Build a Home Assistant OS virtual machine on this node
+PVE_HAOS_HOSTNAME|no|yes|_schema_default_haos_hostname|Hostname for the Home Assistant OS virtual machine
+PVE_HAOS_VMID|no|no||Guest ID for the Home Assistant OS machine; blank means 200, or the next free ID
+PVE_HAOS_ADOPT_EXISTING|no|yes|_schema_default_no|Let the HAOS stage take over a machine it did not build, which PVE_HAOS_VMID must then name
+PVE_HAOS_STORAGE|no|no||Storage for the appliance's disks; blank means the node's only one that takes disk images
+PVE_HAOS_RAM_MB|no|no||Memory for the appliance in MB; blank scales to the host, between 2048 and 8192
+PVE_HAOS_CORES|no|no||CPU cores for the appliance; blank scales to the host, between 2 and 4
+PVE_HAOS_DISK_GB|no|no||Disk size for the appliance in GB; blank means 32, which is the published image
+PVE_HAOS_VERSION|no|no||Home Assistant OS release to install; blank means the release pinned in this toolkit
+PVE_HAOS_IMAGE_SHA256|no|no||SHA-256 the Home Assistant OS disk image must have; blank means the digest pinned in this toolkit
 PVE_ZULIP_ENABLED|no|yes|_schema_default_no|Send boot and shutdown notices to Zulip
 PVE_ZULIP_STREAM|no|no||Zulip stream for boot and shutdown notices
 PVE_ZULIP_TOPIC|no|no||Zulip topic for boot and shutdown notices
@@ -373,6 +383,125 @@ _schema_validate_PVE_TAILSCALE_HOSTNAME() {
   fi
   if [[ ! ${value} =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
     printf 'a container hostname is lowercase letters, digits and hyphens, and starts and ends with a letter or a digit\n'
+    return 1
+  fi
+}
+
+# --- Home Assistant OS ----------------------------------------------------
+
+_schema_default_haos_hostname() { printf 'haos\n'; }
+
+# Bash arithmetic wraps at 64 bits, so a value made only of digits can
+# still compare as something else: 2**64 + 100 is 100 inside `(( ))`, and
+# a floor check on it passes. Every number this stage takes is bounded as
+# text, before an arithmetic context ever sees it. Nine digits is past
+# every figure any of these keys has a use for.
+_schema_haos_bounded_number() {
+  local value=$1 what=$2
+  if [[ ! ${value} =~ ^[0-9]{1,9}$ ]]; then
+    printf 'it is %s, a whole number of at most nine digits\n' "${what}"
+    return 1
+  fi
+  _schema_positive_number "${value}" "${what}"
+}
+
+# shellcheck disable=SC2329  # called indirectly, by name, from schema_resolve
+_schema_validate_PVE_HAOS_ENABLED() {
+  _schema_yes_no_valid "$1" && return 0
+  printf 'it is yes or no\n'
+  return 1
+}
+
+# The machine name reaches `qm create -name`, which takes a DNS label, and
+# becomes the name the appliance answers to on the LAN. Proxmox refuses a
+# name that is not one, so it is refused here rather than in the middle of
+# a build.
+# shellcheck disable=SC2329  # called indirectly, by name, from schema_resolve
+_schema_validate_PVE_HAOS_HOSTNAME() {
+  local value=$1
+  if [[ ${#value} -gt 63 ]]; then
+    printf 'a hostname is at most 63 characters\n'
+    return 1
+  fi
+  if [[ ! ${value} =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
+    printf 'a machine hostname is lowercase letters, digits and hyphens, and starts and ends with a letter or a digit\n'
+    return 1
+  fi
+}
+
+# shellcheck disable=SC2329  # called indirectly, by name, from schema_resolve
+_schema_validate_PVE_HAOS_VMID() {
+  local value=$1
+  _schema_haos_bounded_number "${value}" 'a guest id' || return 1
+  if ((value < 100 || value > 999999999)); then
+    printf 'Proxmox guest ids run from 100 to 999999999\n'
+    return 1
+  fi
+}
+
+# The adoption gate decides whether this toolkit may tag and start a
+# virtual machine somebody else built. A value that is neither yes nor no
+# is refused rather than read as no, for the same reason the Tailscale one
+# is.
+# shellcheck disable=SC2329  # called indirectly, by name, from schema_resolve
+_schema_validate_PVE_HAOS_ADOPT_EXISTING() {
+  local value=$1
+  if ! _schema_yes_no_valid "${value}"; then
+    printf 'it is yes or no\n'
+    return 1
+  fi
+  if [[ ${value} == yes && -z ${PVE_HAOS_VMID:-} ]]; then
+    printf 'it only has meaning with PVE_HAOS_VMID set to the machine to adopt; adoption is never automatic\n'
+    return 1
+  fi
+}
+
+# shellcheck disable=SC2329  # called indirectly, by name, from schema_resolve
+_schema_validate_PVE_HAOS_STORAGE() {
+  _schema_storage_name_valid "$1"
+}
+
+# shellcheck disable=SC2329  # called indirectly, by name, from schema_resolve
+_schema_validate_PVE_HAOS_RAM_MB() {
+  _schema_haos_bounded_number "$1" 'a memory size in MB'
+}
+
+# shellcheck disable=SC2329  # called indirectly, by name, from schema_resolve
+_schema_validate_PVE_HAOS_CORES() {
+  _schema_haos_bounded_number "$1" 'a core count'
+}
+
+# The published image is a 32 GiB disk, and qm does not shrink one: a
+# smaller figure here is a setting that silently does not happen.
+# shellcheck disable=SC2329  # called indirectly, by name, from schema_resolve
+_schema_validate_PVE_HAOS_DISK_GB() {
+  local value=$1
+  _schema_haos_bounded_number "${value}" 'a disk size in GB' || return 1
+  if ((value < 32)); then
+    printf 'the Home Assistant OS image is a 32 GiB disk and qm does not shrink one, so 32 is the smallest size that means anything\n'
+    return 1
+  fi
+}
+
+# A Home Assistant OS release, as the project spells them: 18.4, 18.4.1.
+# The value becomes part of a download URL and part of a filename.
+# shellcheck disable=SC2329  # called indirectly, by name, from schema_resolve
+_schema_validate_PVE_HAOS_VERSION() {
+  local value=$1
+  if [[ ! ${value} =~ ^[0-9]+(\.[0-9a-zA-Z]+)*$ ]]; then
+    printf 'a Home Assistant OS release is a dotted version such as 18.4\n'
+    return 1
+  fi
+}
+
+# The pinned digest is the only thing that makes the disk image an
+# installation of what was reviewed rather than of whatever answered, so a
+# value that is not a SHA-256 is refused before it is compared.
+# shellcheck disable=SC2329  # called indirectly, by name, from schema_resolve
+_schema_validate_PVE_HAOS_IMAGE_SHA256() {
+  local value=${1,,}
+  if [[ ! ${value} =~ ^[0-9a-f]{64}$ ]]; then
+    printf 'a SHA-256 digest is 64 hexadecimal digits\n'
     return 1
   fi
 }

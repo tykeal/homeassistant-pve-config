@@ -162,12 +162,51 @@ PVE_TAILSCALE_RAM_MB=''
 PVE_TAILSCALE_CORES=''
 PVE_TAILSCALE_DISK_GB=''
 
-# Hostname and resources for the Home Assistant OS VM. Blank RAM and core
-# values are derived from the host's totals.
+# Builds the Home Assistant OS appliance as a virtual machine, from the
+# image the project publishes. Nothing is converged inside it: HAOS is a
+# closed appliance with its own onboarding, its own authentication and its
+# own updates, so the administrators phase 1 creates on the host do not
+# reach into it.
+PVE_HAOS_ENABLED='no'
+
+# The machine's name, as Proxmox and the LAN see it.
 PVE_HAOS_HOSTNAME='haos'
+
+# Guest ID for the appliance. Blank means 200 by convention, or the next
+# free ID when 200 is taken. Set it when this node already uses 200 for
+# something else.
 PVE_HAOS_VMID=''
+
+# Lets the stage take over a virtual machine it did not build: it tags it,
+# starts it, and says so in the log. PVE_HAOS_VMID must name the machine,
+# because adoption is never automatic. Leave this 'no' unless a Home
+# Assistant you built by hand really is the appliance this node should
+# converge.
+PVE_HAOS_ADOPT_EXISTING='no'
+
+# Storage for the appliance's EFI and root disks. Blank picks the node's
+# only storage that accepts disk images; a node with more than one is
+# asked rather than guessed at.
+PVE_HAOS_STORAGE=''
+
+# Resources for the appliance. Blank RAM and core values are derived from
+# the host's totals -- an eighth of memory between 2048 MB and 8192 MB,
+# a quarter of the cores between two and four. The disk defaults to 32 GB,
+# which is the size of the published image; smaller is refused because qm
+# does not shrink a disk.
 PVE_HAOS_RAM_MB=''
 PVE_HAOS_CORES=''
+PVE_HAOS_DISK_GB=''
+
+# The Home Assistant OS release to install, and the SHA-256 of its disk
+# image. Both are pinned in the toolkit and both are blank here. The stage
+# downloads the image itself and checks the digest before the image
+# becomes a disk, so a download that does not match the pin builds
+# nothing. Set the two together, from the release's own SHA256SUMS asset,
+# to install a release this toolkit has not caught up with; either one
+# alone stops the stage.
+PVE_HAOS_VERSION=''
+PVE_HAOS_IMAGE_SHA256=''
 
 # Hostname for the Frigate LXC.
 PVE_FRIGATE_HOSTNAME='frigate'

@@ -8,6 +8,59 @@
 # shellcheck source=tests/helpers/mocks/_record
 source "$(dirname -- "$0")/_record"
 
+# pvesh's refusals. It is an API client: a verb it does not have and a
+# path nothing is mounted at are both errors, and a mock that answered
+# either with silence and a zero status could not fail when a stage
+# started asking for something the API does not serve.
+usage_error() {
+  printf '%s\n' "$1" >&2
+  exit 255
+}
+
+case ${1:-} in
+  get | set | create | delete | ls | usage) ;;
+  '') usage_error 'no command specified' ;;
+  *)
+    usage_error "Unknown command '${1}'. Available commands: create, delete, get, ls, set, usage"
+    ;;
+esac
+
+[[ ${2:-} == /* ]] || usage_error "no value specified for 'api_path'"
+
+# The options these queries take, checked against the values the API
+# enumerates rather than taken on trust.
+pvesh_args=("${@:3}")
+while ((${#pvesh_args[@]})); do
+  case ${pvesh_args[0]} in
+    --type)
+      case ${pvesh_args[1]:-} in
+        vm | storage | node | sdn | pool | qemu | lxc) ;;
+        '') usage_error "option 'type' requires an argument" ;;
+        *)
+          usage_error "type: value '${pvesh_args[1]}' does not have a value in the enumeration 'node, storage, pool, qemu, lxc, vm, sdn'"
+          ;;
+      esac
+      pvesh_args=("${pvesh_args[@]:2}")
+      ;;
+    --output-format)
+      case ${pvesh_args[1]:-} in
+        text | json | 'json-pretty' | yaml) ;;
+        '') usage_error "option 'output-format' requires an argument" ;;
+        *)
+          usage_error "output-format: value '${pvesh_args[1]}' does not have a value in the enumeration 'text, json, json-pretty, yaml'"
+          ;;
+      esac
+      pvesh_args=("${pvesh_args[@]:2}")
+      ;;
+    --noborder | --noheader | --quiet)
+      pvesh_args=("${pvesh_args[@]:1}")
+      ;;
+    *)
+      usage_error "Unknown option: ${pvesh_args[0]#--}"
+      ;;
+  esac
+done
+
 # The one query that has to answer with something: the next free guest id.
 # A toolkit that read nothing here would allocate nothing, so the mock
 # gives the number a cluster would, and a test can move it.
@@ -56,11 +109,27 @@ if [[ ${1:-} == get && ${2:-} == /cluster/resources ]]; then
     [[ -n ${tags} ]] && printf ',"tags":"%s"' "${tags}"
     printf '}'
   done
+  # The same, for the virtual machines this node has. A stage that builds
+  # one has to find it here on the next run, tag and all.
+  for conf in "${PVE_CONFIG_ROOT:-}"/etc/pve/qemu-server/*.conf; do
+    [[ -f ${conf} ]] || continue
+    id=$(basename -- "${conf}")
+    id=${id%.conf}
+    name=$(sed -n 's/^name: //p' "${conf}" | head -n 1)
+    tags=$(sed -n 's/^tags: //p' "${conf}" | head -n 1)
+    [[ ${first} == 1 ]] || printf ','
+    first=0
+    printf '{"type":"qemu","vmid":%s,"node":"%s","name":"%s"' \
+      "${id}" "${node}" "${name}"
+    [[ -n ${tags} ]] && printf ',"tags":"%s"' "${tags}"
+    printf '}'
+  done
   # "vmid:node" pairs a test uses to put a tagged router on another node.
   for remote in ${PVE_CONFIG_MOCK_CLUSTER_REMOTE:-}; do
     [[ ${first} == 1 ]] || printf ','
     first=0
-    printf '{"type":"lxc","vmid":%s,"node":"%s","name":"ts-remote","tags":"%s"}' \
+    printf '{"type":"%s","vmid":%s,"node":"%s","name":"a-remote-guest","tags":"%s"}' \
+      "${PVE_CONFIG_MOCK_CLUSTER_REMOTE_TYPE:-lxc}" \
       "${remote%%:*}" "${remote##*:}" "${PVE_CONFIG_MOCK_CLUSTER_REMOTE_TAG:-pve-config-tailscale}"
   done
   # "vmid:node" pairs a test uses to put a virtual machine on an id, which
@@ -76,4 +145,7 @@ if [[ ${1:-} == get && ${2:-} == /cluster/resources ]]; then
   exit 0
 fi
 
-exit 0
+# A path this mock does not serve is not a quiet success. The API would
+# say it has nothing there, and a stage reading that as an empty answer
+# is a bug the suite should be able to see.
+usage_error "no such resource '${2}'"

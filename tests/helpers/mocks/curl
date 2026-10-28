@@ -14,19 +14,65 @@
 # shellcheck source=tests/helpers/mocks/_record
 source "$(dirname -- "$0")/_record"
 
+# curl's own refusal, for a switch it does not have.
+unknown_option() {
+  printf 'curl: option %s: is unknown\n' "$1" >&2
+  printf "curl: try 'curl --help' for more information\n" >&2
+  exit 2
+}
+
 output=''
 url=''
 while [[ $# -gt 0 ]]; do
   case $1 in
     -o | --output)
-      output=${2:-}
+      if [[ $# -lt 2 ]]; then
+        printf 'curl: option -o: requires parameter\n' >&2
+        exit 2
+      fi
+      output=$2
       shift 2
       ;;
     --output=*)
       output=${1#*=}
       shift
       ;;
-    -*) shift ;;
+    # The switches the toolkit uses, and nothing else. A mock that
+    # shrugged at an unknown one could not fail when a fetch started
+    # asking for something curl does not do -- the same permissiveness
+    # that let an invalid disk format through the qm mock.
+    --fail | --silent | --show-error | --location | --config)
+      [[ $1 == --config ]] && shift
+      shift
+      ;;
+    --max-time | --request | --header | --retry)
+      if [[ $# -lt 2 ]]; then
+        printf 'curl: option %s: requires parameter\n' "$1" >&2
+        exit 2
+      fi
+      shift 2
+      ;;
+    -m | -X | -H)
+      if [[ $# -lt 2 ]]; then
+        printf 'curl: option %s: requires parameter\n' "$1" >&2
+        exit 2
+      fi
+      shift 2
+      ;;
+    --*) unknown_option "$1" ;;
+    -?*)
+      # Short switches come bundled: -fsSL is four of them, and each one
+      # has to be one this mock knows.
+      flags=${1#-}
+      while [[ -n ${flags} ]]; do
+        case ${flags:0:1} in
+          f | s | S | L | I | k) ;;
+          *) unknown_option "-${flags:0:1}" ;;
+        esac
+        flags=${flags:1}
+      done
+      shift
+      ;;
     *)
       url=$1
       shift
@@ -73,6 +119,17 @@ case ${url} in
     printf '%s\n' \
       "${PVE_CONFIG_MOCK_KEYRING_PAYLOAD:-pve-config test fixture: Tailscale repository signing key}" |
       emit
+    ;;
+  https://github.com/home-assistant/operating-system/releases/download/*/haos_ova-*.qcow2.xz)
+    # The published disk image. A test builds the bytes it wants served
+    # and names the file here, so the digest the stage checks is a
+    # digest of real content rather than a value the fixture asserts.
+    payload=${PVE_CONFIG_MOCK_HAOS_IMAGE_FILE:-}
+    if [[ -z ${payload} || ! -f ${payload} ]]; then
+      printf 'curl: (22) The requested URL returned error: 404\n' >&2
+      exit 22
+    fi
+    emit <"${payload}"
     ;;
   *)
     printf 'curl: (6) Could not resolve host: %s\n' "${url}" >&2

@@ -270,6 +270,16 @@ The driver resolves these keys on every run.
 | `PVE_TAILSCALE_RAM_MB` | no | scaled | Container memory. Unset means host RAM / 64, clamped to 256..1024 |
 | `PVE_TAILSCALE_CORES` | no | scaled | Container cores. Unset means 1, or 2 on a host with eight or more |
 | `PVE_TAILSCALE_DISK_GB` | no | `2` | Container root disk size |
+| `PVE_HAOS_ENABLED` | yes | `no` | Build the Home Assistant OS virtual machine |
+| `PVE_HAOS_HOSTNAME` | yes | `haos` | Name of the appliance, as Proxmox and the LAN see it |
+| `PVE_HAOS_VMID` | no | first free | Guest ID for the appliance. Unset means 200 when free, otherwise `pvesh get /cluster/nextid` |
+| `PVE_HAOS_ADOPT_EXISTING` | yes | `no` | Allow `PVE_HAOS_VMID` to point at a virtual machine this toolkit did not build |
+| `PVE_HAOS_STORAGE` | no | detected | Storage for the EFI and root disks. Unset means the node's only storage that accepts `images` |
+| `PVE_HAOS_RAM_MB` | no | scaled | Appliance memory. Unset means host RAM / 8, clamped to 2048..8192 |
+| `PVE_HAOS_CORES` | no | scaled | Appliance cores. Unset means host cores / 4, clamped to 2..4 |
+| `PVE_HAOS_DISK_GB` | no | `32` | Appliance disk size. The published image is 32 GiB and `qm` does not shrink a disk, so the stage refuses anything smaller |
+| `PVE_HAOS_VERSION` | no | pinned | Home Assistant OS release to install. Set it with `PVE_HAOS_IMAGE_SHA256`, never alone |
+| `PVE_HAOS_IMAGE_SHA256` | no | pinned | SHA-256 the disk image must have, from the release's own `SHA256SUMS` asset |
 
 Derivation of `PVE_BRIDGE_PORTS` fails when the host has no default route,
 or carries more than one. The driver then names what it found and asks,
@@ -292,10 +302,9 @@ the config file or the environment when you need them.
 | `PVE_NETWORK_TAKEOVER` | `no` | Let the network stage replace an `/etc/network/interfaces` that describes more than `lo`, the bridge ports and `vmbr0` |
 | `PVE_ADMIN_KEY_<USERNAME>` | none | Per-user key source, overriding `PVE_ADMIN_KEY_SOURCE`. Uppercase the username and turn any `-` into `_` |
 
-The shipped `examples/pve-config.conf.example` also carries keys that the
-remaining phase-2 stages will read. They do nothing today, and the driver
-preserves them across a rewrite: `PVE_HAOS_HOSTNAME`, `PVE_HAOS_VMID`,
-`PVE_HAOS_RAM_MB`, `PVE_HAOS_CORES`, `PVE_FRIGATE_HOSTNAME` and
+The shipped `examples/pve-config.conf.example` also carries two keys that
+the Frigate stage will read. They do nothing today, and the driver
+preserves them across a rewrite: `PVE_FRIGATE_HOSTNAME` and
 `PVE_FRIGATE_CTID`.
 
 The community-scripts pins are not among them. They belong to the toolkit
@@ -412,6 +421,10 @@ Stages 40 and 50 exit early unless `PVE_NO_SUBSCRIPTION` says `yes`. Stage
 | --- | --- |
 | `10-acme` | Optional. Writes the DNS Made Easy credentials to a 0600 file, registers the plugin and the ACME account for the selected directory, points the node at both, then orders a certificate for `PVE_FQDN` when the host lacks a current one |
 | `20-tailscale` | Optional. Builds an unprivileged Debian LXC, installs Tailscale from its own repository, turns on IPv4 forwarding, joins the tailnet and advertises the LAN as a subnet router |
+| `40-haos` | Optional. Verifies the pinned Home Assistant OS image against its digest, builds the appliance virtual machine with `qm` and resources scaled to the node, tags it as this toolkit's and starts it |
+
+Stage 20 exits early unless `PVE_TAILSCALE_ENABLED` says `yes`, and stage
+40 unless `PVE_HAOS_ENABLED` says `yes`. Stage 30 belongs to Frigate.
 
 Stage 10 exits early unless `PVE_ACME_ENABLED` says `yes`. It orders from
 the Let's Encrypt staging directory until `PVE_ACME_ENVIRONMENT` says
@@ -614,6 +627,124 @@ A tailnet with device approval turned on parks the new machine in
 `NeedsMachineAuth`. The stage stops there and says so rather than
 retrying, because another `tailscale up` would spend another key without
 changing anything.
+
+### The Home Assistant OS appliance
+
+Stage `40-haos` exits early unless `PVE_HAOS_ENABLED` says `yes`. It
+builds the appliance Home Assistant publishes, as a virtual machine, with
+`qm` directly.
+
+The stage converges nothing inside it. Home Assistant OS is a closed appliance
+with its own onboarding, its own authentication and its own updates: it
+has no package manager this toolkit could drive and no account model it
+could add an administrator to. The admins phase 1 creates on the host do
+not reach into it, and the stage does not pretend otherwise.
+
+#### The virtual machine path is not the container path
+
+The container stages drive the community-scripts helpers, which build a
+guest from a Proxmox template the node already trusts. The virtual
+machine path has no such property: it boots a disk image off the public
+internet, and the upstream `vm/haos-vm.sh` at the pinned SHA checks that
+image by unpacking it and by nothing else. No digest, no signature. It
+also creates and starts the machine in one step, tagging it
+`community-script`, which leaves a window where an interruption strands a
+machine this stage cannot recognise as its own on a rerun.
+
+This stage owns the build instead. It downloads the pinned image, checks
+the SHA-256 before anything opens it, creates the machine carrying its
+own tag in the `qm create` itself, gives it its disks, and starts it only
+once every one of those steps holds. The recipe ports the upstream one: a q35
+machine on OVMF firmware with a 4 MB EFI disk, a virtio-scsi controller,
+the image imported as `scsi0` with `ssd=1,discard=on`, `boot order=scsi0`,
+a socket on `serial0` for the Proxmox console, the guest agent enabled,
+and `onboot 1`. Two things differ deliberately: the tag, and a MAC
+address Proxmox picks rather than the script.
+
+`qm` is a local administrative tool, and runs with the environment this
+toolkit runs with. The download and the unpack do not: they run under
+`env -i` with a short allowlist, so a credential the caller exported
+reaches neither.
+
+#### The disk image
+
+This toolkit pins the release and its SHA-256, downloads the image
+itself, and checks the digest before the image becomes a disk. A download
+that does not match the pin goes no further, and leaves no machine
+behind. Every run checks a cached file again rather than trusting it for
+existing, and a symlink at that path stops the stage outright.
+
+What the stage unpacks is the file it checked, not the name it checked.
+It holds the image open from the digest until `qm` has the disk, and
+reads it through that open file. A cached entry that something else
+replaces meanwhile leaves the stage holding the bytes it verified.
+
+Set `PVE_HAOS_VERSION` and `PVE_HAOS_IMAGE_SHA256` together, from the
+release's own `SHA256SUMS` asset, to install a release this toolkit has
+not caught up with. Setting either alone stops the stage and names both
+keys: a release with somebody else's digest never matches, and a digest
+on its own describes an image the stage is not fetching.
+
+#### Which machine the stage works on
+
+The stage marks the machine it builds with the Proxmox tag
+`pve-config-haos`, and checks for it before the first change it makes.
+The tag goes on in the `qm create`, so the machine carries it from the
+moment it exists: a run interrupted between creating the machine and
+giving it a disk leaves something the next run recognises and finishes,
+rather than a second appliance alongside the first.
+
+Finishing one takes a handful of steps, and each of them reads the
+machine for itself: the root disk, the EFI disk, the boot order, the serial
+console, the guest agent and the disk size. A machine whose disk got
+attached and never grown is still a machine with something to do, so an
+attached disk is not read as proof that the rest of the build happened.
+
+A machine with no root disk and more than one unused volume stops the
+stage. Which of those volumes holds Home Assistant is not something this
+node can tell, and booting the appliance off another guest's disk is the
+cost of guessing. Attach the right one by hand, or remove the ones that
+do not belong, and run again.
+
+It picks an id in this order: `PVE_HAOS_VMID` when you pin one; the
+tagged machine on this node; 200 when nothing in the cluster holds it,
+which is the convention; otherwise `pvesh get /cluster/nextid`. Guest ids
+are unique across a cluster and across both guest types, so a container
+numbered 200 is enough to move the appliance.
+
+A pinned id whose machine exists but carries no tag stops the stage. Set
+`PVE_HAOS_ADOPT_EXISTING=yes` to adopt it deliberately: the stage warns,
+tags it and treats it as the appliance from then on. Adoption without
+`PVE_HAOS_VMID` stops the stage, because an unaimed adoption would take
+over whatever happened to sit at the default id.
+
+The search is cluster-wide, and a listing the stage cannot read or decode
+stops it rather than letting it build: two Home Assistant installations
+driving one house share no state and fight over the same devices. The
+same rule governs starting the machine: a `qm status` the stage cannot
+decode ends the run instead of authorising a `qm start` on a guess.
+
+#### Resources
+
+Unset memory and cores scale to the node: an eighth of its RAM held
+between 2048 MB and 8192 MB, a quarter of its cores held between two and
+four. Home Assistant is not a subnet router — it runs an application
+server, a database, a supervisor and whatever add-ons the household
+collects — so the share is far larger than the router's, and upstream's
+own defaults of 4096 MB and two cores sit inside the band rather than at
+its top. The ceiling is there because the other
+guests on the node still have to fit, and because an appliance given
+32 GB does not use 32 GB, it leaves it unavailable.
+
+The disk defaults to 32 GB, which is the size of the published image.
+`qm` does not shrink a disk, so the stage refuses a smaller figure rather
+than ignoring it, and a resize it asks for and does not get stops the
+run.
+
+The stage applies the resources as it creates the machine. On a machine
+that already exists the stage reports a configured value disagreeing with
+the machine's and leaves it alone, because writing one would mean
+rebooting a running Home Assistant to apply a number.
 
 ## Idempotency and safety
 
@@ -1098,10 +1229,10 @@ changes the answer on a host that already has one.
 
 - **Phase 1 — implemented.** The nine host stages above.
 - **Phase 2 — partly implemented.** Stage `10-acme` orders the node
-  certificate and stage `20-tailscale` builds the subnet router. The Home
-  Assistant OS and Frigate guests remain a later effort. Their
-  configuration keys already appear in the example file and survive a
-  rewrite, but no stage reads them yet.
+  certificate, stage `20-tailscale` builds the subnet router and stage
+  `40-haos` builds the Home Assistant OS appliance. The Frigate guest
+  remains a later effort. Its configuration keys already appear in the
+  example file and survive a rewrite, but no stage reads them yet.
 
 ## Releases
 
