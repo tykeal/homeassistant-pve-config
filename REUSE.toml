@@ -17,3 +17,12 @@ path = ".aislop/baseline.json"
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 Andrew Grimberg <tykeal@bardicgrove.org>"
 SPDX-License-Identifier = "Apache-2.0"
+
+# What a real nft printed, kept byte for byte so the parser is tested
+# against nftables' own rendering rather than against a copy somebody
+# retyped. Annotated here rather than in the files for that reason.
+[[annotations]]
+path = "tests/fixtures/nft/**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Andrew Grimberg <tykeal@bardicgrove.org>"
+SPDX-License-Identifier = "Apache-2.0"

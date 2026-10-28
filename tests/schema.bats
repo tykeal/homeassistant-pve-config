@@ -350,6 +350,22 @@ resolve_names() {
   [ "$status" -eq 0 ]
 }
 
+# shellcheck disable=SC2016  # the payload must stay literal to be a payload
+@test "a guest ssh reachability that is neither tailnet nor lan is rejected" {
+  local value
+  for value in 'Tailnet' 'LAN' 'both' 'tailnet lan' '' '$(id)'; do
+    run _schema_validate_PVE_GUEST_ADMIN_SSH_ACCESS "${value}"
+    [ "$status" -ne 0 ] || {
+      echo "accepted: ${value}"
+      return 1
+    }
+  done
+  run _schema_validate_PVE_GUEST_ADMIN_SSH_ACCESS tailnet
+  [ "$status" -eq 0 ]
+  run _schema_validate_PVE_GUEST_ADMIN_SSH_ACCESS lan
+  [ "$status" -eq 0 ]
+}
+
 @test "adoption without a container to adopt is rejected" {
   unset PVE_TAILSCALE_CTID
   run _schema_validate_PVE_TAILSCALE_ADOPT_EXISTING yes

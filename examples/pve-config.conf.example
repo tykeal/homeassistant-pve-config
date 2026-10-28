@@ -79,6 +79,13 @@ PVE_ADMIN_KEY_SOURCE='ssh-ed25519 AAAAC3Nza... alice@example.net'
 # holding one of the keys above (pam_ssh_agent_auth).
 PVE_SUDO_SSH_AGENT='yes'
 
+# Where the administrators above may reach a container's sshd from once
+# they have been mirrored into it. 'tailnet' restricts it to the Tailscale
+# tunnel, in the container's own nftables ruleset as well as in sshd's
+# AllowUsers; 'lan' does neither and lets anything that can route to the
+# container reach sshd.
+PVE_GUEST_ADMIN_SSH_ACCESS='tailnet'
+
 # --- Certificates ---------------------------------------------------------
 
 # Order a Let's Encrypt certificate for PVE_FQDN over the DNS-01 challenge.

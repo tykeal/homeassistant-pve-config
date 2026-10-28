@@ -479,6 +479,55 @@ setup() {
   [[ "$(cat "${target}")" == 'PasswordAuthentication no'* ]]
 }
 
+@test "install_validated reads a mixed case Include as the Include it is" {
+  # sshd matches keywords without regard to case, so this pulls the file
+  # in and the Match inside it applies. A walk that only knew `Include`
+  # and `include` would report the host hardened with it in force.
+  mkdir -p "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d"
+  printf 'Include %s/etc/ssh/sshd_config.d/*.conf\niNcLuDe /etc/ssh/site-policy.conf\n' \
+    "${PVE_CONFIG_ROOT}" >"${PVE_CONFIG_ROOT}/etc/ssh/sshd_config"
+  printf 'Match User alice\n    PasswordAuthentication yes\n' \
+    >"${PVE_CONFIG_ROOT}/etc/ssh/site-policy.conf"
+
+  local target="${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/99-hardening.conf"
+  run install_validated "${target}" 'PasswordAuthentication no
+' 0644 validate_sshd_config
+
+  [ "$status" -ne 0 ]
+  [ ! -e "${target}" ]
+  [[ "$output" == *site-policy.conf* ]]
+}
+
+@test "a mixed case Include still reaches the candidate it names" {
+  # The other direction: the assembled configuration has to agree that
+  # the fragment is read, or a host that would be hardened is refused.
+  mkdir -p "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d"
+  printf 'iNcLuDe %s/etc/ssh/sshd_config.d/*.conf\nPort 22\n' \
+    "${PVE_CONFIG_ROOT}" >"${PVE_CONFIG_ROOT}/etc/ssh/sshd_config"
+
+  local target="${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/99-hardening.conf"
+  run install_validated "${target}" 'PasswordAuthentication no
+' 0644 validate_sshd_config
+  [ "$status" -eq 0 ]
+  [ -f "${target}" ]
+}
+
+@test "a mixed case Include pattern is redirected like any other" {
+  mkdir -p "${PVE_CONFIG_ROOT}/scratch" "${BATS_TEST_TMPDIR}/sshd_config.d"
+  : >"${BATS_TEST_TMPDIR}/sshd_config.d/50-site.conf"
+
+  local out
+  out=$(cd "${BATS_TEST_TMPDIR}" &&
+    _sshd_redirect_includes 'iNcLuDe sshd_config.d/*.conf' \
+      "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d" "${PVE_CONFIG_ROOT}/scratch")
+
+  # Left where sshd would read it, under the sysroot, rather than being
+  # passed through as a path this host would read for real.
+  [[ "${out}" == iNcLuDe\ * ]]
+  [[ "${out}" == *"${PVE_CONFIG_ROOT}"* ]]
+  [[ "${out}" != *50-site.conf* ]]
+}
+
 @test "install_validated refuses a conditional block an Include hides" {
   mkdir -p "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d"
   printf 'Include %s/etc/ssh/sshd_config.d/*.conf\nInclude /etc/ssh/site-policy.conf\n' \

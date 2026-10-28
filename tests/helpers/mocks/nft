@@ -1,0 +1,338 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Andrew Grimberg <tykeal@bardicgrove.org>
+# SPDX-License-Identifier: Apache-2.0
+
+# Enough of nft to tell a loaded ruleset from an unloaded one.
+#
+# The ruleset is state, not a file the toolkit can read back: `nft -f`
+# loads it and `nft list ruleset` prints what the kernel then holds, so
+# that is what this keeps. A mock that simply recorded the call and said
+# yes would let a module that never loads anything, or loads something
+# the real parser would reject, pass as a container with a packet filter
+# in it.
+#
+# So the loaded file is parsed. An unknown keyword, a rule outside the
+# syntax, an unbalanced brace, a family nft does not have, a file that is
+# not there and a `delete table` naming a table that does not exist all
+# fail here the way they fail there -- the last of those is why a ruleset
+# is loaded as an empty table, a delete and then the real one, and a mock
+# that tolerated the delete would never prove the idiom was needed.
+# shellcheck source=tests/helpers/mocks/_record
+source "$(dirname -- "$0")/_record"
+
+ruleset_file() {
+  local dir
+  dir=$(mock_state_dir) || return 1
+  printf '%s\n' "${dir}/nft-ruleset"
+}
+
+# A kernel that will not answer, and a load that is refused: two different
+# things, and a module that treats the first as "nothing is loaded" would
+# harden a container it cannot see.
+if [[ -n ${PVE_CONFIG_MOCK_NFT_LIST_FAIL:-} && ${1:-} == list ]]; then
+  printf 'Error: Could not receive netlink message: Operation not permitted\n' >&2
+  exit 1
+fi
+if [[ -n ${PVE_CONFIG_MOCK_NFT_LOAD_FAIL:-} && ${1:-} == -f ]]; then
+  printf 'Error: Could not process rule: Operation not permitted\n' >&2
+  exit 1
+fi
+
+STATE=$(ruleset_file) || exit 1
+[[ -f ${STATE} ]] || : >"${STATE}"
+
+syntax_error() {
+  printf 'Error: syntax error, unexpected %s\n' "$1" >&2
+  exit 1
+}
+
+valid_family() {
+  case $1 in
+    ip | ip6 | inet | arp | bridge | netdev) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+table_present() {
+  grep -q "^table $1 $2 {" -- "${STATE}"
+}
+
+table_delete() {
+  local family=$1 name=$2 keep='' depth=0 line
+  while IFS= read -r line; do
+    if [[ ${depth} -eq 0 && ${line} == "table ${family} ${name} {" ]]; then
+      depth=1
+      continue
+    fi
+    if [[ ${depth} -gt 0 ]]; then
+      case ${line} in
+        *'{') depth=$((depth + 1)) ;;
+        '}' | *'}') depth=$((depth - 1)) ;;
+      esac
+      continue
+    fi
+    keep+="${line}"$'\n'
+  done <"${STATE}"
+  printf '%s' "${keep}" >"${STATE}"
+}
+
+table_print() {
+  local family=$1 name=$2 out='' depth=0 line
+  while IFS= read -r line; do
+    if [[ ${depth} -eq 0 && ${line} == "table ${family} ${name} {" ]]; then
+      depth=1
+      out+="${line}"$'\n'
+      continue
+    fi
+    if [[ ${depth} -gt 0 ]]; then
+      out+="${line}"$'\n'
+      case ${line} in
+        *'{') depth=$((depth + 1)) ;;
+        '}' | *'}') depth=$((depth - 1)) ;;
+      esac
+      continue
+    fi
+  done <"${STATE}"
+  printf '%s' "${out}"
+}
+
+# The subset of nft's rule syntax this deployment writes. Anything else is
+# a syntax error, because anything else is a rule nobody has checked.
+valid_rule() {
+  local rule=$1
+  case ${rule} in
+    'type filter hook '*' priority '*'; policy accept;') return 0 ;;
+    'type filter hook '*' priority '*'; policy drop;') return 0 ;;
+  esac
+  [[ ${rule} =~ ^iif\ \"[a-z0-9]+\"\ (accept|drop|reject)$ ]] && return 0
+  [[ ${rule} =~ ^(ip|ip6)\ saddr\ [0-9a-fA-F:./]+\ tcp\ dport\ [0-9]+\ (accept|drop|reject)$ ]] && return 0
+  [[ ${rule} =~ ^tcp\ dport\ [0-9]+\ (accept|drop|reject)$ ]] && return 0
+  return 1
+}
+
+# An include names a path as the kernel's nft would see it, so under the
+# simulated container root it is the container's path that has to be
+# resolved. A mock that accepted `include` without opening what it names
+# would let a boot configuration that cannot load look loadable.
+resolve_guest_path() {
+  local path=$1
+  if [[ -n ${PVE_CONFIG_MOCK_GUEST_ROOT:-} && ${path} == /* ]]; then
+    printf '%s' "${PVE_CONFIG_MOCK_GUEST_ROOT}${path}"
+    return 0
+  fi
+  printf '%s' "${path}"
+}
+
+# nft tolerates a wildcard include that matches nothing and refuses a
+# literal one that is not there.
+include_files() {
+  local spec=$1 resolved
+  resolved=$(resolve_guest_path "${spec}")
+  local -a matches=()
+  if [[ ${spec} == *'*'* || ${spec} == *'?'* || ${spec} == *'['* ]]; then
+    local candidate
+    for candidate in ${resolved}; do
+      [[ -f ${candidate} ]] && matches+=("${candidate}")
+    done
+  else
+    if [[ ! -f ${resolved} ]]; then
+      printf 'Error: Could not open file "%s": No such file or directory\n' "${spec}" >&2
+      exit 1
+    fi
+    matches=("${resolved}")
+  fi
+  printf '%s\n' ${matches[@]+"${matches[@]}"}
+}
+
+parse_file() {
+  local file=$1 depth_in=${2:-0}
+  if [[ ${depth_in} -gt 8 ]]; then
+    printf 'Error: too many levels of include\n' >&2
+    exit 1
+  fi
+  if [[ ! -f ${file} ]]; then
+    printf 'Error: Could not open file "%s": No such file or directory\n' "${file}" >&2
+    exit 1
+  fi
+
+  local line trimmed depth=0 family='' name='' block='' words=() included
+  while IFS= read -r line || [[ -n ${line} ]]; do
+    trimmed=${line%%#*}
+    trimmed=${trimmed#"${trimmed%%[![:space:]]*}"}
+    trimmed=${trimmed%"${trimmed##*[![:space:]]}"}
+    [[ -n ${trimmed} ]] || continue
+
+    if [[ ${depth} -gt 0 ]]; then
+      block+="${line}"$'\n'
+      case ${trimmed} in
+        'chain '*'{')
+          depth=$((depth + 1))
+          continue
+          ;;
+        '}')
+          depth=$((depth - 1))
+          if [[ ${depth} -eq 0 ]]; then
+            blocks+=("${family}|${name}|${block}")
+            block=''
+          fi
+          continue
+          ;;
+      esac
+      valid_rule "${trimmed}" || syntax_error "'${trimmed}'"
+      continue
+    fi
+
+    read -r -a words <<<"${trimmed}"
+    case ${words[0]} in
+      table)
+        [[ ${#words[@]} -ge 4 ]] || syntax_error "'${trimmed}'"
+        valid_family "${words[1]}" || printf 'Error: unknown family %s\n' "${words[1]}" >&2
+        valid_family "${words[1]}" || exit 1
+        family=${words[1]}
+        name=${words[2]}
+        case ${words[3]} in
+          '{}')
+            creates+=("${family}|${name}")
+            ;;
+          '{')
+            depth=1
+            block="table ${family} ${name} {"$'\n'
+            ;;
+          *) syntax_error "'${trimmed}'" ;;
+        esac
+        ;;
+      delete)
+        [[ ${#words[@]} -eq 4 && ${words[1]} == table ]] || syntax_error "'${trimmed}'"
+        valid_family "${words[2]}" || exit 1
+        deletes+=("${words[2]}|${words[3]}")
+        ;;
+      flush)
+        [[ ${words[1]:-} == ruleset ]] || syntax_error "'${trimmed}'"
+        deletes+=('*|*')
+        ;;
+      include)
+        [[ ${#words[@]} -eq 2 ]] || syntax_error "'${trimmed}'"
+        included=${words[1]}
+        included=${included%\"}
+        included=${included#\"}
+        # Captured rather than piped: include_files refuses a literal
+        # path that is not there, and a refusal inside a process
+        # substitution is a message nobody acts on.
+        local nested nested_list='' nested_rc=0
+        nested_list=$(include_files "${included}") || nested_rc=$?
+        [[ ${nested_rc} -eq 0 ]] || exit 1
+        while IFS= read -r nested; do
+          [[ -n ${nested} ]] || continue
+          parse_file "${nested}" "$((depth_in + 1))"
+        done <<<"${nested_list}"
+        ;;
+      *) syntax_error "'${trimmed}'" ;;
+    esac
+  done <"${file}"
+
+  [[ ${depth} -eq 0 ]] || syntax_error 'end of file'
+}
+
+load_file() {
+  local file=$1 check_only=$2 entry key family name block
+  creates=()
+  deletes=()
+  blocks=()
+  parse_file "${file}" 0
+
+  # nft applies a file as one transaction, so a delete naming a table that
+  # the same file has not created is the error it would be there.
+  local -A present=()
+  local line words=()
+  while IFS= read -r line; do
+    [[ ${line} == 'table '*' {' ]] || continue
+    read -r -a words <<<"${line}"
+    present["${words[1]}|${words[2]}"]=1
+  done <"${STATE}"
+  for entry in ${creates[@]+"${creates[@]}"}; do
+    present["${entry}"]=1
+  done
+  for entry in ${deletes[@]+"${deletes[@]}"}; do
+    [[ ${entry} == '*|*' ]] && continue
+    [[ -n ${present[${entry}]:-} ]] || {
+      printf 'Error: No such file or directory\n' >&2
+      exit 1
+    }
+  done
+
+  [[ ${check_only} == 1 ]] && return 0
+
+  for entry in ${creates[@]+"${creates[@]}"}; do
+    key=${entry%%|*}
+    table_present "${key}" "${entry#*|}" ||
+      printf 'table %s %s {\n}\n' "${key}" "${entry#*|}" >>"${STATE}"
+  done
+  for entry in ${deletes[@]+"${deletes[@]}"}; do
+    if [[ ${entry} == '*|*' ]]; then
+      : >"${STATE}"
+      continue
+    fi
+    table_delete "${entry%%|*}" "${entry#*|}"
+  done
+  for entry in ${blocks[@]+"${blocks[@]}"}; do
+    family=${entry%%|*}
+    entry=${entry#*|}
+    name=${entry%%|*}
+    block=${entry#*|}
+    table_delete "${family}" "${name}"
+    printf '%s' "${block}" >>"${STATE}"
+  done
+}
+
+declare -a creates=() deletes=() blocks=()
+
+args=("$@")
+check_only=0
+if [[ ${args[0]:-} == -c ]]; then
+  check_only=1
+  args=("${args[@]:1}")
+fi
+
+case ${args[0]:-} in
+  -f)
+    [[ -n ${args[1]:-} ]] || syntax_error 'end of input'
+    # Real nft takes one file and nothing after it. A mock that shrugs
+    # at the extra operand hides a caller the real tool would reject.
+    [[ ${#args[@]} -eq 2 ]] || syntax_error "'${args[2]}'"
+    load_file "${args[1]}" "${check_only}"
+    ;;
+  list)
+    case ${args[1]:-} in
+      ruleset)
+        [[ ${#args[@]} -eq 2 ]] || syntax_error "'${args[2]}'"
+        cat -- "${STATE}"
+        ;;
+      table)
+        [[ ${#args[@]} -eq 4 ]] || syntax_error "'${args[4]:-}'"
+        valid_family "${args[2]:-}" || exit 1
+        table_present "${args[2]}" "${args[3]:-}" || {
+          printf 'Error: No such file or directory\n' >&2
+          exit 1
+        }
+        table_print "${args[2]}" "${args[3]}"
+        ;;
+      *) syntax_error "'${args[1]:-}'" ;;
+    esac
+    ;;
+  delete)
+    [[ ${args[1]:-} == table ]] || syntax_error "'${args[1]:-}'"
+    [[ ${#args[@]} -eq 4 ]] || syntax_error "'${args[4]:-}'"
+    valid_family "${args[2]:-}" || exit 1
+    table_present "${args[2]}" "${args[3]:-}" || {
+      printf 'Error: No such file or directory\n' >&2
+      exit 1
+    }
+    table_delete "${args[2]}" "${args[3]}"
+    ;;
+  flush)
+    [[ ${args[1]:-} == ruleset ]] || syntax_error "'${args[1]:-}'"
+    [[ ${#args[@]} -eq 2 ]] || syntax_error "'${args[2]}'"
+    : >"${STATE}"
+    ;;
+  *) syntax_error "'${args[0]:-}'" ;;
+esac

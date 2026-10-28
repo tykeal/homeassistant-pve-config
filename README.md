@@ -249,6 +249,7 @@ The driver resolves these keys on every run.
 | `PVE_NETWORK_WAIT_SECONDS` | yes | `60` | Seconds to wait for `vmbr0` to pick up an address, from 0 to 86400 |
 | `PVE_NO_SUBSCRIPTION` | yes | `yes` | Use the no-subscription repository and suppress the subscription notice |
 | `PVE_SUDO_SSH_AGENT` | yes | `yes` | Let `sudo` accept a forwarded SSH agent key |
+| `PVE_GUEST_ADMIN_SSH_ACCESS` | yes | `tailnet` | Where the administrators mirrored into a container may reach its sshd from: `tailnet` restricts it to the tunnel in the container's packet filter, `lan` admits anything that can route to it |
 | `PVE_ZULIP_ENABLED` | yes | `no` | Send boot and shutdown notices to Zulip |
 | `PVE_ZULIP_STREAM` | no | the stage falls back to `infrastructure` | Zulip stream for the notices |
 | `PVE_ZULIP_TOPIC` | no | the notifier falls back to the host FQDN | Zulip topic for the notices |
@@ -751,6 +752,97 @@ The stage applies the resources as it creates the machine. On a machine
 that already exists the stage reports a configured value disagreeing with
 the machine's and leaves it alone, because writing one would mean
 rebooting a running Home Assistant to apply a number.
+### Administrators in a container
+
+Every container this toolkit builds gets the administrators named by
+`PVE_ADMIN_USERS`, with the same keys, the same sshd policy and the same
+`pam_ssh_agent_auth` sudo the host has. One library does the work for both,
+so host and container share the reasoning and differ only in plumbing: the
+host path writes files, the container path reaches through `pct`.
+
+What a container ends up with:
+
+- `sudo`, `openssh-server`, `libpam-ssh-agent-auth` and `nftables`;
+- an account per administrator, in `sudo`, with their own
+  `~/.ssh/authorized_keys`;
+- `/etc/security/authorized_keys` at `0600` holding every administrator's
+  key, and exactly one `pam_ssh_agent_auth` line in `/etc/pam.d/sudo`;
+- a `0440` sudoers drop-in keeping `SSH_AUTH_SOCK` across `sudo`, which
+  `visudo -c` on the host approves before the push;
+- sshd with `PasswordAuthentication no` and `KbdInteractiveAuthentication
+  no`, in a drop-in the host's `sshd -t` judges against a copy of the
+  container's own configuration;
+- `TERM` set for the sessions `pct enter` starts;
+- a locked root password, once the toolkit has read every one of those
+  back out of the container and found them working.
+
+`PVE_GUEST_ADMIN_SSH_ACCESS` decides where that sshd answers. `tailnet`,
+the default, restricts it two ways: an `AllowUsers` qualified with the
+tailnet's address space, and a small nftables table in the container that
+drops port 22 from anywhere else. The nftables rule is the one that bounds
+exposure, because `AllowUsers` still talks to a LAN client and only then
+declines to authenticate it. sshd's own `ListenAddress` cannot do the job:
+the tailnet address does not exist until the container joins the tunnel,
+and sshd refuses to start without it. `lan` does neither and lets anything
+that can route to the container reach sshd. Moving a container from
+`tailnet` to `lan` lifts the restriction on the next run.
+
+The toolkit also checks that `/etc/nftables.conf` and everything it
+includes still load, because one malformed file in `/etc/nftables.d`
+takes the whole boot configuration down and a container restricted now
+would come back from a reboot restricting nothing.
+
+Before it hardens anything, the toolkit copies the container's
+`sshd_config` and the whole of `/etc/ssh/sshd_config.d` -- subdirectories
+included -- and works out who that configuration admits. An `Include`
+naming anything the copy does not hold, or a path that resolves outside
+that directory, stops the run: a configuration this node cannot reproduce
+is one it cannot judge, and disabling passwords against a guess is how
+operators get locked out.
+
+That reading is deliberately narrow, and it refuses two things sshd
+itself accepts:
+
+- an `Include` operand holding a quote, a backslash, whitespace or a
+  control character -- `Include "/etc/ssh/sshd_config.d/*.conf"` stops
+  the run, although sshd reads it;
+- a drop-in filename with anything in it beyond letters, digits, dots,
+  dashes and underscores, including one with a newline in the name.
+
+Both abort with a message naming the file. Rename the file, or write the
+`Include` unquoted, and the run proceeds. The narrowness is the point:
+each of these is a place where this toolkit would otherwise have to
+reproduce a corner of OpenSSH's own parser, and a wrong guess there is a
+lockout rather than a failed run. Issue #30 replaces the whole reading
+with `sshd -T` -- sshd's parser answering for itself -- and lifts these
+restrictions. The copy keeps a filename that begins with a dot rather
+than refusing it: `Include .../*.conf` does not load one, but an
+`Include` naming it outright does.
+
+Treat the container-side filter as hardening, not as a boundary against
+the container itself. Root inside the container can flush the table; a
+later run reads the running ruleset back and notices, but between runs
+nothing stops it. It shrinks what the LAN can reach, and it does not make
+a container's root account somebody you can distrust.
+
+The ordering carries the safety. The toolkit turns password authentication
+off only after reading every administrator's key back out of the container
+and finding one sshd would accept, and it locks the root password only
+after the hardened sshd runs, the restriction holds, and a second check
+confirms that access. A run interrupted between writing the hardening and
+reloading sshd leaves a marker in the container, so the next run reloads
+the daemon rather than reading the files, finding them right, and locking
+root against a daemon still serving the old policy. Anything it cannot
+read aborts the run rather than counting as a `no`. `pct enter` from the node survives every step and
+remains the recovery path.
+
+One thing this deliberately avoids: linking `/etc/pam.d/sudo-i` to
+`/etc/pam.d/sudo`. Debian ships both files and they differ -- `sudo` ends
+with `@include common-session-noninteractive` and `sudo-i` with `@include
+common-session`, which is what gives a `sudo -i` login shell its logind
+session -- so the toolkit converges the agent line into each of them
+instead. Where somebody has already linked `sudo-i` to `sudo`, it changes
+nothing.
 
 ## Idempotency and safety
 

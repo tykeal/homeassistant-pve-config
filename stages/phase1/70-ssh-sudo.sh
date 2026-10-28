@@ -24,7 +24,7 @@ mapfile -t USERS < <(admin_users)
 # password-only machine 60-admin-users may never have run and disabling
 # passwords here would close the only way in.
 assert_admin_access() {
-  local user home keys key file installed
+  local user home keys file installed reason
   for user in "${USERS[@]}"; do
     user_exists "${user}" ||
       die "${user} has no account on this host; run the 60-admin-users stage before hardening SSH."
@@ -33,29 +33,11 @@ assert_admin_access() {
     [[ -f ${file} ]] ||
       die "${user} has no ${file}; run the 60-admin-users stage before hardening SSH."
     _slurp installed "${file}"
-    # Active entries only. A commented out key is not one this host would
-    # accept, and taking it for one would disable passwords behind a login
-    # nobody has.
-    local -A active=() unrestricted=()
-    local entry identity
-    while IFS= read -r entry || [[ -n ${entry} ]]; do
-      _is_comment "${entry}" && continue
-      identity=$(_ssh_key_identity "${entry}") || continue
-      active["${identity}"]=1
-      # An entry carrying from= or a forced command may be deliberate, but
-      # it is not one this stage can call a working remote login, and
-      # rewriting someone else's restriction is not ours to do either.
-      ssh_key_entry_is_unrestricted "${entry}" && unrestricted["${identity}"]=1
-    done <<<"${installed}"
     keys=$(admin_keys_for "${user}")
-    while IFS= read -r key || [[ -n ${key} ]]; do
-      [[ -n ${key} ]] || continue
-      key=$(_ssh_key_identity "${key}") || continue
-      [[ -n ${active[${key}]+set} ]] ||
-        die "${user}'s configured key is not active in ${file}; run the 60-admin-users stage before hardening SSH."
-      [[ -n ${unrestricted[${key}]+set} ]] ||
-        die "${user}'s only entry for that key in ${file} carries restrictions (from=, command=, restrict or no-pty) that this stage cannot verify remote logins through; add an unrestricted entry or relax the restriction before hardening SSH."
-    done <<<"${keys}"
+    reason=$(authorized_keys_access_problem \
+      "${installed}" "${keys}" "${user}" "${file}" \
+      'run the 60-admin-users stage before hardening SSH') && continue
+    die "${reason}"
   done
 }
 
@@ -64,24 +46,14 @@ assert_admin_access() {
 # above. Disabling passwords on top of that removes the last way in, so
 # any AuthorizedKeysFile this host sets -- globally or under a Match -- has
 # to still name the file the keys went into.
+#
+# The reading is lib/common.sh's, shared with the containers phase 2
+# mirrors these administrators into: two systems asking the same question
+# must not be able to answer it differently.
 assert_authorized_keys_path() {
-  local main="${SYSROOT}/etc/ssh/sshd_config"
-  [[ -f ${main} ]] || return 0
-
-  local file criteria keyword value operand ok
-  while IFS=$'\x1f' read -r file criteria keyword value; do
-    [[ ${keyword} == authorizedkeysfile ]] || continue
-    ok=0
-    for operand in ${value}; do
-      operand=${operand#'%h/'}
-      [[ ${operand} == '.ssh/authorized_keys' ]] && ok=1
-    done
-    [[ ${ok} -eq 1 ]] && continue
-    if [[ -n ${criteria} ]]; then
-      die "${file} sets AuthorizedKeysFile to '${value}' under 'Match ${criteria}', so the keys installed for the administrators would be ignored."
-    fi
-    die "${file} sets AuthorizedKeysFile to '${value}', so the keys installed for the administrators would be ignored."
-  done < <(_sshd_config_directives "${main}")
+  local main="${SYSROOT}/etc/ssh/sshd_config" reason
+  reason=$(sshd_authorized_keys_problem "${main}" "$(sysroot)" '' '') && return 0
+  die "${reason}"
 }
 
 # AllowUsers, DenyUsers, AllowGroups and DenyGroups decide who sshd will
@@ -90,71 +62,16 @@ assert_authorized_keys_path() {
 # authentication on top of that leaves nobody able to log in at all. None
 # of these four are permitted inside a Match block, so the unconditional
 # part of the configuration is the whole story.
-_ssh_name_matches() {
-  local name=$1 pattern=$2
-  # A pattern may be qualified with the host it applies from; the account
-  # it admits is the part before the '@'.
-  pattern=${pattern%%@*}
-  [[ -n ${pattern} ]] || return 1
-  # shellcheck disable=SC2053 # the pattern is one, and matching it is the point
-  [[ ${name} == ${pattern} ]]
-}
-
 assert_ssh_admits_admins() {
-  local main="${SYSROOT}/etc/ssh/sshd_config"
-  [[ -f ${main} ]] || return 0
-
-  local -a allow_users=() deny_users=() allow_groups=() deny_groups=()
-  local file criteria keyword value
-  local -a more=()
-  # sshd accumulates every occurrence of these keywords rather than
-  # letting the first one win, so each directive adds to the list.
-  while IFS=$'\x1f' read -r file criteria keyword value; do
-    [[ -n ${criteria} ]] && continue
-    read -r -a more <<<"${value}"
-    case ${keyword} in
-      allowusers) allow_users+=(${more[@]+"${more[@]}"}) ;;
-      denyusers) deny_users+=(${more[@]+"${more[@]}"}) ;;
-      allowgroups) allow_groups+=(${more[@]+"${more[@]}"}) ;;
-      denygroups) deny_groups+=(${more[@]+"${more[@]}"}) ;;
-    esac
-  done < <(_sshd_config_directives "${main}")
-
-  local user pattern group admitted
+  local main="${SYSROOT}/etc/ssh/sshd_config" user groups reason
+  local -a pairs=()
   for user in "${USERS[@]}"; do
-    for pattern in ${deny_users[@]+"${deny_users[@]}"}; do
-      _ssh_name_matches "${user}" "${pattern}" &&
-        die "${main} denies ${user} with 'DenyUsers ${pattern}', so hardening would leave them unable to log in."
-    done
-    if [[ ${#allow_users[@]} -gt 0 ]]; then
-      admitted=0
-      for pattern in "${allow_users[@]}"; do
-        _ssh_name_matches "${user}" "${pattern}" && admitted=1
-      done
-      [[ ${admitted} -eq 1 ]] ||
-        die "${main} admits only '${allow_users[*]}', which does not include ${user}; hardening would leave them unable to log in."
-    fi
-
-    [[ ${#deny_groups[@]} -gt 0 || ${#allow_groups[@]} -gt 0 ]] || continue
-    local -a groups=()
-    mapfile -t groups < <(user_groups "${user}")
-    for pattern in ${deny_groups[@]+"${deny_groups[@]}"}; do
-      for group in ${groups[@]+"${groups[@]}"}; do
-        _ssh_name_matches "${group}" "${pattern}" &&
-          die "${main} denies ${user}'s group ${group} with 'DenyGroups ${pattern}', so hardening would leave them unable to log in."
-      done
-    done
-    if [[ ${#allow_groups[@]} -gt 0 ]]; then
-      admitted=0
-      for pattern in "${allow_groups[@]}"; do
-        for group in ${groups[@]+"${groups[@]}"}; do
-          _ssh_name_matches "${group}" "${pattern}" && admitted=1
-        done
-      done
-      [[ ${admitted} -eq 1 ]] ||
-        die "${main} admits only the groups '${allow_groups[*]}', none of which ${user} is in; hardening would leave them unable to log in."
-    fi
+    groups=$(user_groups "${user}" | paste -sd, -)
+    pairs+=("${user}" "${groups}")
   done
+  reason=$(sshd_admission_problem "${main}" "$(sysroot)" '' '' \
+    ${pairs[@]+"${pairs[@]}"}) && return 0
+  die "${reason}"
 }
 
 if dry_run_enabled; then
@@ -176,7 +93,10 @@ fi
 # with it every other file in that directory -- including one some other
 # tool left broken -- newly live for the next sshd restart.
 sshd_main="${SYSROOT}/etc/ssh/sshd_config"
-include_match='^[[:space:]]*[Ii]nclude[[:space:]]+.*sshd_config\.d'
+# Every letter spelled out: sshd reads its keywords without regard to
+# case, so a host whose `iNcLuDe` already names the directory would
+# otherwise gain a second Include line on every run.
+include_match='^[[:space:]]*[Ii][Nn][Cc][Ll][Uu][Dd][Ee][[:space:]]+.*sshd_config\.d'
 include_needed=0
 if [[ -f ${sshd_main} ]] && ! grep -Eq "${include_match}" "${sshd_main}"; then
   include_needed=1

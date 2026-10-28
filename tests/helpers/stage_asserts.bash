@@ -47,6 +47,9 @@ MOCK_READ_ONLY_PATTERNS=(
   '^sshd( -[^ ]+)* -t( |$).*'
   '^sshd( -[^ ]+)* -T( |$).*'
   '^visudo -c -f .*'
+  '^passwd -S .*'
+  '^nft list (ruleset|table [a-z]+ [A-Za-z0-9_]+)$'
+  '^nft -c -f /[^ ]+$'
   '^ifreload --syntax-check .*'
   '^ifquery -a -i .*'
   '^findmnt( -[^ ]+)* .*'
@@ -65,7 +68,7 @@ MOCK_READ_ONLY_PATTERNS=(
   # wrapper and its five environment assignments included. Naming the
   # command that follows TERM=dumb is what keeps this a list of read-only
   # invocations rather than a licence for pct exec.
-  '^pct exec [0-9]+ --keep-env 0 -- /bin/sh -c .* TERM=dumb (test|stat|sha256sum|dpkg-query|sysctl -n|tailscale status|systemctl is-active|systemctl is-enabled) .*$'
+  '^pct exec [0-9]+ --keep-env 0 -- /bin/sh -c .* TERM=dumb (test|stat|ls -1A?|find|readlink|sha256sum|dpkg-query|sysctl -n|tailscale status|systemctl is-active|systemctl is-enabled|passwd -S|nft list|nft -c) .*$'
 )
 
 assert_no_mutating_calls() {

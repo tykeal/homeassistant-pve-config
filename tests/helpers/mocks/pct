@@ -64,8 +64,15 @@ guest_state() {
 is_path_tool() {
   case $1 in
     mkdir | rmdir | chmod | chown | rm | stat | test | cat | touch | ln | readlink) return 0 ;;
+    # `ls` is given the sshd drop-in directory to enumerate, and `find`
+    # counts what is in it without depending on the names.
+    ls | find) return 0 ;;
     # sha256sum is given the keyring's path inside the container.
     sha256sum) return 0 ;;
+    # `nft -f` names a ruleset file in the container. Its other forms
+    # (`list ruleset`, `delete table inet ...`) have no absolute operand,
+    # so relocation leaves them alone.
+    nft) return 0 ;;
     # Only curl's -o operand is an absolute path; the URL is not.
     curl) return 0 ;;
     *) return 1 ;;
@@ -152,7 +159,19 @@ case ${verb} in
     done
 
     args=()
-    if is_path_tool "${1:-}"; then
+    if [[ ${1:-} == ln ]]; then
+      # The operand `ln -s` stores in the link is the path the container
+      # will resolve, not a path this mock opens: relocating it would
+      # record a link to the simulated root and make a converged symlink
+      # look like one that needs rewriting. Only the name of the link
+      # itself is a path here.
+      args=("$@")
+      last=$(($# - 1))
+      if [[ ${args[last]} == /* ]]; then
+        args[last]="${root}${args[last]}"
+      fi
+      mkdir -p -- "$(dirname -- "${args[last]}")"
+    elif is_path_tool "${1:-}"; then
       for arg in "$@"; do
         if [[ ${arg} == /* ]]; then
           args+=("${root}${arg}")
@@ -247,7 +266,12 @@ case ${verb} in
       PVE_CONFIG_MOCK_BRIDGE_IP \
       PVE_CONFIG_MOCK_TAILSCALE_STATUS_JSON \
       PVE_CONFIG_MOCK_TAILSCALE_STATUS_FAIL \
-      PVE_CONFIG_MOCK_KEYRING_PAYLOAD; do
+      PVE_CONFIG_MOCK_KEYRING_PAYLOAD \
+      PVE_CONFIG_MOCK_PASSWD_STATUS \
+      PVE_CONFIG_MOCK_PASSWD_S_FAIL \
+      PVE_CONFIG_MOCK_PASSWD_LOCK_FAIL \
+      PVE_CONFIG_MOCK_NFT_LIST_FAIL \
+      PVE_CONFIG_MOCK_NFT_LOAD_FAIL; do
       if [[ -n ${!knob:-} ]]; then
         container_env+=("${knob}=${!knob}")
       fi

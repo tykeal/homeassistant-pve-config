@@ -1062,6 +1062,23 @@ zulip_secrets() {
   [ ! -e "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/99-hardening.conf" ]
 }
 
+@test "70-ssh-sudo adds no second Include to a mixed case one" {
+  # sshd reads `iNcLuDe` as an Include, so the directory is already
+  # pulled in. Adding another line would rewrite the configuration and
+  # reload the daemon on every run.
+  seed_admin_access
+  mkdir -p "${PVE_CONFIG_ROOT}/etc/ssh"
+  printf 'iNcLuDe /etc/ssh/sshd_config.d/*.conf\nPort 22\n' \
+    >"${PVE_CONFIG_ROOT}/etc/ssh/sshd_config"
+
+  run run_phase1_stage 70-ssh-sudo.sh
+  [ "$status" -eq 0 ]
+  local body
+  body=$(cat "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config")
+  [[ "${body}" == 'iNcLuDe /etc/ssh/sshd_config.d/*.conf'* ]]
+  [ "$(grep -ci 'include /etc/ssh/sshd_config.d' <<<"${body}")" -eq 1 ]
+}
+
 @test "70-ssh-sudo keeps an Include that names another policy file" {
   seed_admin_access
   mkdir -p "${PVE_CONFIG_ROOT}/etc/ssh"

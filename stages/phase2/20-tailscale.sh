@@ -50,6 +50,8 @@ unset PVE_TAILSCALE_AUTHKEY
 source "${PVE_CONFIG_LIB_DIR:?PVE_CONFIG_LIB_DIR is unset}/stage.sh"
 # shellcheck source=lib/tailscale.sh
 source "${PVE_CONFIG_LIB_DIR}/tailscale.sh"
+# shellcheck source=lib/guest-admin.sh
+source "${PVE_CONFIG_LIB_DIR}/guest-admin.sh"
 
 # The libraries take over the capture, and the secret region the block
 # above opened by hand stays open until the key is gone.
@@ -466,3 +468,10 @@ elif [[ ${login_state} == changed ]]; then
 fi
 
 log_info "the Tailscale subnet router in container ${ctid} (${hostname}) advertises ${advertise_routes}"
+
+# The administrators who manage this node manage the router too. Last,
+# because it hardens the container's sshd and locks its root password, and
+# neither belongs in front of the work that makes the container useful:
+# a run that fails before the tunnel is up should not also have taken a
+# way back in with it.
+guest_admin_converge "${target}" >/dev/null

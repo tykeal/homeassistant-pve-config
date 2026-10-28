@@ -1025,3 +1025,75 @@ target_service_reload() {
     die "Unable to reload ${unit} on $(target_describe "${target}")"
   printf 'changed\n'
 }
+
+# --- the rest of the filesystem -------------------------------------------
+
+# Every group an account on the target belongs to. The guest's group file
+# is pulled out and parsed by the same awk the host path uses, so a
+# container is judged by its own database and by the host's reasoning.
+target_user_groups() {
+  local target=$1 name=$2 gid='' body=''
+  _target_valid "${target}"
+  if target_is_host "${target}"; then
+    user_groups "${name}"
+    return
+  fi
+  local _target_groups_gid
+  if target_user_gid _target_groups_gid "${target}" "${name}"; then
+    gid=${_target_groups_gid}
+  fi
+  target_slurp body "${target}" /etc/group || return 1
+  _groups_from_body "${body}" "${name}" "${gid}"
+}
+
+target_ensure_symlink() {
+  local target=$1 dest=$2 link=$3
+  _target_valid "${target}"
+  if target_is_host "${target}"; then
+    ensure_symlink "${dest}" "$(target_path "${target}" "${link}")"
+    return
+  fi
+
+  local current=''
+  if target_test "${target}" L "${link}"; then
+    if target_capture current "${target}" readlink -- "${link}"; then
+      if [[ ${current} == "${dest}" ]]; then
+        printf 'unchanged\n'
+        return 0
+      fi
+    fi
+  elif target_test "${target}" e "${link}" && ! target_test "${target}" f "${link}"; then
+    die "Refusing to replace ${link} on $(target_describe "${target}") with a symlink: it is not a regular file"
+  fi
+
+  if dry_run_enabled; then
+    log_info "would link ${link} to ${dest} on $(target_describe "${target}")"
+    printf 'changed\n'
+    return 0
+  fi
+  target_run "${target}" ln -sfn -- "${dest}" "${link}" ||
+    die "Unable to link ${link} to ${dest} on $(target_describe "${target}")"
+  log_info "linked ${link} to ${dest} on $(target_describe "${target}")"
+  printf 'changed\n'
+}
+
+# Writes a file the target only accepts in one shape, having first had the
+# host's own tool agree that this content is that shape.
+#
+# The validation happens on the host because that is where the tool is:
+# visudo may not even be installed in a container yet when its sudoers
+# drop-in is written, and a file pushed before it is checked is a file that
+# was wrong for however long the check takes. Nothing is written anywhere
+# until the validator has accepted it.
+target_install_validated() {
+  local target=$1 path=$2 content=$3 mode=$4 validator=$5
+  _target_valid "${target}"
+  if target_is_host "${target}"; then
+    install_validated "$(target_path "${target}" "${path}")" "${content}" "${mode}" "${validator}"
+    return
+  fi
+
+  _target_refuse_symlink "${target}" "${path}"
+  assert_candidate_valid "${path}" "${content}" "${mode}" "${validator}"
+  target_write_file "${target}" "${path}" "${content}" "${mode}"
+}
