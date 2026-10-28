@@ -87,7 +87,7 @@ if ((exists == 0)); then
       needs_disk=1
       log_warn "virtual machine ${vmid} carries the ${HAOS_OWNER_TAG} tag and has no root disk, which is what an interrupted build leaves behind. Finishing it."
     else
-      log_warn "virtual machine ${vmid} has no root disk and does not carry the ${HAOS_OWNER_TAG} tag, so this stage did not build it and will not give it one."
+      die "Virtual machine ${vmid} has no scsi0 root disk and does not carry the ${HAOS_OWNER_TAG} tag. This stage cannot tell a build of its own that was interrupted before the import from a machine whose root disk is on virtio0, sata0 or ide0, and tagging it would make the next run treat it as unfinished and boot it from a freshly imported Home Assistant OS image instead of what is on it. Point PVE_HAOS_VMID at an unused id, or give the machine a scsi0 root disk, before adopting it."
     fi
   fi
 else

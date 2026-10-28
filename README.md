@@ -718,6 +718,12 @@ tags it and treats it as the appliance from then on. Adoption without
 `PVE_HAOS_VMID` stops the stage, because an unaimed adoption would take
 over whatever happened to sit at the default id.
 
+An untagged machine with no `scsi0` is not adopted at all. Once tagged it
+would read as a build of this stage's own that stopped before the import,
+and the next run would import a fresh image and point the boot order at
+it, past whatever is on `virtio0`, `sata0` or `ide0`. Aim `PVE_HAOS_VMID`
+at an unused id, or move the root disk to `scsi0`, and run again.
+
 The search is cluster-wide, and a listing the stage cannot read or decode
 stops it rather than letting it build: two Home Assistant installations
 driving one house share no state and fight over the same devices. The

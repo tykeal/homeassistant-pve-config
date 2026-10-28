@@ -605,16 +605,37 @@ cached_image() {
   [ "$status" -eq 0 ]
 }
 
-@test "a diskless machine this toolkit did not build is left alone" {
+@test "a diskless machine this toolkit did not build is refused rather than adopted" {
   seed_half_built_vm 200
   sed -i "/^tags: /d" "$(vm_conf 200)"
   export PVE_HAOS_VMID=200
   export PVE_HAOS_ADOPT_EXISTING='yes'
 
   run run_haos
-  [ "$status" -eq 0 ]
-  [[ "${output}" == *'will not give it one'* ]]
+  [ "$status" -ne 0 ]
+  [[ "${output}" == *'has no scsi0 root disk'* ]]
   run grep -F 'qm disk import' <(mock_calls)
+  [ "$status" -ne 0 ]
+  # And it is not tagged, because the tag is what would make the next run
+  # treat somebody else's machine as a build of its own to finish.
+  run grep -F 'qm set 200 -tags' <(mock_calls)
+  [ "$status" -ne 0 ]
+}
+
+@test "a machine whose root disk is not on scsi0 is never given a second one" {
+  # The boot disk is on virtio0, which is a layout this stage does not
+  # build and must not overwrite.
+  seed_half_built_vm 200
+  sed -i "/^tags: /d" "$(vm_conf 200)"
+  printf 'virtio0: local-lvm:vm-200-disk-0,size=64G\n' >>"$(vm_conf 200)"
+  export PVE_HAOS_VMID=200
+  export PVE_HAOS_ADOPT_EXISTING='yes'
+
+  run run_haos
+  [ "$status" -ne 0 ]
+  run grep -F 'qm disk import' <(mock_calls)
+  [ "$status" -ne 0 ]
+  run grep -F '--boot order=scsi0' <(mock_calls)
   [ "$status" -ne 0 ]
 }
 
@@ -882,6 +903,36 @@ imported_sha256() {
   [ "$status" -eq 0 ]
   run grep -F 'qm resize' <(mock_calls)
   [ "$status" -ne 0 ]
+}
+
+@test "a disk recorded in a unit other than gigabytes is read, not refused" {
+  # PVE::JSONSchema's format_size divides down while the division is
+  # exact, so a 1024 GiB disk is written as 1T. Reading only G would
+  # stop a deployment whose disk is already far bigger than it asked
+  # for.
+  seed_vm 200 haos "${OWNER_TAG}" 1T
+  export PVE_HAOS_VMID=200
+  export PVE_HAOS_DISK_GB=64
+
+  run run_haos
+  [ "$status" -eq 0 ]
+  run grep -F 'qm resize' <(mock_calls)
+  [ "$status" -ne 0 ]
+  run grep -F 'qm start 200' <(mock_calls)
+  [ "$status" -eq 0 ]
+}
+
+@test "a disk of a size no whole gigabytes describes is counted down, not up" {
+  # 33280M is 32.5 GiB: thirty-two whole gigabytes and not thirty-three,
+  # so a deployment asking for 33 still gets the resize it asked for.
+  seed_vm 200 haos "${OWNER_TAG}" 33280M
+  export PVE_HAOS_VMID=200
+  export PVE_HAOS_DISK_GB=33
+
+  run run_haos
+  [ "$status" -eq 0 ]
+  run grep -F 'qm resize 200 scsi0 33G' <(mock_calls)
+  [ "$status" -eq 0 ]
 }
 
 @test "a disk whose size cannot be read stops the stage rather than being resized" {

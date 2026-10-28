@@ -1370,15 +1370,35 @@ haos_vm_firmware_converge() {
 # whether a resize has anything to do: `qm resize` to a size the disk
 # already has fails, and treating that failure as success is how a disk
 # that was never grown passes for a converged one.
+#
+# The unit is whichever one says the figure exactly: PVE::JSONSchema's
+# format_size divides the byte count down while it divides evenly, so a
+# 1024 GiB disk is recorded as `size=1T` and one that is not a whole
+# number of gigabytes as `size=33280M`. Reading only `G` would make those
+# machines unreadable and stop a deployment whose disk is already big
+# enough, so every unit it can print is understood here and the figure is
+# taken down to whole gigabytes. Down, because a disk of 32.5 GiB has 32
+# whole ones: rounding the other way would call a disk bigger than it is
+# and skip a resize that was asked for.
+#
+# The digits are bounded before any arithmetic sees them.
 haos_vm_disk_size_gb() {
-  local __var=$1 __ds_vmid=$2 __ds_value='' __ds_size='' rc=0
+  local __var=$1 __ds_vmid=$2 __ds_value='' __ds_size='' __ds_unit='' rc=0
   printf -v "${__var}" '%s' ''
 
   haos_vm_conf_value __ds_value "${__ds_vmid}" scsi0 || rc=$?
   ((rc == 0)) || return "${rc}"
-  [[ ${__ds_value} =~ (^|,)size=([0-9]+)G(,|$) ]] || return 2
+  [[ ${__ds_value} =~ (^|,)size=([0-9]{1,12})([KMGT]?)(,|$) ]] || return 2
   __ds_size=${BASH_REMATCH[2]}
-  _haos_is_number "${__ds_size}" || return 2
+  __ds_unit=${BASH_REMATCH[3]}
+  [[ ${__ds_size} =~ ^[0-9]{1,12}$ ]] || return 2
+  case ${__ds_unit} in
+    T) __ds_size=$((__ds_size * 1024)) ;;
+    G) ;;
+    M) __ds_size=$((__ds_size / 1024)) ;;
+    K) __ds_size=$((__ds_size / 1024 / 1024)) ;;
+    *) __ds_size=$((__ds_size / 1024 / 1024 / 1024)) ;;
+  esac
   printf -v "${__var}" '%s' "${__ds_size}"
   return 0
 }
