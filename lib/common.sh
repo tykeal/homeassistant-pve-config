@@ -723,25 +723,37 @@ _sshd_includes_candidate() {
 _sshd_effective_config() {
   local candidate=$1 target=$2 dir=$3
   local conf_d="${dir}/sshd_config.d"
-  local base main body='' existing root
+  local base main body='' root
   root=$(sysroot)
   base=$(basename -- "${target}")
 
   mkdir -p -- "${conf_d}" || return 1
 
-  # Every file in the directory, not only *.conf: an Include naming
-  # `site-policy` or `*.cfg` pulls in whatever it names, and leaving those
-  # out of the scratch tree would validate a configuration the daemon does
-  # not have.
+  # The whole directory, structure and all: not only *.conf, because an
+  # Include naming `site-policy` or `*.cfg` pulls in whatever it names,
+  # and not only its immediate children, because a drop-in may itself
+  # Include a subdirectory. Leaving either out would validate a
+  # configuration the daemon does not have.
   local src="${root}/etc/ssh/sshd_config.d"
   if [[ -d ${src} ]]; then
-    for existing in "${src}"/*; do
-      [[ -f ${existing} ]] || continue
-      [[ $(basename -- "${existing}") == "${base}" ]] && continue
-      cp -- "${existing}" "${conf_d}/" || return 1
-    done
+    cp -a -- "${src}/." "${conf_d}/" || return 1
+    rm -f -- "${conf_d}/${base}" || return 1
   fi
   cp -- "${candidate}" "${conf_d}/${base}" || return 1
+
+  # Every copied file's own Includes are redirected too. Rewriting only
+  # the main file would leave a nested Include naming the real
+  # /etc/ssh/sshd_config.d, so sshd would read the live directory while
+  # being asked about the scratch copy of it.
+  local copied copied_body='' redirected
+  while IFS= read -r -d '' copied; do
+    [[ ${copied} == "${conf_d}/${base}" ]] && continue
+    [[ -r ${copied} ]] || return 1
+    _slurp copied_body "${copied}"
+    [[ ${copied_body} == *[Ii][Nn][Cc][Ll][Uu][Dd][Ee]* ]] || continue
+    redirected=$(_sshd_redirect_includes "${copied_body}" "${src}" "${conf_d}")
+    printf '%s\n' "${redirected}" >"${copied}" || return 1
+  done < <(find "${conf_d}" -type f -print0 2>/dev/null)
 
   main="${dir}/sshd_config"
   local host_main="${root}/etc/ssh/sshd_config"
@@ -1045,7 +1057,25 @@ sshd_admission_problem() {
   # sshd accumulates every occurrence of these keywords rather than
   # letting the first one win, so each directive adds to the list.
   while IFS=$'\x1f' read -r file criteria keyword value; do
-    [[ -n ${criteria} ]] && continue
+    if [[ -n ${criteria} ]]; then
+      # A conditional one cannot be answered here: whether it applies
+      # depends on the address, the user and the host a connection
+      # arrives with, none of which exist yet. Reading past it would have
+      # a `Match User alice` carrying `DenyUsers alice` judged as though
+      # it were not there, and password authentication taken away from an
+      # account the daemon will not talk to. The contradiction is the
+      # operator's to resolve.
+      case ${keyword} in
+        allowusers | denyusers | allowgroups | denygroups)
+          local conditional=${file}
+          [[ -n ${display_root} ]] && conditional=${conditional#"${display_root}"}
+          printf "%s sets %s under 'Match %s', and who that admits cannot be judged ahead of a connection; resolve that before hardening.\n" \
+            "${conditional}" "${keyword}" "${criteria}"
+          return 1
+          ;;
+      esac
+      continue
+    fi
     read -r -a more <<<"${value}"
     case ${keyword} in
       allowusers) allow_users+=(${more[@]+"${more[@]}"}) ;;

@@ -80,11 +80,18 @@ PVE_ADMIN_KEY_SOURCE='ssh-ed25519 AAAAC3Nza... alice@example.net'
 PVE_SUDO_SSH_AGENT='yes'
 
 # Where the administrators above may reach a container's sshd from once
-# they have been mirrored into it. 'tailnet' restricts it to the Tailscale
+# they have been mirrored into it. 'lan' lets anything that can route to
+# the container reach sshd; 'tailnet' restricts it to the Tailscale
 # tunnel, in the container's own nftables ruleset as well as in sshd's
-# AllowUsers; 'lan' does neither and lets anything that can route to the
-# container reach sshd.
-PVE_GUEST_ADMIN_SSH_ACCESS='tailnet'
+# AllowUsers.
+PVE_GUEST_ADMIN_SSH_ACCESS='lan'
+
+# Lock the root password of a container the administrators are mirrored
+# into, once their key based access to it has been confirmed working.
+# 'pct enter' from this node is unaffected either way; what a lock takes
+# away is a password login from anywhere else. Left at no, the container
+# keeps its root password as a fallback.
+PVE_GUEST_ADMIN_ROOT_LOCK='no'
 
 # --- Certificates ---------------------------------------------------------
 

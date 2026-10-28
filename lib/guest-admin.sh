@@ -72,7 +72,12 @@ GUEST_ADMIN_NFT_DIR='/etc/nftables.d'
 GUEST_ADMIN_NFT_PATH='/etc/nftables.d/pve-config-admin.nft'
 GUEST_ADMIN_NFT_MAIN='/etc/nftables.conf'
 GUEST_ADMIN_NFT_INCLUDE='include "/etc/nftables.d/*.nft"'
-GUEST_ADMIN_NFT_INCLUDE_MATCH='^[[:space:]]*include[[:space:]]+"?/etc/nftables\.d/'
+# Only this module's own wildcard include. A pattern that matched every
+# include naming that directory would have target_ensure_exact_line
+# replace an operator's `include "/etc/nftables.d/site.rules"` with this
+# one, and `*.nft` does not load `site.rules`: their firewall would go
+# away at the next reboot without anything having said so.
+GUEST_ADMIN_NFT_INCLUDE_MATCH='^[[:space:]]*include[[:space:]]+"?/etc/nftables\.d/\*\.nft"?[[:space:]]*$'
 GUEST_ADMIN_NFT_UNIT='nftables.service'
 GUEST_ADMIN_SSH_PORT='22'
 
@@ -558,24 +563,55 @@ _guest_admin_firewall_rules_restrict() {
 # is asked for, so a rule that happens to exist in somebody else's table
 # cannot answer for one that does not exist in this one.
 _guest_admin_firewall_live() {
-  local target=$1 table='' status=0
+  local target=$1 table='' present=0
 
-  target_capture table "${target}" nft list table inet "${GUEST_ADMIN_NFT_TABLE}" || status=$?
-  if [[ ${status} -ne 0 ]]; then
+  _guest_admin_firewall_table table "${target}" || present=$?
+  case ${present} in
+    0) ;;
+    1) return 1 ;;
+    *) return 2 ;;
+  esac
+
+  _guest_admin_firewall_rules_restrict "${table}" || return 1
+  return 0
+}
+
+# Whether this module's own table exists at all, and its body when it
+# does.
+#
+#   0  it exists, and __body_var holds what nft printed
+#   1  it does not exist
+#   2  the container did not answer in a way this can be read
+#
+# Asked separately from whether the table restricts anything, because the
+# two questions have different consequences: a table whose rules are not
+# the ones this module writes still has to be taken away when the
+# configuration stops asking for a restriction, and reading "no
+# restriction" off an existing table would leave it in place while
+# reporting the container open.
+_guest_admin_firewall_table() {
+  # The output variable is named by the caller, and lib/target.sh names
+  # its own locals with a leading double underscore, so every local here
+  # avoids both conventions rather than shadowing one of them.
+  local __body_var=$1 fw_target=$2 fw_raw='' fw_status=0
+
+  target_capture fw_raw "${fw_target}" nft list table inet "${GUEST_ADMIN_NFT_TABLE}" || fw_status=$?
+  if [[ ${fw_status} -ne 0 ]]; then
     # A table that is not there and a kernel that will not answer both
     # fail here, and they mean opposite things. They are told apart by a
     # question that does not depend on the table: if the whole ruleset
     # lists, nft is working and the table is simply absent.
-    local ruleset='' probe=0
-    target_capture ruleset "${target}" nft list ruleset || probe=$?
-    if [[ ${probe} -ne 0 ]]; then
-      log_error "nft list failed in $(target_describe "${target}"): ${ruleset}"
+    local fw_ruleset='' fw_probe=0
+    target_capture fw_ruleset "${fw_target}" nft list ruleset || fw_probe=$?
+    if [[ ${fw_probe} -ne 0 ]]; then
+      log_error "nft list failed in $(target_describe "${fw_target}"): ${fw_ruleset}"
       return 2
     fi
+    printf -v "${__body_var}" '%s' ''
     return 1
   fi
 
-  _guest_admin_firewall_rules_restrict "${table}" || return 1
+  printf -v "${__body_var}" '%s' "${fw_raw}"
   return 0
 }
 
@@ -586,19 +622,34 @@ _guest_admin_firewall_live() {
 # behind. An unreadable answer aborts: a container that cannot say whether
 # it is exposed is not one to take another way in away from.
 _guest_admin_firewall_confirmed() {
-  local target=$1 access=${PVE_GUEST_ADMIN_SSH_ACCESS:-tailnet} state=0
+  local target=$1 access=${PVE_GUEST_ADMIN_SSH_ACCESS:-lan} state=0
+
+  # Where the LAN is allowed in, the question is whether this module's
+  # table is gone, not whether its rules restrict: a table left behind
+  # with rules this module did not write can block ssh just as
+  # thoroughly, and reading its rules as "not restricted" is how a
+  # container ends up unreachable while the run reports success.
+  if [[ ${access} != tailnet ]]; then
+    local body=''
+    _guest_admin_firewall_table body "${target}" || state=$?
+    case ${state} in
+      1) return 0 ;;
+      0)
+        die "$(target_describe "${target}") still has the ${GUEST_ADMIN_NFT_TABLE} table, which PVE_GUEST_ADMIN_SSH_ACCESS=${access} does not ask for; refusing to go on until that is lifted."
+        ;;
+      *)
+        die "Unable to read the packet filter in $(target_describe "${target}"); refusing to go on with hardening it."
+        ;;
+    esac
+  fi
 
   _guest_admin_firewall_live "${target}" || state=$?
   case ${state} in
     2)
       die "Unable to read the packet filter in $(target_describe "${target}"); refusing to go on with hardening it."
       ;;
-    0)
-      [[ ${access} == tailnet ]] && return 0
-      die "$(target_describe "${target}") still restricts ssh to the tailnet, which PVE_GUEST_ADMIN_SSH_ACCESS=${access} does not ask for; refusing to go on until that is lifted."
-      ;;
+    0) return 0 ;;
     *)
-      [[ ${access} != tailnet ]] && return 0
       die "$(target_describe "${target}") does not restrict ssh to the tailnet; refusing to go on with hardening it."
       ;;
   esac
@@ -611,7 +662,7 @@ _guest_admin_firewall_confirmed() {
 # the running ruleset is loaded from it only when something is actually
 # out of place, so a converged container is never reconfigured.
 guest_admin_firewall_converge() {
-  local target=$1 access=${PVE_GUEST_ADMIN_SSH_ACCESS:-tailnet}
+  local target=$1 access=${PVE_GUEST_ADMIN_SSH_ACCESS:-lan}
   local changed=0 state live=0
 
   if [[ ${access} != tailnet ]]; then
@@ -708,7 +759,12 @@ _guest_admin_firewall_unrestrict() {
     return 0
   fi
 
-  _guest_admin_firewall_live "${target}" || live=$?
+  # Presence, not shape. A table whose rules are not the ones this module
+  # writes is still this module's table, and still filters ssh; deciding
+  # by whether it currently restricts would leave exactly those rules in
+  # place and call the container reachable.
+  local body=''
+  _guest_admin_firewall_table body "${target}" || live=$?
   case ${live} in
     1) ;;
     0)
@@ -735,7 +791,7 @@ _guest_admin_firewall_unrestrict() {
 
 # The hardening fragment this container is to be given.
 guest_admin_sshd_fragment() {
-  local access=${PVE_GUEST_ADMIN_SSH_ACCESS:-tailnet}
+  local access=${PVE_GUEST_ADMIN_SSH_ACCESS:-lan}
   local user cidr allow=''
   while IFS= read -r user; do
     [[ -n ${user} ]] || continue
@@ -1031,6 +1087,56 @@ _guest_admin_sshd_mirror() {
   printf -v "${__dir_var}" '%s' "${dir}"
 }
 
+# Dies unless the only port this container's sshd answers on is the one
+# the packet filter protects.
+#
+# The restriction this module writes names tcp port 22 and nothing else.
+# A configuration that moves sshd to another port, or adds a second
+# listener on one, is reachable from the LAN through a port no rule
+# covers -- while every check here reports the container restricted to
+# the tailnet. Rather than grow the ruleset to follow a configuration
+# this module does not own, a port it cannot vouch for stops the run.
+#
+# Only asked where the restriction is what makes the container safe to
+# harden: with the LAN admitted there is no claim being made about which
+# ports answer it.
+_guest_admin_sshd_ports_guard() {
+  local target=$1 mirror=$2 access=${PVE_GUEST_ADMIN_SSH_ACCESS:-lan}
+  [[ ${access} == tailnet ]] || return 0
+
+  local main="${mirror}${GUEST_ADMIN_SSHD_MAIN}"
+  [[ -f ${main} ]] || return 0
+
+  local file criteria keyword value port display
+  while IFS=$'\x1f' read -r file criteria keyword value; do
+    port=''
+    case ${keyword} in
+      port) port=${value%%[[:space:]]*} ;;
+      listenaddress)
+        # ListenAddress is `host`, `host:port`, `[v6]:port`, each with an
+        # optional `rdomain NAME` after it. A bare IPv6 address has
+        # colons and no port, which is why the bracketed form is the only
+        # one a colon is read as a port separator in.
+        local operand=${value%%[[:space:]]*}
+        case ${operand} in
+          \[*\]:*) port=${operand##*]:} ;;
+          *:*:*) port='' ;;
+          *:*) port=${operand##*:} ;;
+        esac
+        ;;
+      *) continue ;;
+    esac
+    [[ -n ${port} ]] || continue
+    [[ ${port} == "${GUEST_ADMIN_SSH_PORT}" ]] && continue
+    display=${file#"${mirror}"}
+    if [[ -n ${criteria} ]]; then
+      die "${display} in $(target_describe "${target}") puts sshd on port ${port} under 'Match ${criteria}', which the tailnet restriction does not cover; refusing to report it restricted."
+    fi
+    die "${display} in $(target_describe "${target}") puts sshd on port ${port}, which the tailnet restriction does not cover; refusing to report it restricted."
+  done < <(_sshd_config_directives "${main}" "${mirror}" "${mirror}")
+  return 0
+}
+
 # Dies unless this fragment would leave every administrator able to log in.
 #
 # Asked of the whole assembled configuration rather than of the fragment,
@@ -1040,14 +1146,22 @@ _guest_admin_sshd_mirror() {
 # in any complaint are rewritten back to the ones the container knows.
 _guest_admin_sshd_admits() {
   local target=$1 mirror=$2
-  local main="${mirror}${GUEST_ADMIN_SSHD_MAIN}" user groups reason
+  local main="${mirror}${GUEST_ADMIN_SSHD_MAIN}" user groups raw reason
   local -a pairs=()
 
   while IFS= read -r user; do
     [[ -n ${user} ]] || continue
-    groups=$(target_user_groups "${target}" "${user}" | paste -sd, -) || groups=''
+    # A group file that cannot be read is not an account with no groups.
+    # Taking it for one would have an AllowGroups or a DenyGroups judged
+    # against an empty list, which admits every administrator no matter
+    # what the configuration says about them.
+    raw=$(target_user_groups "${target}" "${user}") ||
+      die "Unable to read the groups ${user} belongs to in $(target_describe "${target}"); refusing to judge who its sshd would admit."
+    groups=$(printf '%s\n' "${raw}" | paste -sd, -)
     pairs+=("${user}" "${groups}")
   done < <(_guest_admin_users)
+
+  _guest_admin_sshd_ports_guard "${target}" "${mirror}"
 
   if ! reason=$(sshd_authorized_keys_problem "${main}" "${mirror}" "${mirror}" "${mirror}"); then
     die "In $(target_describe "${target}"): ${reason}"
@@ -1310,12 +1424,22 @@ _guest_admin_access_confirmed() {
 
 # Locks root's password, once key-based access has been confirmed working.
 #
+# Off unless PVE_GUEST_ADMIN_ROOT_LOCK asks for it: a container whose root
+# password is still set has one more way in that does not depend on this
+# toolkit having got the keys right, and that fallback is the operator's
+# to give up rather than this module's to take.
+#
 # `pct enter` from this host is the recovery path and is unaffected by a
 # locked password, so this cannot lock anybody out of a container on the
 # node that runs it. What it does take away is a password login from
 # anywhere else, which is the point.
 guest_admin_root_lock() {
   local target=$1 state=0
+
+  if [[ ${PVE_GUEST_ADMIN_ROOT_LOCK:-no} != yes ]]; then
+    printf 'unchanged\n'
+    return 0
+  fi
 
   if dry_run_enabled; then
     log_info "would lock the root password in $(target_describe "${target}") once key based access is confirmed"
@@ -1362,6 +1486,17 @@ guest_admin_converge() {
   # is worse than none, because this goes on to turn password
   # authentication off.
   admin_keys_require >/dev/null
+
+  # A dry run over a container that does not exist yet has nothing to
+  # ask. Every probe below reads the container, and a container this node
+  # cannot reach answers none of them: going on would stop the plan with
+  # a transport error rather than finish it. The work is still reported,
+  # because a run that is not a dry one would do it.
+  if dry_run_enabled && ! target_test "${target}" f /etc/os-release; then
+    log_info "would mirror the administrators into $(target_describe "${target}") once it exists"
+    printf 'changed\n'
+    return 0
+  fi
 
   state_of state guest_admin_packages "${target}"
   if [[ ${state} == changed ]]; then

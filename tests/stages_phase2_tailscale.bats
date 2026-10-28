@@ -155,6 +155,18 @@ advertised_routes() {
   grep -q '^alice:' "$(guest_file 100 /etc/passwd)"
   grep -qx 'PasswordAuthentication no' \
     "$(guest_file 100 /etc/ssh/sshd_config.d/99-pve-config-admin.conf)"
+  # The root password is left as the operator's fallback unless they ask
+  # for it to be locked, so nothing here has touched it.
+  run grep -q 'passwd -l root' <(mock_calls)
+  [ "$status" -ne 0 ]
+}
+
+@test "20-tailscale locks the container's root password when asked to" {
+  export PVE_GUEST_ADMIN_ROOT_LOCK='yes'
+  mirror_administrators
+
+  run run_tailscale
+  [ "$status" -eq 0 ]
   grep -q '^root:!' "$(guest_file 100 /etc/shadow)"
 }
 

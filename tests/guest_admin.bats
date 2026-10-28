@@ -224,6 +224,7 @@ ${PAM_LINE}
 }
 
 @test "ssh is restricted to the tailnet in the container's own packet filter" {
+  export PVE_GUEST_ADMIN_SSH_ACCESS='tailnet'
   converge >/dev/null
   local ruleset
   ruleset=$(cat "${PVE_CONFIG_MOCK_STATE}/guests/${CT}/state/nft-ruleset")
@@ -236,6 +237,7 @@ ${PAM_LINE}
 }
 
 @test "the include goes after the flush Debian's own ruleset starts with" {
+  export PVE_GUEST_ADMIN_SSH_ACCESS='tailnet'
   seed_guest_file /etc/nftables.conf '#!/usr/sbin/nft -f
 
 flush ruleset
@@ -265,6 +267,7 @@ flush ruleset
 }
 
 @test "a restriction that cannot be applied stops the run before hardening" {
+  export PVE_GUEST_ADMIN_SSH_ACCESS='tailnet'
   export PVE_CONFIG_MOCK_NFT_LOAD_FAIL=1
   run converge
   [ "${status}" -ne 0 ]
@@ -279,6 +282,8 @@ flush ruleset
 }
 
 @test "a restriction gone by the time the root lock is reached stops it" {
+  export PVE_GUEST_ADMIN_SSH_ACCESS='tailnet'
+  export PVE_GUEST_ADMIN_ROOT_LOCK='yes'
   converge >/dev/null
   printf 'root:x:20000:0:99999:7:::\n' >"${ROOT}/etc/shadow"
   : >"${PVE_CONFIG_MOCK_STATE}/guests/${CT}/state/nft-ruleset"
@@ -297,6 +302,7 @@ flush ruleset
 }
 
 @test "moving a container from tailnet to lan lifts the restriction" {
+  export PVE_GUEST_ADMIN_SSH_ACCESS='tailnet'
   converge >/dev/null
   grep -q 'table inet pve_config_admin' \
     "${PVE_CONFIG_MOCK_STATE}/guests/${CT}/state/nft-ruleset"
@@ -306,6 +312,132 @@ flush ruleset
     "${PVE_CONFIG_MOCK_STATE}/guests/${CT}/state/nft-ruleset"
   [ "${status}" -ne 0 ]
   [ ! -e "${ROOT}/etc/nftables.d/pve-config-admin.nft" ]
+}
+
+@test "an include somebody else put in nftables.conf is left where it is" {
+  export PVE_GUEST_ADMIN_SSH_ACCESS='tailnet'
+  seed_guest_file /etc/nftables.d/site.rules 'table inet site {
+	chain input {
+		type filter hook input priority filter; policy accept;
+	}
+}
+'
+  seed_guest_file /etc/nftables.conf '#!/usr/sbin/nft -f
+
+flush ruleset
+include "/etc/nftables.d/site.rules"
+'
+  converge >/dev/null
+  # `*.nft` does not load `site.rules`, so replacing that line with this
+  # module's own would take the operator's firewall away at the next boot
+  # without anything having said so.
+  grep -qF 'include "/etc/nftables.d/site.rules"' "${ROOT}/etc/nftables.conf"
+  grep -qF 'include "/etc/nftables.d/*.nft"' "${ROOT}/etc/nftables.conf"
+}
+
+@test "a table whose rules are not this toolkit's is still taken away" {
+  export PVE_GUEST_ADMIN_SSH_ACCESS='lan'
+  # This module's own table, carrying rules it did not write: ssh is
+  # filtered either way, so reading "not restricted" off it and leaving
+  # it alone would report the container reachable while it is not.
+  seed_ruleset 'table inet pve_config_admin {
+	chain input {
+		type filter hook input priority filter; policy accept;
+		tcp dport 22 drop
+	}
+}
+'
+  run converge
+  [ "${status}" -eq 0 ]
+  run grep -q 'table inet pve_config_admin' \
+    "${PVE_CONFIG_MOCK_STATE}/guests/${CT}/state/nft-ruleset"
+  [ "${status}" -ne 0 ]
+  mock_calls | grep -q 'nft delete table inet pve_config_admin'
+}
+
+@test "sshd on a port the restriction does not cover stops the hardening" {
+  export PVE_GUEST_ADMIN_SSH_ACCESS='tailnet'
+  seed_guest_file /etc/ssh/sshd_config 'Include /etc/ssh/sshd_config.d/*.conf
+Port 2222
+'
+  run converge
+  [ "${status}" -ne 0 ]
+  [[ ${output} == *'port 2222'* ]]
+  [ ! -e "${ROOT}/etc/ssh/sshd_config.d/99-pve-config-admin.conf" ]
+  run grep -q 'passwd -l root' <(mock_calls)
+  [ "${status}" -ne 0 ]
+}
+
+@test "a second listener the restriction does not cover stops the hardening" {
+  export PVE_GUEST_ADMIN_SSH_ACCESS='tailnet'
+  seed_guest_file /etc/ssh/sshd_config 'Include /etc/ssh/sshd_config.d/*.conf
+ListenAddress 0.0.0.0:2222
+'
+  run converge
+  [ "${status}" -ne 0 ]
+  [[ ${output} == *'port 2222'* ]]
+}
+
+@test "a bare IPv6 listener is not read as a port and does not stop it" {
+  # The colons in an unbracketed IPv6 address are not a port separator,
+  # and refusing one would abort a container configured exactly right.
+  export PVE_GUEST_ADMIN_SSH_ACCESS='tailnet'
+  seed_guest_file /etc/ssh/sshd_config 'Include /etc/ssh/sshd_config.d/*.conf
+ListenAddress fd00::1
+Port 22
+'
+  run converge
+  [ "${status}" -eq 0 ]
+}
+
+@test "groups that cannot be read are not an account with no groups" {
+  # An AllowGroups judged against an empty list admits everybody, which
+  # is the answer that disables password authentication.
+  converge >/dev/null
+  rm -f -- "${ROOT}/etc/ssh/sshd_config.d/99-pve-config-admin.conf"
+  seed_guest_file /etc/ssh/sshd_config 'Include /etc/ssh/sshd_config.d/*.conf
+AllowGroups operators
+'
+  chmod 000 "${ROOT}/etc/group"
+  run guest_admin_sshd_converge "${GUEST}"
+  chmod 644 "${ROOT}/etc/group"
+  [ "${status}" -ne 0 ]
+  [[ ${output} == *'groups alice belongs to'* ]]
+  [ ! -e "${ROOT}/etc/ssh/sshd_config.d/99-pve-config-admin.conf" ]
+}
+
+@test "an administrator denied inside a Match block stops the hardening" {
+  # sshd never enters a Match block for a dump with no connection to
+  # match on, so reading past it would take passwords away from an
+  # account the daemon will not talk to.
+  seed_guest_file /etc/ssh/sshd_config 'Include /etc/ssh/sshd_config.d/*.conf
+
+Match User alice
+	DenyUsers alice
+'
+  run converge
+  [ "${status}" -ne 0 ]
+  [[ ${output} == *'Match User alice'* ]]
+  [ ! -e "${ROOT}/etc/ssh/sshd_config.d/99-pve-config-admin.conf" ]
+}
+
+@test "a dry run over a container that does not exist yet still plans" {
+  # The container a dry run would have built answers nothing, and every
+  # check below reads it: going on would end the plan with a transport
+  # error instead of finishing it.
+  export PVE_CONFIG_DRY_RUN=1
+  export PVE_CONFIG_MOCK_PCT_FAIL_VMID="${CT}"
+  run converge
+  [ "${status}" -eq 0 ]
+  [[ ${output} == *'would mirror the administrators'* ]]
+}
+
+@test "the root password is left alone unless the configuration asks" {
+  converge >/dev/null
+  run grep -q '^root:!' "${ROOT}/etc/shadow"
+  [ "${status}" -ne 0 ]
+  run grep -q 'passwd -l root' <(mock_calls)
+  [ "${status}" -ne 0 ]
 }
 
 @test "a dry run loads no rules into the container" {
@@ -334,6 +466,7 @@ flush ruleset
 }
 
 @test "sshd is hardened and admits the administrators over the tailnet" {
+  export PVE_GUEST_ADMIN_SSH_ACCESS='tailnet'
   converge >/dev/null
   local fragment="${ROOT}/etc/ssh/sshd_config.d/99-pve-config-admin.conf"
   grep -qx 'PasswordAuthentication no' "${fragment}"
@@ -575,6 +708,7 @@ policy.conf" 'AllowUsers root
 }
 
 @test "the root password is locked once key based access is confirmed" {
+  export PVE_GUEST_ADMIN_ROOT_LOCK='yes'
   converge >/dev/null
   grep -q '^root:!' "${ROOT}/etc/shadow"
   mock_calls | grep -q 'passwd -l root'
@@ -590,6 +724,7 @@ policy.conf" 'AllowUsers root
 }
 
 @test "a root password status that cannot be read stops the run" {
+  export PVE_GUEST_ADMIN_ROOT_LOCK='yes'
   export PVE_CONFIG_MOCK_PASSWD_S_FAIL=1
   run converge
   [ "${status}" -ne 0 ]
@@ -599,6 +734,7 @@ policy.conf" 'AllowUsers root
 }
 
 @test "a password status this toolkit does not know stops the run" {
+  export PVE_GUEST_ADMIN_ROOT_LOCK='yes'
   export PVE_CONFIG_MOCK_PASSWD_STATUS='??'
   run converge
   [ "${status}" -ne 0 ]
@@ -607,6 +743,7 @@ policy.conf" 'AllowUsers root
 }
 
 @test "the root password is not locked while sshd is stopped" {
+  export PVE_GUEST_ADMIN_ROOT_LOCK='yes'
   converge >/dev/null
   # Back to a container that has everything installed and a daemon that is
   # not running, which is not a container anybody has been let into.
@@ -620,6 +757,7 @@ policy.conf" 'AllowUsers root
 }
 
 @test "the root password is not locked when the hardening is missing" {
+  export PVE_GUEST_ADMIN_ROOT_LOCK='yes'
   converge >/dev/null
   printf 'root:x:20000:0:99999:7:::\n' >"${ROOT}/etc/shadow"
   rm -f -- "${ROOT}/etc/ssh/sshd_config.d/99-pve-config-admin.conf"
@@ -631,6 +769,7 @@ policy.conf" 'AllowUsers root
 }
 
 @test "the root password is not locked when sudo would not accept a key" {
+  export PVE_GUEST_ADMIN_ROOT_LOCK='yes'
   converge >/dev/null
   printf 'root:x:20000:0:99999:7:::\n' >"${ROOT}/etc/shadow"
   seed_guest_file /etc/pam.d/sudo '@include common-auth
@@ -736,6 +875,8 @@ table inet other {
 }
 
 @test "a filter whose order has been undone stops the root lock" {
+  export PVE_GUEST_ADMIN_SSH_ACCESS='tailnet'
+  export PVE_GUEST_ADMIN_ROOT_LOCK='yes'
   converge >/dev/null
   printf 'root:x:20000:0:99999:7:::\n' >"${ROOT}/etc/shadow"
   seed_ruleset 'table inet pve_config_admin {
@@ -755,6 +896,7 @@ table inet other {
 }
 
 @test "a restriction the container would lose at boot stops the hardening" {
+  export PVE_GUEST_ADMIN_SSH_ACCESS='tailnet'
   # One malformed file in the include directory takes the whole boot
   # configuration down with it, so a container restricted now would come
   # back from a reboot restricting nothing.
@@ -773,6 +915,7 @@ table inet other {
 }
 
 @test "the hardening stage refuses on its own when the filter is gone" {
+  export PVE_GUEST_ADMIN_SSH_ACCESS='tailnet'
   # The gate inside the sshd stage, reached directly: the converge above
   # it would have refused first, which leaves this one unverified unless
   # it is asked by itself.
@@ -808,6 +951,7 @@ table inet other {
 }
 
 @test "an outstanding reload stops the root password being locked" {
+  export PVE_GUEST_ADMIN_ROOT_LOCK='yes'
   converge >/dev/null
   printf 'root:x:20000:0:99999:7:::\n' >"${ROOT}/etc/shadow"
   seed_guest_file /var/lib/pve-config/sshd-reload-pending 'pending
@@ -909,6 +1053,7 @@ table inet other {
 }
 
 @test "counters and comments on a rule are not a filter this stops for" {
+  export PVE_GUEST_ADMIN_SSH_ACCESS='tailnet'
   # nft prints what it holds, and a chain that has seen traffic prints
   # counters with it. Refusing a ruleset over the way it renders would
   # abort a container that is configured exactly right.

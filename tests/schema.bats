@@ -366,6 +366,30 @@ resolve_names() {
   [ "$status" -eq 0 ]
 }
 
+@test "a guest root password lock that is neither yes nor no is rejected" {
+  local value
+  for value in 'Yes' 'true' '1' '' 'lock'; do
+    run _schema_validate_PVE_GUEST_ADMIN_ROOT_LOCK "${value}"
+    [ "$status" -ne 0 ] || {
+      echo "accepted: ${value}"
+      return 1
+    }
+  done
+  run _schema_validate_PVE_GUEST_ADMIN_ROOT_LOCK no
+  [ "$status" -eq 0 ]
+  run _schema_validate_PVE_GUEST_ADMIN_ROOT_LOCK yes
+  [ "$status" -eq 0 ]
+}
+
+@test "a container keeps its lan reachability and its root password by default" {
+  # Both of these take something away from the operator, so neither is a
+  # default: a deployment that wants them says so.
+  export PVE_HOSTNAME='pve1' PVE_DOMAIN='example.test'
+  resolve_names
+  [ "${PVE_GUEST_ADMIN_SSH_ACCESS}" = 'lan' ]
+  [ "${PVE_GUEST_ADMIN_ROOT_LOCK}" = 'no' ]
+}
+
 @test "adoption without a container to adopt is rejected" {
   unset PVE_TAILSCALE_CTID
   run _schema_validate_PVE_TAILSCALE_ADOPT_EXISTING yes

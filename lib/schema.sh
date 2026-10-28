@@ -33,7 +33,8 @@ PVE_BRIDGE_GATEWAY|no|no||Default gateway for vmbr0, only read when the mode is 
 PVE_NETWORK_WAIT_SECONDS|no|yes|_schema_default_wait|Seconds to wait for vmbr0 to pick up an address
 PVE_NO_SUBSCRIPTION|no|yes|_schema_default_yes|Use the no-subscription repository and suppress the subscription notice
 PVE_SUDO_SSH_AGENT|no|yes|_schema_default_yes|Allow sudo to accept a forwarded SSH agent key
-PVE_GUEST_ADMIN_SSH_ACCESS|no|yes|_schema_default_tailnet|Where the administrators mirrored into a container may reach its sshd from, tailnet or lan
+PVE_GUEST_ADMIN_SSH_ACCESS|no|yes|_schema_default_lan|Where the administrators mirrored into a container may reach its sshd from, lan or tailnet
+PVE_GUEST_ADMIN_ROOT_LOCK|no|yes|_schema_default_no|Lock the root password of a container the administrators are mirrored into
 PVE_ACME_ENABLED|no|yes|_schema_default_no|Order a certificate for this host over the DNS-01 challenge
 PVE_ACME_ENVIRONMENT|no|yes|_schema_default_staging|ACME directory to order from, staging or production
 PVE_ACME_EMAIL|no|no||Contact address for the ACME account and for expiry warnings
@@ -80,12 +81,12 @@ _schema_default_wait() { printf '60\n'; }
 _schema_default_staging() { printf 'staging\n'; }
 _schema_default_dnsmadeeasy() { printf 'dnsmadeeasy\n'; }
 
-# A container's sshd is reachable over the tailnet by default. The
-# administrators mirrored into it are there so the container can be
-# managed, and the tunnel is the path this deployment builds for that; a
-# container that also answers on the LAN is a second way in that nobody
-# asked for.
-_schema_default_tailnet() { printf 'tailnet\n'; }
+# A container's sshd answers on the LAN and over the tailnet by default.
+# The tunnel is the path this deployment builds for managing it, but a
+# deployment whose tunnel is not up yet still has to be reachable, so
+# narrowing it to the tailnet is something an operator asks for rather
+# than something that happens to them.
+_schema_default_lan() { printf 'lan\n'; }
 
 # The uplink, and only the uplink. Bridging every port the host happens to
 # have risks an L2 loop between two live ports and merges networks that
@@ -209,6 +210,13 @@ _schema_yes_no_valid() {
 _schema_validate_PVE_GUEST_ADMIN_SSH_ACCESS() {
   [[ $1 == tailnet || $1 == lan ]] && return 0
   printf 'a container admits its administrators over the tailnet or the lan\n'
+  return 1
+}
+
+# shellcheck disable=SC2329  # called indirectly, by name, from schema_resolve
+_schema_validate_PVE_GUEST_ADMIN_ROOT_LOCK() {
+  _schema_yes_no_valid "$1" && return 0
+  printf 'it is yes or no\n'
   return 1
 }
 

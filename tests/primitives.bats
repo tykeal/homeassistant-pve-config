@@ -479,6 +479,51 @@ setup() {
   [[ "$(cat "${target}")" == 'PasswordAuthentication no'* ]]
 }
 
+@test "install_validated follows an Include a drop-in makes itself" {
+  # A drop-in may Include a subdirectory of its own. Copying only the
+  # immediate children of sshd_config.d, or redirecting only the main
+  # file's Includes, leaves that nested file out of the assembled
+  # configuration: the Match below never applies here while it does
+  # apply to the daemon, and the host is reported hardened with
+  # passwords still accepted for alice.
+  mkdir -p "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/site"
+  printf 'Include %s/etc/ssh/sshd_config.d/*.conf\n' \
+    "${PVE_CONFIG_ROOT}" >"${PVE_CONFIG_ROOT}/etc/ssh/sshd_config"
+  printf 'Include /etc/ssh/sshd_config.d/site/*.conf\n' \
+    >"${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/10-site.conf"
+  printf 'Match User alice\n    PasswordAuthentication yes\n' \
+    >"${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/site/10-policy.conf"
+
+  local target="${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/99-hardening.conf"
+  run install_validated "${target}" 'PasswordAuthentication no
+' 0644 validate_sshd_config
+
+  [ "$status" -ne 0 ]
+  [ ! -e "${target}" ]
+  [[ "$output" == *10-policy.conf* ]]
+}
+
+@test "a nested Include reads the candidate, not the file it replaces" {
+  # The redirect has to reach the drop-ins' own Includes as well as the
+  # main file's. A nested Include naming the live sshd_config.d reads
+  # the fragment as it is on disk now, so the configuration being
+  # validated is the one being replaced rather than the one proposed.
+  mkdir -p "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d"
+  printf 'Include %s/etc/ssh/sshd_config.d/*.conf\n' \
+    "${PVE_CONFIG_ROOT}" >"${PVE_CONFIG_ROOT}/etc/ssh/sshd_config"
+  printf 'Include %s/etc/ssh/sshd_config.d/99-hardening.conf\n' \
+    "${PVE_CONFIG_ROOT}" >"${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/10-site.conf"
+  printf 'Match User alice\n    PasswordAuthentication yes\n' \
+    >"${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/99-hardening.conf"
+
+  local target="${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/99-hardening.conf"
+  run install_validated "${target}" 'PasswordAuthentication no
+' 0644 validate_sshd_config
+
+  [ "$status" -eq 0 ]
+  [[ "$(cat "${target}")" == 'PasswordAuthentication no'* ]]
+}
+
 @test "install_validated reads a mixed case Include as the Include it is" {
   # sshd matches keywords without regard to case, so this pulls the file
   # in and the Match inside it applies. A walk that only knew `Include`

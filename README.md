@@ -249,7 +249,8 @@ The driver resolves these keys on every run.
 | `PVE_NETWORK_WAIT_SECONDS` | yes | `60` | Seconds to wait for `vmbr0` to pick up an address, from 0 to 86400 |
 | `PVE_NO_SUBSCRIPTION` | yes | `yes` | Use the no-subscription repository and suppress the subscription notice |
 | `PVE_SUDO_SSH_AGENT` | yes | `yes` | Let `sudo` accept a forwarded SSH agent key |
-| `PVE_GUEST_ADMIN_SSH_ACCESS` | yes | `tailnet` | Where the administrators mirrored into a container may reach its sshd from: `tailnet` restricts it to the tunnel in the container's packet filter, `lan` admits anything that can route to it |
+| `PVE_GUEST_ADMIN_SSH_ACCESS` | yes | `lan` | Where the administrators mirrored into a container may reach its sshd from: `lan` admits anything that can route to it, `tailnet` restricts it to the tunnel in the container's packet filter |
+| `PVE_GUEST_ADMIN_ROOT_LOCK` | yes | `no` | Lock the root password of a container this toolkit mirrors the administrators into |
 | `PVE_ZULIP_ENABLED` | yes | `no` | Send boot and shutdown notices to Zulip |
 | `PVE_ZULIP_STREAM` | no | the stage falls back to `infrastructure` | Zulip stream for the notices |
 | `PVE_ZULIP_TOPIC` | no | the notifier falls back to the host FQDN | Zulip topic for the notices |
@@ -773,19 +774,27 @@ What a container ends up with:
   no`, in a drop-in the host's `sshd -t` judges against a copy of the
   container's own configuration;
 - `TERM` set for the sessions `pct enter` starts;
-- a locked root password, once the toolkit has read every one of those
-  back out of the container and found them working.
+- where `PVE_GUEST_ADMIN_ROOT_LOCK` is `yes`, a locked root password,
+  once the toolkit has read every one of those back out of the container
+  and found them working. The default is `no`: a root password that is
+  still set is one more way in that does not depend on this toolkit
+  having got the keys right, and giving that up is the operator's call.
 
-`PVE_GUEST_ADMIN_SSH_ACCESS` decides where that sshd answers. `tailnet`,
-the default, restricts it two ways: an `AllowUsers` qualified with the
+`PVE_GUEST_ADMIN_SSH_ACCESS` decides where that sshd answers. `lan`, the
+default, lets anything that can route to the container reach sshd.
+`tailnet` restricts it two ways: an `AllowUsers` qualified with the
 tailnet's address space, and a small nftables table in the container that
 drops port 22 from anywhere else. The nftables rule is the one that bounds
 exposure, because `AllowUsers` still talks to a LAN client and only then
 declines to authenticate it. sshd's own `ListenAddress` cannot do the job:
 the tailnet address does not exist until the container joins the tunnel,
-and sshd refuses to start without it. `lan` does neither and lets anything
-that can route to the container reach sshd. Moving a container from
-`tailnet` to `lan` lifts the restriction on the next run.
+and sshd refuses to start without it. Moving a container from `tailnet`
+to `lan` takes the table away again on the next run.
+
+Under `tailnet` the toolkit also refuses a container whose configuration
+puts sshd on any port other than 22, or adds a listener on one: the
+table it writes covers port 22, and a second port would be reachable
+from the LAN while every check here reported the container restricted.
 
 The toolkit also checks that `/etc/nftables.conf` and everything it
 includes still load, because one malformed file in `/etc/nftables.d`
@@ -827,14 +836,14 @@ a container's root account somebody you can distrust.
 
 The ordering carries the safety. The toolkit turns password authentication
 off only after reading every administrator's key back out of the container
-and finding one sshd would accept, and it locks the root password only
-after the hardened sshd runs, the restriction holds, and a second check
-confirms that access. A run interrupted between writing the hardening and
+and finding one sshd would accept. A configuration that turns the root
+lock on gets it only after the hardened sshd runs, the restriction holds,
+and a second check confirms that access. A run interrupted between writing the hardening and
 reloading sshd leaves a marker in the container, so the next run reloads
 the daemon rather than reading the files, finding them right, and locking
 root against a daemon still serving the old policy. Anything it cannot
-read aborts the run rather than counting as a `no`. `pct enter` from the node survives every step and
-remains the recovery path.
+read aborts the run rather than counting as a `no`. `pct enter` from the
+node survives every step and remains the recovery path.
 
 One thing this deliberately avoids: linking `/etc/pam.d/sudo-i` to
 `/etc/pam.d/sudo`. Debian ships both files and they differ -- `sudo` ends
