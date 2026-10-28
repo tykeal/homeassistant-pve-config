@@ -42,6 +42,7 @@ source "${PVE_CONFIG_LIB_DIR:?PVE_CONFIG_LIB_DIR is unset}/acme.sh"
   TAILSCALE_SYSCTL_PATH='/etc/sysctl.d/99-tailscale-forwarding.conf'
   TAILSCALE_KEYRING_PATH='/usr/share/keyrings/tailscale.gpg'
   TAILSCALE_LEGACY_KEYRING_PATH='/usr/share/keyrings/tailscale-archive-keyring.gpg'
+  TAILSCALE_LEGACY_SOURCES_PATH='/etc/apt/sources.list.d/tailscale.list'
   TAILSCALE_SOURCES_PATH='/etc/apt/sources.list.d/tailscale.sources'
   TAILSCALE_REPO_BASE='https://pkgs.tailscale.com/stable'
 }
@@ -271,9 +272,16 @@ tailscale_authkey_file_purge() {
     return 0
   fi
 
-  if (target_test "${target}" e "${TAILSCALE_AUTHKEY_PATH}"); then
-    return 1
-  fi
+  # Absence is decided inside the subshell, not from its exit status
+  # alone. target_test dies on a transport failure, and a die in there
+  # exits the subshell non-zero exactly as a "no such file" would: read
+  # the other way round, a pct that could not run would be proof that
+  # the key had gone. Only a subshell that reached its own `exit 0` has
+  # seen the file missing.
+  (
+    target_test "${target}" e "${TAILSCALE_AUTHKEY_PATH}" && exit 1
+    exit 0
+  ) || return 1
   return 0
 }
 
@@ -457,6 +465,23 @@ if ($mode eq 'field') {
         $found = 1;
     }
     exit 1 unless $found;
+} elsif ($mode eq 'cluster-ids') {
+    exit 2 unless ref $data eq 'ARRAY';
+    my $found = 0;
+    for my $item (@$data) {
+        exit 2 unless ref $item eq 'HASH';
+        exit 2 unless exists $item->{type};
+        my $type = text($item->{type});
+        next unless $type eq 'lxc' || $type eq 'qemu';
+        exit 2 unless exists $item->{vmid};
+        my $vmid = $item->{vmid};
+        exit 2 if !defined $vmid || ref $vmid;
+        exit 2 unless "$vmid" =~ /\A[0-9]+\z/;
+        my $node = exists $item->{node} ? text($item->{node}) : '';
+        emit("$vmid", $type, $node);
+        $found = 1;
+    }
+    exit 1 unless $found;
 } else {
     exit 2;
 }
@@ -618,6 +643,11 @@ tailscale_ct_tags() {
   [[ -f ${path} ]] || return 1
   _slurp body "${path}"
   while IFS= read -r line; do
+    # Everything from the first section header on is a snapshot or a
+    # pending change, not what the container is now. A tag this toolkit
+    # once set and has since removed would otherwise authorise adopting
+    # a container that no longer carries it.
+    [[ ${line} == '['*']' ]] && break
     case ${line} in
       tags:*)
         value=${line#tags:}
@@ -699,6 +729,42 @@ tailscale_cluster_tagged() {
   return "${rc}"
 }
 
+# Every guest in the cluster, one "vmid<tab>type<tab>node" per line.
+#
+#   0  at least one, on standard output
+#   1  the listing was read and holds none
+#   2  the listing could not be read
+#
+# Guest ids are unique across a Proxmox cluster and across both guest
+# types, so a virtual machine numbered 100 on any node makes container
+# 100 impossible. /etc/pve/lxc answers for neither, and the builder
+# quietly picks a different id when the one it is given is taken, which
+# leaves an untagged container behind.
+tailscale_cluster_ids() {
+  local __var=$1 out='' rc=0
+  printf -v "${__var}" '%s' ''
+
+  out=$(_tailscale_json_cmd cluster-ids -- \
+    pvesh get /cluster/resources --type vm --output-format json) || rc=$?
+  if ((rc == 0)); then
+    printf -v "${__var}" '%s' "${out}"
+  fi
+  return "${rc}"
+}
+
+# Where a guest id is in use in the cluster, as "type<tab>node", or
+# nothing when it is free.
+_tailscale_cluster_holder() {
+  local __var=$1 guests=$2 want=$3 vmid type node
+  printf -v "${__var}" '%s' ''
+  while IFS=$'\t' read -r vmid type node; do
+    [[ ${vmid} == "${want}" ]] || continue
+    printf -v "${__var}" '%s' "${type}"$'\t'"${node}"
+    return 0
+  done <<<"${guests}"
+  return 1
+}
+
 # The container id to work on, and whether it is already there.
 #
 # Nothing existing is touched without proof that this toolkit built it.
@@ -730,6 +796,12 @@ tailscale_ctid_resolve() {
     die "Unable to read 'pvesh get /cluster/resources --type vm' as JSON, so this node cannot tell whether a Tailscale subnet router already exists in this cluster. Building one anyway could advertise the same routes twice. Fix the cluster query, or set PVE_TAILSCALE_CTID to the id this router should have."
   fi
 
+  local guests='' grc=0
+  tailscale_cluster_ids guests || grc=$?
+  if ((grc == 2)); then
+    die "Unable to read 'pvesh get /cluster/resources --type vm' as JSON, so this node cannot tell which guest ids are already taken in this cluster. Fix the cluster query, or set PVE_TAILSCALE_CTID to the id this router should have."
+  fi
+
   local -a mine=()
   if ((rc == 0)); then
     while IFS=$'\t' read -r vmid node; do
@@ -751,6 +823,11 @@ tailscale_ctid_resolve() {
     if ((configured < 100 || configured > 999999999)); then
       die "PVE_TAILSCALE_CTID is '${configured}'; Proxmox container ids run from 100 to 999999999."
     fi
+    local holder=''
+    if ! tailscale_ct_exists "${configured}" &&
+      _tailscale_cluster_holder holder "${guests}" "${configured}"; then
+      die "PVE_TAILSCALE_CTID is ${configured}, which is already taken in this cluster by a ${holder%%$'\t'*} guest on node ${holder##*$'\t'}. Guest ids are unique cluster wide, so no container can be built with that id. Pick a free one."
+    fi
     if tailscale_ct_exists "${configured}" && ! tailscale_ct_is_owned "${configured}"; then
       if [[ ${adopt} != yes ]]; then
         die "Container ${configured} already exists on this node and does not carry the ${TAILSCALE_OWNER_TAG} tag, so this toolkit did not build it. Refusing to reboot it, give it /dev/net/tun, install packages in it and join it to your tailnet. Point PVE_TAILSCALE_CTID at a free id, or set PVE_TAILSCALE_ADOPT_EXISTING=yes if that container really is the subnet router."
@@ -769,7 +846,9 @@ tailscale_ctid_resolve() {
     return 0
   fi
 
-  if ! tailscale_ct_exists "${TAILSCALE_DEFAULT_CTID}"; then
+  local holder=''
+  if ! tailscale_ct_exists "${TAILSCALE_DEFAULT_CTID}" &&
+    ! _tailscale_cluster_holder holder "${guests}" "${TAILSCALE_DEFAULT_CTID}"; then
     printf -v "${__var}" '%s' "${TAILSCALE_DEFAULT_CTID}"
     return 0
   fi
@@ -778,8 +857,9 @@ tailscale_ctid_resolve() {
   nextid=${nextid//[$'\t\r\n ']/}
   [[ ${nextid} =~ ^[0-9]+$ ]] ||
     die "Container ${TAILSCALE_DEFAULT_CTID} is taken and 'pvesh get /cluster/nextid' did not answer with an id. Set PVE_TAILSCALE_CTID to the id this router should have."
-  if tailscale_ct_exists "${nextid}"; then
-    die "'pvesh get /cluster/nextid' answered with ${nextid}, which is already a container on this node. Set PVE_TAILSCALE_CTID to the id this router should have."
+  if tailscale_ct_exists "${nextid}" ||
+    _tailscale_cluster_holder holder "${guests}" "${nextid}"; then
+    die "'pvesh get /cluster/nextid' answered with ${nextid}, which is already taken in this cluster. Set PVE_TAILSCALE_CTID to the id this router should have."
   fi
   printf -v "${__var}" '%s' "${nextid}"
 }
@@ -967,11 +1047,34 @@ tailscale_diagnostics_warn() {
 # pmxcfs supports. The decision about whether the line is already there is
 # still common.sh's, so the host and the guest cannot disagree about what
 # "present" means.
+# A container configuration is the current settings followed by any
+# number of `[name]` sections holding snapshots and pending changes. Only
+# the part before the first header describes the container as it runs, so
+# that is the part this reads and writes. Appending at the end of the
+# file puts the TUN lines inside the last snapshot, where they do nothing
+# and where the presence check then finds them.
+_tailscale_conf_split() {
+  local __current=$1 __rest=$2 body=$3 line head='' tail='' seen=0
+  while IFS= read -r line; do
+    if ((seen == 0)) && [[ ${line} == '['*']' ]]; then
+      seen=1
+    fi
+    if ((seen)); then
+      tail+="${line}"$'\n'
+    else
+      head+="${line}"$'\n'
+    fi
+  done <<<"${body}"
+  printf -v "${__current}" '%s' "${head}"
+  printf -v "${__rest}" '%s' "${tail}"
+}
+
 tailscale_conf_ensure_line() {
-  local path=$1 line=$2 body=''
+  local path=$1 line=$2 body='' current='' rest=''
 
   _slurp body "${path}"
-  if _line_present_in_body "${body}" "${line}"; then
+  _tailscale_conf_split current rest "${body}"
+  if _line_present_in_body "${current}" "${line}"; then
     printf 'unchanged\n'
     return 0
   fi
@@ -988,8 +1091,15 @@ tailscale_conf_ensure_line() {
     die "Refusing to write through the symlink ${path}"
   fi
 
-  printf '%s\n' "${line}" >>"${path}" ||
-    die "Unable to add the TUN device line to ${path}"
+  if [[ -z ${rest} ]]; then
+    printf '%s\n' "${line}" >>"${path}" ||
+      die "Unable to add the TUN device line to ${path}"
+  else
+    # pmxcfs has no rename and no metadata copy, so this writes the file
+    # in place rather than installing a replacement over it.
+    printf '%s%s\n%s' "${current}" "${line}" "${rest}" >"${path}" ||
+      die "Unable to add the TUN device line to ${path}"
+  fi
   log_info "added to ${path}: ${line}"
   printf 'changed\n'
 }
@@ -1161,14 +1271,11 @@ tailscale_ct_create() {
 
   tailscale_env_scrub_build "${PVE_CONFIG_DIR:-/root/pve-config}/secrets.env"
 
-  # The engine reads its storage answers out of default.vars and puts a
-  # menu on the screen when they are missing. They go in for the length of
-  # this one invocation and come straight back out again -- including when
-  # the builder fails, since the stage's cleanup trap pops them too -- so
-  # the next unrelated community-scripts build on this host still asks its
-  # own questions.
-  tailscale_default_vars_push "${template_storage}" "${container_storage}"
-
+  # The storage answers this build reads out of default.vars are put
+  # there by the caller, not here: this runs inside the command
+  # substitution state_of uses to collect a state, so a backup taken here
+  # would belong to a subshell and the stage's cleanup trap would have
+  # nothing to put back.
   log_info "building container ${ctid} (${hostname}) with the pinned community-scripts ct/debian.sh"
   env ${_TAILSCALE_ENV_SCRUB[@]+"${_TAILSCALE_ENV_SCRUB[@]}"} \
     TERM=dumb \
@@ -1187,7 +1294,6 @@ tailscale_ct_create() {
     var_template_storage="${template_storage}" \
     var_container_storage="${container_storage}" \
     bash "${script}" || rc=$?
-  tailscale_default_vars_pop
   rm -f -- "${script}"
 
   ((rc == 0)) ||

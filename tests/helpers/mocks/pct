@@ -173,6 +173,28 @@ case ${verb} in
       exit 255
     fi
 
+    # A link that drops after the removal has gone through: the rm runs,
+    # and everything about that path afterwards fails at the transport.
+    # Modelled on the removal rather than on a call count, so it still
+    # lands on the verification step if the steps before it change.
+    if [[ -n ${PVE_CONFIG_MOCK_PCT_FAIL_AFTER_RM:-} ]]; then
+      if dir=$(mock_state_dir); then
+        marker="${dir}/pct-fail-after-rm"
+        if [[ -f ${marker} && " ${*} " == *" ${PVE_CONFIG_MOCK_PCT_FAIL_AFTER_RM} "* ]]; then
+          printf 'pct: unable to open file - No such file or directory\n' >&2
+          exit 255
+        fi
+        if [[ ${1:-} == rm ]]; then
+          for arg in "$@"; do
+            if [[ ${arg} == "${PVE_CONFIG_MOCK_PCT_FAIL_AFTER_RM}" ]]; then
+              : >"${marker}"
+              break
+            fi
+          done
+        fi
+      fi
+    fi
+
     # A removal that reports success and leaves the file there: an
     # overlay that swallows the unlink, a bind mount, a filesystem gone
     # read-only after the fact. A toolkit that believes rm's status

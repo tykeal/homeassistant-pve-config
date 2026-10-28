@@ -1229,3 +1229,133 @@ probe_rerun() {
   run test -f "$(ct_conf 100)"
   [ "$status" -ne 0 ]
 }
+
+# --- the review's findings ------------------------------------------------
+
+@test "the default id is left alone when a virtual machine already has it" {
+  export PVE_CONFIG_MOCK_CLUSTER_VMS='100:pve1'
+
+  run run_tailscale
+  [ "$status" -eq 0 ]
+  [ ! -f "$(ct_conf 100)" ]
+  [ -f "$(ct_conf 101)" ]
+}
+
+@test "a configured id another node's guest holds stops the stage" {
+  export PVE_CONFIG_MOCK_CLUSTER_VMS='105:pve2'
+  export PVE_TAILSCALE_CTID=105
+
+  run run_tailscale
+  [ "$status" -ne 0 ]
+  [[ "${output}" == *'already taken in this cluster'* ]]
+  [ ! -f "$(ct_conf 105)" ]
+}
+
+@test "a tag in a snapshot does not make a container this toolkit's" {
+  seed_ct 110 unrelated-service ''
+  printf '[before]\ntags: %s\n' "${OWNER_TAG}" >>"$(ct_conf 110)"
+  export PVE_TAILSCALE_CTID=110
+
+  run run_tailscale
+  [ "$status" -ne 0 ]
+  [[ "${output}" == *'did not build it'* ]]
+  run grep -qF 'lxc.mount.entry: /dev/net/tun' "$(ct_conf 110)"
+  [ "$status" -ne 0 ]
+}
+
+@test "the TUN lines go into the current configuration, not a snapshot" {
+  seed_ct 110
+  printf '[before]\narch: amd64\nhostname: ts-pve1\n' >>"$(ct_conf 110)"
+  export PVE_TAILSCALE_CTID=110
+
+  run run_tailscale
+  [ "$status" -eq 0 ]
+
+  local header tun
+  header=$(grep -n '^\[before\]$' "$(ct_conf 110)" | cut -d: -f1)
+  tun=$(grep -n '^lxc.mount.entry: /dev/net/tun' "$(ct_conf 110)" | cut -d: -f1)
+  [ -n "${header}" ]
+  [ -n "${tun}" ]
+  [ "${tun}" -lt "${header}" ]
+  [ "$(grep -c '^lxc.mount.entry: /dev/net/tun' "$(ct_conf 110)")" = 1 ]
+}
+
+@test "a snapshot holding the TUN lines does not count as having them" {
+  seed_ct 110
+  printf '[before]\nlxc.cgroup2.devices.allow: c 10:200 rwm\nlxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file\n' \
+    >>"$(ct_conf 110)"
+  export PVE_TAILSCALE_CTID=110
+
+  run run_tailscale
+  [ "$status" -eq 0 ]
+  [ "$(grep -c '^lxc.mount.entry: /dev/net/tun' "$(ct_conf 110)")" = 2 ]
+}
+
+@test "a pct that cannot reach the container is not a purged key" {
+  # The removal goes through and the link drops before it can be checked,
+  # which is the case where the status of `rm` alone says nothing about
+  # whether the key is still there.
+  export PVE_CONFIG_MOCK_PCT_FAIL_AFTER_RM='/etc/pve-config/tailscale.authkey'
+
+  run run_tailscale
+  [ "$status" -ne 0 ]
+  [[ "${output}" == *'after logging in'* ]]
+}
+
+@test "the one-line source the addon left behind is removed with its key" {
+  seed_ct 110
+  seed_guest_file 110 /etc/apt/sources.list.d/tailscale.list \
+    'deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/debian bookworm main'
+  export PVE_TAILSCALE_CTID=110
+
+  run run_tailscale
+  [ "$status" -eq 0 ]
+  run test -e "$(guest_file 110 /etc/apt/sources.list.d/tailscale.list)"
+  [ "$status" -ne 0 ]
+}
+
+@test "a refresh that never happened is tried again while tailscale is absent" {
+  run run_tailscale
+  [ "$status" -eq 0 ]
+
+  # The repository is configured and converged, and the package is not
+  # there: the state an interrupted first run leaves behind.
+  sed -i '/^tailscale$/d' "${PVE_CONFIG_MOCK_STATE}/guests/100/state/packages"
+  : >"${PVE_CONFIG_MOCK_LOG}"
+
+  run run_tailscale
+  [ "$status" -eq 0 ]
+  mock_calls | grep -q 'apt-get update'
+}
+
+@test "changed routes reach the daemon rather than waiting for a reboot" {
+  export PVE_TAILSCALE_ROUTES='10.1.0.0/24'
+  run run_tailscale
+  [ "$status" -eq 0 ]
+  [ "$(advertised_routes 100)" = '10.1.0.0/24' ]
+
+  export PVE_TAILSCALE_ROUTES='10.2.0.0/24'
+  : >"${PVE_CONFIG_MOCK_LOG}"
+  run run_tailscale
+  [ "$status" -eq 0 ]
+
+  grep -qF '10.2.0.0/24' "$(guest_file 100 /usr/local/bin/ts-advertise-route.sh)"
+  # The second run is already logged in, so `tailscale up` does not run
+  # again and the unit is the only thing that can carry the new routes to
+  # the daemon. RemainAfterExit means starting it is a no-op, so this
+  # asserts on the restart rather than on what systemd would then do:
+  # the mock keeps unit state but does not run ExecStart.
+  mock_calls | grep -q 'systemctl restart -- ts-advertise-route.service'
+}
+
+@test "routes that did not change leave the advertisement unit alone" {
+  export PVE_TAILSCALE_ROUTES='10.1.0.0/24'
+  run run_tailscale
+  [ "$status" -eq 0 ]
+
+  : >"${PVE_CONFIG_MOCK_LOG}"
+  run run_tailscale
+  [ "$status" -eq 0 ]
+  run grep -qF 'systemctl restart ts-advertise-route.service' <(mock_calls)
+  [ "$status" -ne 0 ]
+}

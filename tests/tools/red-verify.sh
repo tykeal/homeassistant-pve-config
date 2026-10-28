@@ -50,6 +50,12 @@
 #   this RED. A non-zero status with no failed test is a runner problem,
 #   not a result.
 #
+#   The test is run once against the code as it stands before anything
+#   is broken. A test that already fails would report RED for any
+#   replacement at all, including one that changes nothing it covers, so
+#   a failure in that first run is a broken suite rather than a caught
+#   mutation.
+#
 #   OLD must appear exactly once. Only the first occurrence would be
 #   replaced, so a snippet such as `*) return 2 ;;` that appears in two
 #   functions breaks whichever one comes first in the file and reports a
@@ -116,6 +122,99 @@ if [[ ! -f ${test_file} ]]; then
   exit 4
 fi
 
+# Runs the selected test and insists on a result it can stand behind.
+# Sets `run_failed` to 1 when a test ran and failed, 0 when it ran and
+# passed, and exits with a refusal for anything that is neither.
+run_failed=0
+inspect_run() {
+  local label=$1 out status=0 plan ok_count not_ok_count skip_count todo_count
+
+  out=$("${bats_cmd}" -f "${test_name}" "${test_file}" 2>&1) || status=$?
+
+  # bats writes its "Found no tests" error without a trailing newline, so
+  # the plan that follows lands on the same line as the error text. A
+  # whole-line plan is preferred, and the end-of-line form is the
+  # fallback, because a `1..N` in a test's own output is not the plan.
+  plan=$(grep -oE '^1\.\.[0-9]+$' <<<"${out}" | head -n 1 | cut -c4- || true)
+  if [[ -z ${plan} ]]; then
+    plan=$(grep -oE '1\.\.[0-9]+$' <<<"${out}" | head -n 1 | cut -c4- || true)
+  fi
+  ok_count=$(grep -cE '^ok [0-9]+' <<<"${out}" || true)
+  not_ok_count=$(grep -cE '^not ok [0-9]+' <<<"${out}" || true)
+  skip_count=$(grep -ciE '^ok [0-9]+.*# *skip' <<<"${out}" || true)
+  todo_count=$(grep -ciE '^not ok [0-9]+.*# *todo' <<<"${out}" || true)
+
+  if [[ -z ${plan} ]]; then
+    say ERROR "${bats_cmd} printed no TAP plan ${label}, so no test ran: ${test_name}"
+    printf '%s\n' "${out}" >&2
+    exit 4
+  fi
+
+  if ((plan == 0)) || grep -qF 'Found no tests' <<<"${out}"; then
+    say NOMATCH "no test in ${test_file} has that name: ${test_name}"
+    exit 2
+  fi
+
+  if ((plan > 1)); then
+    say AMBIGUOUS "'${test_name}' is a regex and it selects ${plan} tests in ${test_file}; any one of them failing for its own reasons would read as this mutation being caught. Name one test."
+    exit 4
+  fi
+
+  if ((ok_count + not_ok_count != plan)); then
+    say ERROR "${bats_cmd} planned ${plan} tests ${label} and reported $((ok_count + not_ok_count)), so the run did not finish: ${test_name}"
+    printf '%s\n' "${out}" >&2
+    exit 4
+  fi
+
+  if ((skip_count > 0)); then
+    say ERROR "${test_name} reported a skip, so its body never ran."
+    printf '%s\n' "${out}" >&2
+    exit 4
+  fi
+
+  if ((todo_count > 0)); then
+    say ERROR "${test_name} is marked TODO, so a failure from it says nothing."
+    printf '%s\n' "${out}" >&2
+    exit 4
+  fi
+
+  if ((not_ok_count > 0)); then
+    run_failed=1
+    return 0
+  fi
+
+  if ((status != 0)); then
+    say ERROR "${bats_cmd} exited ${status} ${label} with no failed test, so this is a runner problem: ${test_name}"
+    printf '%s\n' "${out}" >&2
+    exit 4
+  fi
+
+  run_failed=0
+}
+
+occurrences=$(perl -0ne \
+  'my $c = () = /\Q$ENV{RED_VERIFY_OLD}\E/g; print $c' \
+  -- "${source_file}")
+if ((occurrences == 0)); then
+  say NOCHANGE "that text is not in ${source_file}: ${test_name}"
+  exit 3
+fi
+if ((occurrences > 1)); then
+  say AMBIGUOUS "that text is in ${source_file} ${occurrences} times; only the first would be replaced. Give more context: ${test_name}"
+  exit 4
+fi
+
+# The baseline. A test that already fails would report RED for any
+# replacement at all, including one that changes nothing it touches, so
+# a failure here is a broken suite rather than a caught mutation. This
+# runs before the source is touched, which is also why none of the
+# refusals above or here need anything put back.
+inspect_run 'before the change'
+if ((run_failed)); then
+  say ERROR "${test_name} fails with ${source_file} as it stands, so a failure afterwards would prove nothing. Fix the test first."
+  exit 4
+fi
+
 backup=$(mktemp -- "${root}/.red-verify.XXXXXX")
 if ! cp -p -- "${source_file}" "${backup}" ||
   ! cmp -s -- "${source_file}" "${backup}"; then
@@ -159,18 +258,6 @@ trap 'restore; exit 129' HUP
 trap 'restore; exit 130' INT
 trap 'restore; exit 143' TERM
 
-occurrences=$(perl -0ne \
-  'my $c = () = /\Q$ENV{RED_VERIFY_OLD}\E/g; print $c' \
-  -- "${backup}")
-if ((occurrences == 0)); then
-  say NOCHANGE "that text is not in ${source_file}: ${test_name}"
-  exit 3
-fi
-if ((occurrences > 1)); then
-  say AMBIGUOUS "that text is in ${source_file} ${occurrences} times; only the first would be replaced. Give more context: ${test_name}"
-  exit 4
-fi
-
 perl -0pe 's/\Q$ENV{RED_VERIFY_OLD}\E/$ENV{RED_VERIFY_NEW}/' \
   -- "${backup}" >"${source_file}"
 if cmp -s -- "${backup}" "${source_file}"; then
@@ -178,64 +265,10 @@ if cmp -s -- "${backup}" "${source_file}"; then
   exit 4
 fi
 
-out=$("${bats_cmd}" -f "${test_name}" "${test_file}" 2>&1) && status=0 || status=$?
-
-# bats writes its "Found no tests" error without a trailing newline, so
-# the plan that follows lands on the same line as the error text. The
-# plan is therefore matched at end of line rather than as a whole line,
-# because matching it as a whole line finds neither.
-plan=$(grep -oE '^1\.\.[0-9]+$' <<<"${out}" | head -n 1 | cut -c4- || true)
-if [[ -z ${plan} ]]; then
-  plan=$(grep -oE '1\.\.[0-9]+$' <<<"${out}" | head -n 1 | cut -c4- || true)
-fi
-ok_count=$(grep -cE '^ok [0-9]+' <<<"${out}" || true)
-not_ok_count=$(grep -cE '^not ok [0-9]+' <<<"${out}" || true)
-skip_count=$(grep -ciE '^ok [0-9]+.*# *skip' <<<"${out}" || true)
-todo_count=$(grep -ciE '^not ok [0-9]+.*# *todo' <<<"${out}" || true)
-
-if [[ -z ${plan} ]]; then
-  say ERROR "${bats_cmd} printed no TAP plan, so no test ran: ${test_name}"
-  printf '%s\n' "${out}" >&2
-  exit 4
-fi
-
-if ((plan == 0)) || grep -qF 'Found no tests' <<<"${out}"; then
-  say NOMATCH "no test in ${test_file} has that name: ${test_name}"
-  exit 2
-fi
-
-if ((plan > 1)); then
-  say AMBIGUOUS "'${test_name}' is a regex and it selects ${plan} tests in ${test_file}; any one of them failing for its own reasons would read as this mutation being caught. Name one test."
-  exit 4
-fi
-
-if ((ok_count + not_ok_count != plan)); then
-  say ERROR "${bats_cmd} planned ${plan} tests and reported $((ok_count + not_ok_count)), so the run did not finish: ${test_name}"
-  printf '%s\n' "${out}" >&2
-  exit 4
-fi
-
-if ((skip_count > 0)); then
-  say ERROR "${test_name} reported a skip, so its body never ran."
-  printf '%s\n' "${out}" >&2
-  exit 4
-fi
-
-if ((todo_count > 0)); then
-  say ERROR "${test_name} is marked TODO, so a failure from it says nothing."
-  printf '%s\n' "${out}" >&2
-  exit 4
-fi
-
-if ((not_ok_count > 0)); then
+inspect_run 'with the change'
+if ((run_failed)); then
   say RED "${test_name}"
   exit 0
-fi
-
-if ((status != 0)); then
-  say ERROR "${bats_cmd} exited ${status} with no failed test, so this is a runner problem: ${test_name}"
-  printf '%s\n' "${out}" >&2
-  exit 4
 fi
 
 say GREEN "it passes with ${source_file} broken: ${test_name}"

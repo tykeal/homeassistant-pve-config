@@ -159,9 +159,18 @@ else
     "${container_configured}" "${container_setting}"
 
   tailscale_diagnostics_warn
+  # The builder's storage answers are set aside and put back here, in the
+  # stage's own shell, so that the cleanup trap can restore the
+  # operator's file however this run ends. state_of collects its state
+  # through a command substitution, and a subshell that is killed takes
+  # the knowledge of what to restore with it.
+  if ! dry_run_enabled; then
+    tailscale_default_vars_push "${template_storage}" "${container_storage}"
+  fi
   state_of ct_state tailscale_ct_create "${ctid}" "${hostname}" \
     "${ram}" "${cores}" "${disk}" "${PVE_BRIDGE_NAME}" \
     "${template_storage}" "${container_storage}"
+  tailscale_default_vars_pop
 fi
 if [[ ${ct_state} == changed ]]; then
   log_info "built container ${ctid} (${hostname}) with ${ram} MB and ${cores} core(s)"
@@ -235,12 +244,24 @@ sources_state=unchanged
 state_of sources_state target_write_file "${target}" "${TAILSCALE_SOURCES_PATH}" \
   "$(tailscale_sources_body "${codename}")" 0644
 
-# The addon leaves this behind and so does this stage: the deb822 source
+# The addon leaves these behind and so does this stage: the deb822 source
 # above names /usr/share/keyrings/tailscale.gpg, and a stale keyring under
-# the old name is a key apt still trusts for no reason.
+# the old name is a key apt still trusts for no reason. The one-line
+# source that went with it has to go at the same time, or apt sees the
+# same repository twice with two different Signed-By values and refuses
+# to update at all.
+legacy_state=unchanged
+state_of legacy_state target_remove_path "${target}" "${TAILSCALE_LEGACY_SOURCES_PATH}"
 target_remove_path "${target}" "${TAILSCALE_LEGACY_KEYRING_PATH}" >/dev/null
 
-if [[ ${key_state} == changed || ${sources_state} == changed ]]; then
+# A refresh that failed last run left the keyring and the sources file in
+# place, so nothing here would look changed and target_pkg_install would
+# go straight to an apt-get install with no package index behind it.
+# Tailscale still being absent is the evidence that the refresh has not
+# happened yet.
+if [[ ${key_state} == changed || ${sources_state} == changed ||
+  ${legacy_state} == changed ]] ||
+  ! target_pkg_is_installed "${target}" tailscale; then
   log_info 'refreshing the apt package lists for the Tailscale repository'
   target_apt_update "${target}"
 fi
@@ -284,8 +305,9 @@ baked_routes=''
 if [[ -n ${PVE_TAILSCALE_ROUTES:-} ]]; then
   baked_routes=${advertise_routes}
 fi
-target_write_file "${target}" "${TAILSCALE_ADVERTISE_SCRIPT}" \
-  "$(tailscale_advertise_script_body "${baked_routes}")" 0755 >/dev/null
+script_state=unchanged
+state_of script_state target_write_file "${target}" "${TAILSCALE_ADVERTISE_SCRIPT}" \
+  "$(tailscale_advertise_script_body "${baked_routes}")" 0755
 
 unit_state=unchanged
 state_of unit_state target_write_file "${target}" "${TAILSCALE_UNIT_PATH}" \
@@ -415,6 +437,15 @@ tailscale_secret_end
 # once it has run, so a converged run finds nothing to start.
 advertise_state=unchanged
 state_of advertise_state target_service_start "${target}" "${TAILSCALE_ADVERTISE_UNIT}"
+# RemainAfterExit leaves the unit active after it has run once, so
+# starting it again is a no-op and the routes it advertised last time
+# stay advertised. A changed helper or unit is a changed answer, and it
+# only reaches the daemon when the unit is made to run again.
+if [[ ${advertise_state} != changed &&
+  (${script_state} == changed || ${unit_state} == changed) ]]; then
+  target_service_restart "${target}" "${TAILSCALE_ADVERTISE_UNIT}" >/dev/null
+  advertise_state=changed
+fi
 if [[ ${advertise_state} == changed ]]; then
   log_info "advertised ${advertise_routes} from container ${ctid}"
 fi

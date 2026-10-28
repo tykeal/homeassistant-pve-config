@@ -63,6 +63,15 @@ if [[ ${1:-} == get && ${2:-} == /cluster/resources ]]; then
     printf '{"type":"lxc","vmid":%s,"node":"%s","name":"ts-remote","tags":"%s"}' \
       "${remote%%:*}" "${remote##*:}" "${PVE_CONFIG_MOCK_CLUSTER_REMOTE_TAG:-pve-config-tailscale}"
   done
+  # "vmid:node" pairs a test uses to put a virtual machine on an id, which
+  # a container can then not have: guest ids are unique across a cluster
+  # and across both guest types.
+  for vm in ${PVE_CONFIG_MOCK_CLUSTER_VMS:-}; do
+    [[ ${first} == 1 ]] || printf ','
+    first=0
+    printf '{"type":"qemu","vmid":%s,"node":"%s","name":"a-virtual-machine"}' \
+      "${vm%%:*}" "${vm##*:}"
+  done
   printf ']\n'
   exit 0
 fi

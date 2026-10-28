@@ -79,6 +79,22 @@ source_digest() {
   [ "$(source_digest)" = "${before}" ]
 }
 
+@test "a test that already fails proves nothing about the change" {
+  cat >>"${FIXTURE_TESTS}" <<'EOF'
+
+@test "a check that was already broken" {
+  run answer
+  [ "${output}" = 41 ]
+}
+EOF
+
+  run_tool "${FIXTURE_SOURCE}" "${FIXTURE_TESTS}" \
+    'a check that was already broken' "printf '42" "printf '43"
+  [ "$status" -eq 4 ]
+  [[ "${output}" == ERROR* ]]
+  [[ "${output}" == *'as it stands'* ]]
+}
+
 @test "a test that skips its body decides nothing" {
   run_tool "${FIXTURE_SOURCE}" "${FIXTURE_TESTS}" \
     'a check nobody runs today' "printf '42" "printf '43"
