@@ -457,3 +457,126 @@ resolve_names() {
   [ -z "${PVE_TAILSCALE_TEMPLATE_STORAGE:-}" ]
   [ "${PVE_TAILSCALE_ADOPT_EXISTING}" = 'no' ]
 }
+
+# --- Home Assistant OS ----------------------------------------------------
+
+@test "the HAOS hostname is held to the shape qm create takes" {
+  local value
+  for value in 'HAOS' 'haos.example.net' 'haos_1' '-haos' 'haos-' \
+    'haos; rm -rf /' ''; do
+    run _schema_validate_PVE_HAOS_HOSTNAME "${value}"
+    [ "$status" -ne 0 ] || {
+      printf 'accepted %s\n' "${value}" >&2
+      return 1
+    }
+  done
+  run _schema_validate_PVE_HAOS_HOSTNAME 'haos'
+  [ "$status" -eq 0 ]
+  run _schema_validate_PVE_HAOS_HOSTNAME 'haos-1'
+  [ "$status" -eq 0 ]
+}
+
+@test "the HAOS guest id is held to the range Proxmox allocates in" {
+  local value
+  for value in '99' 'two hundred' '200;id' '-1' '1000000000' ''; do
+    run _schema_validate_PVE_HAOS_VMID "${value}"
+    [ "$status" -ne 0 ] || {
+      printf 'accepted %s\n' "${value}" >&2
+      return 1
+    }
+  done
+  run _schema_validate_PVE_HAOS_VMID 200
+  [ "$status" -eq 0 ]
+}
+
+@test "HAOS adoption is refused unless a machine is named" {
+  export PVE_HAOS_VMID=200
+  local value
+  for value in 'true' 'Yes' '1' ''; do
+    run _schema_validate_PVE_HAOS_ADOPT_EXISTING "${value}"
+    [ "$status" -ne 0 ] || {
+      printf 'accepted %s\n' "${value}" >&2
+      return 1
+    }
+  done
+  run _schema_validate_PVE_HAOS_ADOPT_EXISTING no
+  [ "$status" -eq 0 ]
+  run _schema_validate_PVE_HAOS_ADOPT_EXISTING yes
+  [ "$status" -eq 0 ]
+
+  # Without an id, adoption would take over whatever sits at the default.
+  unset PVE_HAOS_VMID
+  run _schema_validate_PVE_HAOS_ADOPT_EXISTING yes
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'PVE_HAOS_VMID'* ]]
+}
+
+@test "a HAOS disk smaller than the published image is refused" {
+  local value
+  for value in '16' '31' '0' 'thirty-two' '32G' ''; do
+    run _schema_validate_PVE_HAOS_DISK_GB "${value}"
+    [ "$status" -ne 0 ] || {
+      printf 'accepted %s\n' "${value}" >&2
+      return 1
+    }
+  done
+  run _schema_validate_PVE_HAOS_DISK_GB 32
+  [ "$status" -eq 0 ]
+  run _schema_validate_PVE_HAOS_DISK_GB 64
+  [ "$status" -eq 0 ]
+}
+
+@test "HAOS numbers too long for bash arithmetic are refused as text" {
+  # Digits alone are not enough: `(( ))` wraps at 64 bits, so 2**64 + 148
+  # compares as 148 -- inside the guest id range -- and 2**64 compares as
+  # 0, which is under every floor these keys have. Both are rejected on
+  # their length, before any arithmetic sees them.
+  local key value
+  for key in PVE_HAOS_VMID PVE_HAOS_RAM_MB PVE_HAOS_CORES PVE_HAOS_DISK_GB; do
+    for value in '18446744073709551764' '18446744073709551616' '1000000000'; do
+      run "_schema_validate_${key}" "${value}"
+      [ "$status" -ne 0 ] || {
+        printf '%s accepted %s\n' "${key}" "${value}" >&2
+        return 1
+      }
+    done
+  done
+}
+
+@test "the HAOS release and image digest are held to their published shapes" {
+  local value
+  for value in 'stable' 'latest' '18.4; rm -rf /' ''; do
+    run _schema_validate_PVE_HAOS_VERSION "${value}"
+    [ "$status" -ne 0 ] || {
+      printf 'accepted %s\n' "${value}" >&2
+      return 1
+    }
+  done
+  run _schema_validate_PVE_HAOS_VERSION '18.4'
+  [ "$status" -eq 0 ]
+  run _schema_validate_PVE_HAOS_VERSION '19.0.rc1'
+  [ "$status" -eq 0 ]
+
+  for value in 'deadbeef' "$(printf '%064s' x)" ''; do
+    run _schema_validate_PVE_HAOS_IMAGE_SHA256 "${value}"
+    [ "$status" -ne 0 ] || {
+      printf 'accepted %s\n' "${value}" >&2
+      return 1
+    }
+  done
+  run _schema_validate_PVE_HAOS_IMAGE_SHA256 \
+    '756ec485b1b153099ca53e88a5eebd63a801d56b791afe5c6d63ef94a35dc02d'
+  [ "$status" -eq 0 ]
+}
+
+@test "schema_resolve leaves the optional HAOS keys unset and unprompted" {
+  export PVE_HOSTNAME='pve1' PVE_DOMAIN='example.test'
+  resolve_names
+  [ -z "${PVE_HAOS_VMID:-}" ]
+  [ -z "${PVE_HAOS_STORAGE:-}" ]
+  [ -z "${PVE_HAOS_VERSION:-}" ]
+  [ -z "${PVE_HAOS_IMAGE_SHA256:-}" ]
+  [ "${PVE_HAOS_ENABLED}" = 'no' ]
+  [ "${PVE_HAOS_HOSTNAME}" = 'haos' ]
+  [ "${PVE_HAOS_ADOPT_EXISTING}" = 'no' ]
+}

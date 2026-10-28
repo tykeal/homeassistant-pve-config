@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Andrew Grimberg <tykeal@bardicgrove.org>
+# SPDX-License-Identifier: Apache-2.0
+
+# The processor count, which a test can set.
+#
+# Resource scaling derives cores from this, and a suite that could only
+# ever see the runner's own core count would test one point of the curve
+# and never the floor or the ceiling. Unset, it answers with the real
+# number, so every other test sees what it always saw.
+# shellcheck source=tests/helpers/mocks/_record
+source "$(dirname -- "$0")/_record"
+
+# nproc takes two switches and no operands. Anything else is a mistake
+# the real one would report rather than answer, mocked or not.
+for arg in "$@"; do
+  case ${arg} in
+    --all | --ignore=*) ;;
+    *)
+      printf "nproc: invalid option -- '%s'\n" "${arg}" >&2
+      printf "Try 'nproc --help' for more information.\n" >&2
+      exit 1
+      ;;
+  esac
+done
+
+if [[ -n ${PVE_CONFIG_MOCK_NPROC:-} ]]; then
+  printf '%s\n' "${PVE_CONFIG_MOCK_NPROC}"
+  exit 0
+fi
+
+real=''
+for candidate in /usr/bin/nproc /bin/nproc; do
+  if [[ -x ${candidate} ]]; then
+    real=${candidate}
+    break
+  fi
+done
+
+if [[ -n ${real} ]]; then
+  exec "${real}" "$@"
+fi
+
+grep -c '^processor' /proc/cpuinfo

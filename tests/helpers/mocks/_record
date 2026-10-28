@@ -10,8 +10,38 @@ printf '%s %s\n' "$(basename -- "$0")" "$*" >>"${PVE_CONFIG_MOCK_LOG:-/dev/null}
 # credential reached no child of a stage whatever command that child was.
 # It goes beside the call log rather than in the state directory, which is
 # fingerprinted for convergence.
+#
+# Each block carries the name of the command it belongs to, because the
+# commands a stage runs do not all get the same environment: a local
+# administrative tool runs with the stage's own, and anything reaching the
+# network runs with an explicit allowlist and nothing else.
 if [[ -n ${PVE_CONFIG_MOCK_ENV_LOG:-} ]]; then
-  env >>"${PVE_CONFIG_MOCK_ENV_LOG}"
+  {
+    printf '#mock %s\n' "$(basename -- "$0")"
+    env
+  } >>"${PVE_CONFIG_MOCK_ENV_LOG}"
+fi
+
+# Replaces a file the moment a named command runs.
+#
+# The hazard a stage that verifies a download has to be held to is the
+# one where the bytes change between the check and the use. Nothing a
+# test can do from the outside lands in that window reliably, so the
+# swap is hung off a command the stage runs inside it.
+#
+#   PVE_CONFIG_MOCK_SWAP_ON       the mock that triggers it
+#   PVE_CONFIG_MOCK_SWAP_FILE     the file to overwrite
+#   PVE_CONFIG_MOCK_SWAP_SOURCE   the bytes to put there
+if [[ -n ${PVE_CONFIG_MOCK_SWAP_ON:-} &&
+  $(basename -- "$0") == "${PVE_CONFIG_MOCK_SWAP_ON}" &&
+  -n ${PVE_CONFIG_MOCK_SWAP_FILE:-} &&
+  -n ${PVE_CONFIG_MOCK_SWAP_SOURCE:-} &&
+  -f ${PVE_CONFIG_MOCK_SWAP_SOURCE} ]]; then
+  # A replacement rather than a rewrite, which is how a file under
+  # another process's control actually changes: the name comes to point
+  # at a different object and whoever holds the old one still has it.
+  cat -- "${PVE_CONFIG_MOCK_SWAP_SOURCE}" >"${PVE_CONFIG_MOCK_SWAP_FILE}.swap"
+  mv -f -- "${PVE_CONFIG_MOCK_SWAP_FILE}.swap" "${PVE_CONFIG_MOCK_SWAP_FILE}"
 fi
 
 mock_state_dir() {

@@ -53,6 +53,8 @@ MOCK_READ_ONLY_PATTERNS=(
   '^mountpoint -q .*'
   '^ssh-keygen -l -f /dev/stdin$'
   '^pct (list|status [0-9]+)$'
+  '^qm (list|status [0-9]+|config [0-9]+)$'
+  '^nproc$'
   '^pct pull [0-9]+ /[^ ]+ [^ ]+$'
   '^pvesh get /cluster/nextid$'
   '^pvesh get /cluster/resources( |$).*'
