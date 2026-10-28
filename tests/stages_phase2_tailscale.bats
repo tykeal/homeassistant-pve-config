@@ -1356,6 +1356,20 @@ probe_rerun() {
   : >"${PVE_CONFIG_MOCK_LOG}"
   run run_tailscale
   [ "$status" -eq 0 ]
-  run grep -qF 'systemctl restart ts-advertise-route.service' <(mock_calls)
+  run grep -qF 'systemctl restart -- ts-advertise-route.service' <(mock_calls)
   [ "$status" -ne 0 ]
+}
+
+@test "an interrupted push leaves no auth key staged on the host" {
+  # The key spends an instant in a 0600 file on the host on its way into
+  # the container. A signal arriving during `pct push` ends the run
+  # before the removal that follows it, so the cleanup trap has to take
+  # that copy as well as the guest's.
+  export PVE_CONFIG_MOCK_PCT_SIGNAL_ON_PUSH='/etc/pve-config/tailscale.authkey'
+  run run_tailscale
+  [ "$status" -ne 0 ]
+
+  run find "${BATS_TEST_TMPDIR}" -maxdepth 1 -name 'pve-config-target.*'
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
 }

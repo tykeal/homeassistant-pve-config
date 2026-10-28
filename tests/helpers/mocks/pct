@@ -264,6 +264,32 @@ case ${verb} in
     root=$(guest_root) || exit 1
     src=${3:-}
     dest=${4:-}
+    # A run that is interrupted while the file is on its way in. The
+    # signal goes to the stage rather than to this subshell, because the
+    # removal that follows the push belongs to the stage's shell and a
+    # signal delivered anywhere else would still let it run.
+    if [[ -n ${PVE_CONFIG_MOCK_PCT_SIGNAL_ON_PUSH:-} &&
+      ${dest} == "${PVE_CONFIG_MOCK_PCT_SIGNAL_ON_PUSH}" ]]; then
+      #
+      # The outermost ancestor that matches is the one to signal. A
+      # command substitution forks a subshell whose cmdline is the same
+      # script, and that subshell does not run the stage's traps: the
+      # nearest match would be killed without the cleanup ever running,
+      # which is the opposite of what this is here to exercise.
+      signal_pid=$$
+      signal_found=''
+      while [[ ${signal_pid} -gt 1 ]]; do
+        if [[ -r /proc/${signal_pid}/cmdline ]] &&
+          grep -qa "${PVE_CONFIG_MOCK_PCT_SIGNAL_TARGET:-20-tailscale.sh}" \
+            "/proc/${signal_pid}/cmdline"; then
+          signal_found=${signal_pid}
+        fi
+        signal_pid=$(awk '{print $4}' "/proc/${signal_pid}/stat" 2>/dev/null) || break
+        [[ -n ${signal_pid} ]] || break
+      done
+      [[ -n ${signal_found} ]] && kill -s TERM "${signal_found}"
+      exit 0
+    fi
     perms=''
     while [[ $# -gt 0 ]]; do
       if [[ $1 == --perms ]]; then

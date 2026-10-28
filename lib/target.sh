@@ -335,17 +335,58 @@ target_test() {
   target_probe "${target}" test "-${flag}" "${path}"
 }
 
+# Every scratch file this shell has made and not yet released.
+#
+# A signal arriving in the middle of `pct push` ends the run before the
+# removal that follows it, which would leave whatever was being written
+# -- an auth key, a password -- readable on the host's own disk. A caller
+# that arms a cleanup trap can call target_scratch_purge from it and have
+# those files taken with everything else.
+_TARGET_SCRATCH_FILES=()
+
 # A private file that exists only long enough to cross the pct boundary.
 # mktemp creates at 0600, which keeps a key or a password private for the
 # instant it is on the host's disk.
+# The path is returned through a named variable rather than on stdout,
+# because a command substitution would record the file in a subshell's
+# copy of the list and the caller's trap would never hear of it.
 _target_scratch_file() {
-  local tmp
-  tmp=$(mktemp "${TMPDIR:-/tmp}/pve-config-target.XXXXXX") || return 1
-  chmod 0600 -- "${tmp}" || {
-    rm -f -- "${tmp}"
+  # The locals are spelt unusually because a name a caller also uses
+  # would be shadowed here and the caller would be handed back its own
+  # unset variable.
+  local __scratch_var=$1 __scratch_tmp
+  __scratch_tmp=$(mktemp "${TMPDIR:-/tmp}/pve-config-target.XXXXXX") || return 1
+  chmod 0600 -- "${__scratch_tmp}" || {
+    rm -f -- "${__scratch_tmp}"
     return 1
   }
-  printf '%s\n' "${tmp}"
+  _TARGET_SCRATCH_FILES+=("${__scratch_tmp}")
+  printf -v "${__scratch_var}" '%s' "${__scratch_tmp}"
+}
+
+# Removes one scratch file and forgets it.
+_target_scratch_release() {
+  local file=$1 kept=() entry
+  rm -f -- "${file}"
+  for entry in ${_TARGET_SCRATCH_FILES[@]+"${_TARGET_SCRATCH_FILES[@]}"}; do
+    [[ ${entry} == "${file}" ]] && continue
+    kept+=("${entry}")
+  done
+  _TARGET_SCRATCH_FILES=(${kept[@]+"${kept[@]}"})
+}
+
+# Removes anything left staged on the host, for a trap to call.
+#
+#   0  nothing is left
+#   1  a file could not be removed and may still hold a secret
+target_scratch_purge() {
+  local entry rc=0
+  for entry in ${_TARGET_SCRATCH_FILES[@]+"${_TARGET_SCRATCH_FILES[@]}"}; do
+    rm -f -- "${entry}"
+    [[ -e ${entry} ]] && rc=1
+  done
+  _TARGET_SCRATCH_FILES=()
+  return "${rc}"
 }
 
 # True when a file holds nothing a bash variable cannot carry.
@@ -388,21 +429,21 @@ target_slurp() {
 
   local __vmid __tmp __out __status=0
   __vmid=$(target_vmid "${__target}")
-  __tmp=$(_target_scratch_file) ||
+  _target_scratch_file __tmp ||
     die "Unable to create a temporary file to read ${__path} from $(target_describe "${__target}")"
   log_info "reading ${__path} from $(target_describe "${__target}")"
   __out=$(pct pull "${__vmid}" "${__path}" "${__tmp}" 2>&1) || __status=$?
   if [[ ${__status} -ne 0 ]]; then
-    rm -f -- "${__tmp}"
+    _target_scratch_release "${__tmp}"
     [[ -n ${__out} ]] && log_error "${__out}"
     die "pct could not read ${__path} from $(target_describe "${__target}")"
   fi
   if ! _target_file_has_no_nul "${__tmp}"; then
-    rm -f -- "${__tmp}"
+    _target_scratch_release "${__tmp}"
     die "Refusing to read ${__path} from $(target_describe "${__target}"): it contains a NUL byte"
   fi
   _slurp "${__var}" "${__tmp}"
-  rm -f -- "${__tmp}"
+  _target_scratch_release "${__tmp}"
 }
 
 # True for a mode that is safe to hand to `$((8#...))`.
@@ -482,15 +523,15 @@ _guest_push() {
   target_run "${target}" mkdir -p -- "${dir}" ||
     die "Unable to create ${dir} on $(target_describe "${target}")"
 
-  tmp=$(_target_scratch_file) ||
+  _target_scratch_file tmp ||
     die "Unable to create a temporary file for ${path}"
   if ! printf '%s' "${content}" >"${tmp}"; then
-    rm -f -- "${tmp}"
+    _target_scratch_release "${tmp}"
     die "Unable to stage ${path} for $(target_describe "${target}")"
   fi
 
   out=$(pct push "${vmid}" "${tmp}" "${path}" --perms "${perms}" 2>&1) || status=$?
-  rm -f -- "${tmp}"
+  _target_scratch_release "${tmp}"
   if [[ ${status} -ne 0 ]]; then
     [[ -n ${out} ]] && log_error "${out}"
     die "pct could not write ${path} into $(target_describe "${target}")"

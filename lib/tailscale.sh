@@ -305,6 +305,13 @@ tailscale_cleanup() {
 
   tailscale_default_vars_pop
 
+  # The key spends an instant in a 0600 file on the host on its way into
+  # the container, and a signal during `pct push` ends the run before
+  # that file is removed. The guest copy is not the only copy.
+  if ! target_scratch_purge; then
+    log_error "A staging file in ${TMPDIR:-/tmp} could not be removed and may hold the Tailscale auth key. Delete any pve-config-target.* file there, and revoke the key in the Tailscale admin console under Settings, Keys."
+  fi
+
   [[ -n ${target} ]] || return 0
   if ! tailscale_authkey_file_purge "${target}"; then
     log_error "Unable to remove ${TAILSCALE_AUTHKEY_PATH} from $(target_describe "${target}"). An auth key is still on disk in that container: delete that file, and revoke the key in the Tailscale admin console under Settings, Keys."
