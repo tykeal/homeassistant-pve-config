@@ -21,7 +21,7 @@ stage_require PVE_HAOS_HOSTNAME
 # The cluster listing is read with a JSON decoder, and that reading has a
 # third answer: "I could not tell". Saying here, once, that the decoder is
 # missing beats the same answer arriving later as a refusal to build.
-acme_require_json_decoder
+json_require_decoder
 
 hostname=${PVE_HAOS_HOSTNAME}
 haos_hostname_valid "${hostname}" ||

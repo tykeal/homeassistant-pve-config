@@ -45,12 +45,13 @@
 # different integrity properties and whose work this toolkit has no wish
 # to reproduce.
 
-# The JSON machinery lives in lib/acme.sh: the decoder preflight and the
-# pipeline that hands a command's output to perl without it ever passing
-# through a shell variable. The program below is this library's own, for
-# the reasons set out above _HAOS_JSON_PROGRAM.
-# shellcheck source=lib/acme.sh
-source "${PVE_CONFIG_LIB_DIR:?PVE_CONFIG_LIB_DIR is unset}/acme.sh"
+# The JSON machinery lives in lib/json.sh: the hardened decoder core, the
+# decoder preflight, and the pipeline that hands a command's output to
+# perl without it ever passing through a shell variable. The modes below
+# are this library's own, for the reasons set out above
+# _HAOS_JSON_MODES.
+# shellcheck source=lib/json.sh
+source "${PVE_CONFIG_LIB_DIR:?PVE_CONFIG_LIB_DIR is unset}/json.sh"
 
 # The tag that says this toolkit built a machine.
 #
@@ -139,13 +140,14 @@ _haos_is_number() {
 
 # --- reading what the node and the network say ----------------------------
 #
-# A second decoder, rather than another mode bolted onto the one in
-# lib/acme.sh, for the reason set out above _TAILSCALE_JSON_PROGRAM: the
-# ACME secret path depends on that program, and widening it for a stage
-# that does not share its threat model is how a decoder grows a hole.
-# Shared with the Tailscale library in shape and not in code, because the
-# two read different documents: this one walks the cluster listing for
-# virtual machines rather than containers.
+# The cluster listing this library reads is decoded by the shared
+# hardened core in lib/json.sh, over the same walk lib/tailscale.sh uses:
+# the two read the same document and differ only in which guest type they
+# are looking for, which is a parameter rather than a second copy of the
+# walk. What is not shared is the dispatch, so the program here
+# understands these two modes and nothing else -- widening a decoder for
+# a stage that does not share its threat model is how a decoder grows a
+# hole, and that is as true of this one as of the ACME secret path's.
 #
 # The program is a constant. The document arrives on standard input and
 # the parameters arrive in @ARGV, so nothing a node said is ever
@@ -155,128 +157,24 @@ _haos_is_number() {
 #   1  the document was read and does not have it
 #   2  anything else, including a document that will not decode, a field
 #      of the wrong shape, a duplicated field, and a perl that is absent
-read -r -d '' _HAOS_JSON_PROGRAM <<'PERL' || true
-use strict;
-use warnings;
-use JSON::PP ();
-
-my $mode = shift @ARGV;
-exit 2 unless defined $mode;
-
-binmode STDIN, ':raw';
-binmode STDOUT, ':utf8';
-my $raw = do { local $/; <STDIN> };
-exit 2 unless defined $raw && length $raw;
-exit 2 unless utf8::decode($raw);
-exit 2 unless $raw =~ /\S/;
-
-my $data = eval { JSON::PP->new->decode($raw) };
-exit 2 if $@ or !defined $data;
-
-my $probe = JSON::PP->new->allow_nonref;
-
-sub text {
-    my ($value) = @_;
-    exit 2 unless defined $value;
-    exit 2 if ref $value;
-    exit 2 unless $probe->encode($value) =~ /\A"/;
-    return $value;
-}
-
-sub emit {
-    my (@parts) = @_;
-    for my $part (@parts) {
-        exit 2 if $part =~ /[\x00-\x1f\x7f]/;
-    }
-    print join("\t", @parts), "\n";
-}
-
+read -r -d '' _HAOS_JSON_MODES <<'PERL' || true
 if ($mode eq 'tagged-vms') {
-    my $tag = shift @ARGV;
-    exit 2 unless defined $tag && length $tag;
-    exit 2 unless ref $data eq 'ARRAY';
-    my $found = 0;
-    for my $item (@$data) {
-        exit 2 unless ref $item eq 'HASH';
-        # A listing entry with no type is a listing this code cannot
-        # answer from, including about the machines it does describe.
-        exit 2 unless exists $item->{type};
-        next unless text($item->{type}) eq 'qemu';
-        exit 2 unless exists $item->{vmid};
-        my $vmid = $item->{vmid};
-        exit 2 if !defined $vmid || ref $vmid;
-        exit 2 unless "$vmid" =~ /\A[0-9]+\z/;
-        # tags is absent on an untagged guest, which is a guest that is
-        # certainly not this toolkit's.
-        next unless exists $item->{tags};
-        my @tags = split /[;, ]+/, text($item->{tags});
-        next unless grep { $_ eq $tag } @tags;
-        my $node = exists $item->{node} ? text($item->{node}) : '';
-        emit("$vmid", $node);
-        $found = 1;
-    }
-    exit 1 unless $found;
+    tagged_guests($data, 'qemu', shift @ARGV);
 } elsif ($mode eq 'cluster-ids') {
-    exit 2 unless ref $data eq 'ARRAY';
-    my $found = 0;
-    for my $item (@$data) {
-        exit 2 unless ref $item eq 'HASH';
-        exit 2 unless exists $item->{type};
-        my $type = text($item->{type});
-        next unless $type eq 'lxc' || $type eq 'qemu';
-        exit 2 unless exists $item->{vmid};
-        my $vmid = $item->{vmid};
-        exit 2 if !defined $vmid || ref $vmid;
-        exit 2 unless "$vmid" =~ /\A[0-9]+\z/;
-        my $node = exists $item->{node} ? text($item->{node}) : '';
-        emit("$vmid", $type, $node);
-        $found = 1;
-    }
-    exit 1 unless $found;
+    cluster_ids($data);
 } else {
     exit 2;
 }
 exit 0;
 PERL
+_HAOS_JSON_PROGRAM=$(_json_program "${_JSON_DECODER_GUESTS}" "${_HAOS_JSON_MODES}")
 
-# Runs a command and decodes what it printed, as _acme_json_cmd does and
-# for the same reasons: the document goes down a pipe rather than through
-# a shell variable, and the decoder's parameters are never the command's.
+# Runs a command and decodes what it printed with the program above,
+# through the shared pipeline: the document goes down a pipe rather than
+# through a shell variable, and the decoder's parameters are never the
+# command's.
 _haos_json_cmd() {
-  local arg seen=0
-  local -a params=() cmd=()
-  for arg in "$@"; do
-    if ((seen)); then
-      cmd+=("${arg}")
-    elif [[ ${arg} == '--' ]]; then
-      seen=1
-    else
-      params+=("${arg}")
-    fi
-  done
-  ((seen)) || return 2
-  ((${#cmd[@]} > 0)) || return 2
-
-  local captured states source_status decode_status
-  captured=$(
-    set +e
-    "${cmd[@]}" 2>/dev/null |
-      perl -e "${_HAOS_JSON_PROGRAM}" -- ${params[@]+"${params[@]}"} 2>/dev/null
-    printf '\n%s' "${PIPESTATUS[*]}"
-  )
-  states=${captured##*$'\n'}
-  captured=${captured%$'\n'*}
-  source_status=${states%% *}
-  decode_status=${states##* }
-  [[ ${source_status} == 0 ]] || return 2
-  while [[ ${captured} == *$'\n' ]]; do
-    captured=${captured%$'\n'}
-  done
-  case ${decode_status} in
-    0) printf '%s' "${captured}" ;;
-    1) return 1 ;;
-    *) return 2 ;;
-  esac
+  _json_decode_cmd "${_HAOS_JSON_PROGRAM}" "$@"
 }
 
 # --- naming ---------------------------------------------------------------

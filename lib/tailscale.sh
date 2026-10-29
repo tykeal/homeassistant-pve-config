@@ -21,13 +21,14 @@
 # `tailscale up` is told the path, which is what --auth-key=file: exists
 # for. The file is removed again as soon as the login has been made.
 
-# The JSON machinery lives in lib/acme.sh: the decoder preflight and the
-# pipeline that hands a command's output to perl without it ever passing
-# through a shell variable. Reusing it is deliberate -- a second
-# hand-rolled reader of a JSON document is how the ACME stage grew the
-# fail-open bug that took three review rounds to remove.
-# shellcheck source=lib/acme.sh
-source "${PVE_CONFIG_LIB_DIR:?PVE_CONFIG_LIB_DIR is unset}/acme.sh"
+# The JSON machinery lives in lib/json.sh: the hardened decoder core, the
+# decoder preflight, and the pipeline that hands a command's output to
+# perl without it ever passing through a shell variable. Reusing it is
+# deliberate -- a second hand-rolled reader of a JSON document is how the
+# ACME stage grew the fail-open bug that took three review rounds to
+# remove.
+# shellcheck source=lib/json.sh
+source "${PVE_CONFIG_LIB_DIR:?PVE_CONFIG_LIB_DIR is unset}/json.sh"
 
 # Where the pieces live inside the container. Several of these are read
 # only by stages/phase2/20-tailscale.sh, which shellcheck cannot see from
@@ -320,24 +321,20 @@ tailscale_cleanup() {
 
 # --- reading what the node and the daemon report -------------------------
 
-# A decoder for the two JSON documents this stage reads.
+# The two JSON documents this stage reads, decoded by the shared hardened
+# core in lib/json.sh.
 #
-# There are deliberately two JSON programs in this toolkit, this one and
-# _ACME_JSON_PROGRAM in lib/acme.sh. Do not merge them. This one exists
-# for two things acme's cannot express and that the ACME stage never
-# needed: refusing a document in which the field appears more than once
-# (JSON::PP silently keeps the last of a repeated key and offers no
-# allow_dupkeys, so that needs a lexer), and walking the cluster resource
-# listing, which is an array of objects rather than a flat field read.
-# Bending acme's program to cover both would mean editing the decoder
-# that the ACME secret path depends on, for the benefit of a stage that
-# does not share its threat model.
+# What this path needs and the others do not is refusing a document in
+# which the field appears more than once: JSON::PP silently keeps the
+# last of a repeated key and offers no allow_dupkeys, so that needs a
+# lexer. It is declared here, with the one mode that asks for it, rather
+# than in the core every decoder runs -- including the one the ACME
+# secret path depends on, which never needed it.
 #
-# What is reused rather than rewritten is the surrounding machinery:
-# acme_require_json_decoder preflights perl for both, and
-# _tailscale_json_cmd below is _acme_json_cmd's pipeline, which hands a
-# command's standard output to perl without it passing through a shell
-# variable.
+# What is shared is the byte handling and the shape checking, which were
+# identical in all three copies and are the security-relevant part, plus
+# the walk over the cluster resource listing, which lib/haos.sh does over
+# the same document for the other guest type.
 #
 # The program is a constant. The document arrives on standard input and
 # the parameters arrive in @ARGV, so nothing a node or a tailnet said is
@@ -347,42 +344,7 @@ tailscale_cleanup() {
 #   1  the document was read and does not have it
 #   2  anything else, including a document that will not decode, a field
 #      of the wrong shape, a duplicated field, and a perl that is absent
-read -r -d '' _TAILSCALE_JSON_PROGRAM <<'PERL' || true
-use strict;
-use warnings;
-use JSON::PP ();
-
-my $mode = shift @ARGV;
-exit 2 unless defined $mode;
-
-binmode STDIN, ':raw';
-binmode STDOUT, ':utf8';
-my $raw = do { local $/; <STDIN> };
-exit 2 unless defined $raw && length $raw;
-exit 2 unless utf8::decode($raw);
-exit 2 unless $raw =~ /\S/;
-
-my $data = eval { JSON::PP->new->decode($raw) };
-exit 2 if $@ or !defined $data;
-
-my $probe = JSON::PP->new->allow_nonref;
-
-sub text {
-    my ($value) = @_;
-    exit 2 unless defined $value;
-    exit 2 if ref $value;
-    exit 2 unless $probe->encode($value) =~ /\A"/;
-    return $value;
-}
-
-sub emit {
-    my (@parts) = @_;
-    for my $part (@parts) {
-        exit 2 if $part =~ /[\x00-\x1f\x7f]/;
-    }
-    print join("\t", @parts), "\n";
-}
-
+read -r -d '' _TAILSCALE_JSON_MODES <<'PERL' || true
 # How many times a name is used as a key of the outermost object.
 #
 # JSON::PP keeps the last of a repeated key and says nothing, so a
@@ -448,91 +410,24 @@ if ($mode eq 'field') {
     exit 1 unless exists $data->{$key};
     emit(text($data->{$key}));
 } elsif ($mode eq 'tagged-cts') {
-    my $tag = shift @ARGV;
-    exit 2 unless defined $tag && length $tag;
-    exit 2 unless ref $data eq 'ARRAY';
-    my $found = 0;
-    for my $item (@$data) {
-        exit 2 unless ref $item eq 'HASH';
-        # A listing entry with no type is a listing this code cannot
-        # answer from, including about the containers it does describe.
-        exit 2 unless exists $item->{type};
-        next unless text($item->{type}) eq 'lxc';
-        exit 2 unless exists $item->{vmid};
-        my $vmid = $item->{vmid};
-        exit 2 if !defined $vmid || ref $vmid;
-        exit 2 unless "$vmid" =~ /\A[0-9]+\z/;
-        # tags is absent on an untagged guest, which is a guest that is
-        # certainly not this toolkit's.
-        next unless exists $item->{tags};
-        my @tags = split /[;, ]+/, text($item->{tags});
-        next unless grep { $_ eq $tag } @tags;
-        my $node = exists $item->{node} ? text($item->{node}) : '';
-        emit("$vmid", $node);
-        $found = 1;
-    }
-    exit 1 unless $found;
+    tagged_guests($data, 'lxc', shift @ARGV);
 } elsif ($mode eq 'cluster-ids') {
-    exit 2 unless ref $data eq 'ARRAY';
-    my $found = 0;
-    for my $item (@$data) {
-        exit 2 unless ref $item eq 'HASH';
-        exit 2 unless exists $item->{type};
-        my $type = text($item->{type});
-        next unless $type eq 'lxc' || $type eq 'qemu';
-        exit 2 unless exists $item->{vmid};
-        my $vmid = $item->{vmid};
-        exit 2 if !defined $vmid || ref $vmid;
-        exit 2 unless "$vmid" =~ /\A[0-9]+\z/;
-        my $node = exists $item->{node} ? text($item->{node}) : '';
-        emit("$vmid", $type, $node);
-        $found = 1;
-    }
-    exit 1 unless $found;
+    cluster_ids($data);
 } else {
     exit 2;
 }
 exit 0;
 PERL
+_TAILSCALE_JSON_PROGRAM=$(
+  _json_program "${_JSON_DECODER_GUESTS}" "${_TAILSCALE_JSON_MODES}"
+)
 
-# Runs a command and decodes what it printed, as _acme_json_cmd does and
-# for the same reasons: the document goes down a pipe rather than through
-# a shell variable, and the decoder's parameters are never the command's.
+# Runs a command and decodes what it printed with the program above,
+# through the shared pipeline: the document goes down a pipe rather than
+# through a shell variable, and the decoder's parameters are never the
+# command's.
 _tailscale_json_cmd() {
-  local arg seen=0
-  local -a params=() cmd=()
-  for arg in "$@"; do
-    if ((seen)); then
-      cmd+=("${arg}")
-    elif [[ ${arg} == '--' ]]; then
-      seen=1
-    else
-      params+=("${arg}")
-    fi
-  done
-  ((seen)) || return 2
-  ((${#cmd[@]} > 0)) || return 2
-
-  local captured states source_status decode_status
-  captured=$(
-    set +e
-    "${cmd[@]}" 2>/dev/null |
-      perl -e "${_TAILSCALE_JSON_PROGRAM}" -- ${params[@]+"${params[@]}"} 2>/dev/null
-    printf '\n%s' "${PIPESTATUS[*]}"
-  )
-  states=${captured##*$'\n'}
-  captured=${captured%$'\n'*}
-  source_status=${states%% *}
-  decode_status=${states##* }
-  [[ ${source_status} == 0 ]] || return 2
-  while [[ ${captured} == *$'\n' ]]; do
-    captured=${captured%$'\n'}
-  done
-  case ${decode_status} in
-    0) printf '%s' "${captured}" ;;
-    1) return 1 ;;
-    *) return 2 ;;
-  esac
+  _json_decode_cmd "${_TAILSCALE_JSON_PROGRAM}" "$@"
 }
 
 # --- naming and addressing ------------------------------------------------

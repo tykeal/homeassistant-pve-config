@@ -765,6 +765,20 @@ advertised_routes() {
   [ "$status" -ne 0 ]
 }
 
+@test "a guest on another node carrying somebody else's tag is not adopted" {
+  # The other half of the case above. The listing is walked for the tag
+  # this toolkit sets, and a guest wearing a different one is somebody
+  # else's: the stage builds its own container rather than stopping over
+  # a router it does not own.
+  export PVE_CONFIG_MOCK_CLUSTER_REMOTE='131:pve2'
+  export PVE_CONFIG_MOCK_CLUSTER_REMOTE_TAG='somebody-elses-service'
+
+  run run_tailscale
+  [ "$status" -eq 0 ]
+  [[ "${output}" != *'on node pve2'* ]]
+  [ -f "$(ct_conf 100)" ]
+}
+
 @test "a cluster listing that cannot be read stops the stage" {
   export PVE_CONFIG_MOCK_CLUSTER_FAIL=1
 
@@ -781,6 +795,19 @@ advertised_routes() {
   run run_tailscale
   [ "$status" -ne 0 ]
   [[ "${output}" == *"Unable to read 'pvesh get /cluster/resources"* ]]
+}
+
+@test "a cluster listing whose guest id is not a number stops the stage" {
+  # The listing decodes; what it says is not a guest id. An entry this
+  # toolkit cannot read says nothing about the containers beside it
+  # either, so the whole listing is refused rather than partly believed.
+  export PVE_CONFIG_MOCK_CLUSTER_JSON="[{\"type\":\"lxc\",\"vmid\":\"1a\",\"node\":\"pve1\",\"tags\":\"${OWNER_TAG}\"}]"
+
+  run run_tailscale
+  [ "$status" -ne 0 ]
+  [[ "${output}" == *"Unable to read 'pvesh get /cluster/resources"* ]]
+  run test -f "$(ct_conf 100)"
+  [ "$status" -ne 0 ]
 }
 
 @test "two tagged routers on this node stop the stage rather than picking one" {
