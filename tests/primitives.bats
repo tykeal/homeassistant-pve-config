@@ -524,6 +524,29 @@ setup() {
   [[ "$(cat "${target}")" == 'PasswordAuthentication no'* ]]
 }
 
+@test "install_validated reads a drop-in that is a symlink" {
+  # A drop-in may be a link into a packaging directory, which is how
+  # several distributions ship them. Copying the link rather than what
+  # it points at leaves a relative link that dangles in the scratch
+  # copy, so the Match below is never read and the host is reported
+  # hardened with passwords still accepted for alice.
+  mkdir -p "${PVE_CONFIG_ROOT}/etc/ssh/policy" \
+    "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d"
+  printf 'Include %s/etc/ssh/sshd_config.d/*.conf\n' \
+    "${PVE_CONFIG_ROOT}" >"${PVE_CONFIG_ROOT}/etc/ssh/sshd_config"
+  printf 'Match User alice\n    PasswordAuthentication yes\n' \
+    >"${PVE_CONFIG_ROOT}/etc/ssh/policy/10-policy.conf"
+  ln -s ../policy/10-policy.conf \
+    "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/10-site.conf"
+
+  local target="${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d/99-hardening.conf"
+  run install_validated "${target}" 'PasswordAuthentication no
+' 0644 validate_sshd_config
+
+  [ "$status" -ne 0 ]
+  [ ! -e "${target}" ]
+}
+
 @test "install_validated reads a mixed case Include as the Include it is" {
   # sshd matches keywords without regard to case, so this pulls the file
   # in and the Match inside it applies. A walk that only knew `Include`

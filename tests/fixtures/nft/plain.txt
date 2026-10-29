@@ -2,8 +2,8 @@ table inet pve_config_admin {
 	chain input {
 		type filter hook input priority filter; policy accept;
 		iif "lo" accept
-		ip saddr 100.64.0.0/10 tcp dport 22 accept
-		ip6 saddr fd7a:115c:a1e0::/48 tcp dport 22 accept
+		iifname "tailscale0" ip saddr 100.64.0.0/10 tcp dport 22 accept
+		iifname "tailscale0" ip6 saddr fd7a:115c:a1e0::/48 tcp dport 22 accept
 		tcp dport 22 drop
 	}
 }

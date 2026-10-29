@@ -106,6 +106,9 @@ valid_rule() {
   esac
   [[ ${rule} =~ ^iif\ \"[a-z0-9]+\"\ (accept|drop|reject)$ ]] && return 0
   [[ ${rule} =~ ^(ip|ip6)\ saddr\ [0-9a-fA-F:./]+\ tcp\ dport\ [0-9]+\ (accept|drop|reject)$ ]] && return 0
+  # The same rule bound to the interface the packet arrived on, which is
+  # what the tailnet restriction writes.
+  [[ ${rule} =~ ^iifname\ \"[A-Za-z0-9][A-Za-z0-9._-]{0,14}\"\ (ip|ip6)\ saddr\ [0-9a-fA-F:./]+\ tcp\ dport\ [0-9]+\ (accept|drop|reject)$ ]] && return 0
   [[ ${rule} =~ ^tcp\ dport\ [0-9]+\ (accept|drop|reject)$ ]] && return 0
   return 1
 }

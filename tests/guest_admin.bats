@@ -229,8 +229,8 @@ ${PAM_LINE}
   local ruleset
   ruleset=$(cat "${PVE_CONFIG_MOCK_STATE}/guests/${CT}/state/nft-ruleset")
   [[ ${ruleset} == *'table inet pve_config_admin'* ]]
-  [[ ${ruleset} == *'ip saddr 100.64.0.0/10 tcp dport 22 accept'* ]]
-  [[ ${ruleset} == *'ip6 saddr fd7a:115c:a1e0::/48 tcp dport 22 accept'* ]]
+  [[ ${ruleset} == *'iifname "tailscale0" ip saddr 100.64.0.0/10 tcp dport 22 accept'* ]]
+  [[ ${ruleset} == *'iifname "tailscale0" ip6 saddr fd7a:115c:a1e0::/48 tcp dport 22 accept'* ]]
   [[ ${ruleset} == *'tcp dport 22 drop'* ]]
   grep -q 'include "/etc/nftables.d/\*.nft"' "${ROOT}/etc/nftables.conf"
   mock_calls | grep -q 'systemctl enable -- nftables.service'
@@ -291,6 +291,57 @@ flush ruleset
   [ "${status}" -ne 0 ]
   [[ ${output} == *'does not restrict ssh to the tailnet'* ]]
   run grep -q '^root:!' "${ROOT}/etc/shadow"
+  [ "${status}" -ne 0 ]
+}
+
+@test "a container with no tunnel interface is not given the restriction" {
+  export PVE_GUEST_ADMIN_SSH_ACCESS='tailnet'
+  # The accepts name the interface the tunnel's packets arrive on, so a
+  # container that has no such interface would be given a filter that
+  # drops ssh from everywhere, tunnel included.
+  rm -rf -- "${ROOT}/sys/class/net/tailscale0"
+  run converge
+  [ "${status}" -ne 0 ]
+  [[ ${output} == *'has no tailscale0 interface'* ]]
+  [ ! -s "${PVE_CONFIG_MOCK_STATE}/guests/${CT}/state/nft-ruleset" ]
+  [ ! -e "${ROOT}/etc/ssh/sshd_config.d/99-pve-config-admin.conf" ]
+}
+
+@test "a tunnel interface under another name is the one bound to" {
+  export PVE_GUEST_ADMIN_SSH_ACCESS='tailnet'
+  export PVE_GUEST_ADMIN_TAILNET_IFACE='ts0'
+  mkdir -p -- "${ROOT}/sys/class/net/ts0"
+  converge >/dev/null
+  local ruleset
+  ruleset=$(cat "${PVE_CONFIG_MOCK_STATE}/guests/${CT}/state/nft-ruleset")
+  [[ ${ruleset} == *'iifname "ts0" ip saddr 100.64.0.0/10 tcp dport 22 accept'* ]]
+}
+
+@test "a boot file that goes on past the include stops the hardening" {
+  export PVE_GUEST_ADMIN_SSH_ACCESS='tailnet'
+  converge >/dev/null
+  # The check, rather than a whole run: converge puts the include back at
+  # the end of the file before it gets here, so the condition only
+  # survives long enough to reach the check if that ever stops being
+  # true. The guard is what is under test either way.
+  printf '%s\n' 'flush ruleset' >>"${ROOT}/etc/nftables.conf"
+  run _guest_admin_firewall_boot_keeps "${GUEST}"
+  [ "${status}" -ne 0 ]
+  [[ ${output} == *'goes on past the include'* ]]
+}
+
+@test "another fragment that flushes the ruleset stops the hardening" {
+  export PVE_GUEST_ADMIN_SSH_ACCESS='tailnet'
+  # nftables.conf loads /etc/nftables.d/*.nft in order, so a fragment
+  # sorting after this module's takes the table away again at boot while
+  # `nft -c` still calls the file a valid transaction.
+  seed_guest_file /etc/nftables.d/zz-reset.nft '#!/usr/sbin/nft -f
+flush ruleset
+'
+  run converge
+  [ "${status}" -ne 0 ]
+  [[ ${output} == *'flushes the ruleset'* ]]
+  run grep -q 'passwd -l root' <(mock_calls)
   [ "${status}" -ne 0 ]
 }
 
@@ -685,6 +736,52 @@ policy.conf" 'AllowUsers root
   [ ! -e "${ROOT}/etc/ssh/sshd_config.d/99-pve-config-admin.conf" ]
 }
 
+@test "a key that cannot carry the agent is not a login to harden behind" {
+  converge >/dev/null
+  # sudo in the container authenticates with the forwarded agent key, so
+  # an entry that refuses to forward one is not the administrative access
+  # this is about to rely on.
+  printf 'no-agent-forwarding %s\n' "${KEY_ALICE}" \
+    >"${ROOT}/home/alice/.ssh/authorized_keys"
+  rm -f -- "${ROOT}/etc/ssh/sshd_config.d/99-pve-config-admin.conf"
+  # shellcheck disable=SC2329  # the module under test calls it
+  guest_admin_keys_install() { printf 'unchanged\n'; }
+  run guest_admin_sshd_converge "${GUEST}"
+  [ "${status}" -ne 0 ]
+  [[ ${output} == *'no-agent-forwarding'* ]]
+}
+
+@test "an authentication chain no key finishes stops the hardening" {
+  seed_guest_file /etc/ssh/sshd_config 'Include /etc/ssh/sshd_config.d/*.conf
+AuthenticationMethods publickey,password
+'
+  run converge
+  [ "${status}" -ne 0 ]
+  [[ ${output} == *'AuthenticationMethods publickey,password'* ]]
+  [ ! -e "${ROOT}/etc/ssh/sshd_config.d/99-pve-config-admin.conf" ]
+}
+
+@test "a key alone finishing one of the alternatives is enough" {
+  seed_guest_file /etc/ssh/sshd_config 'Include /etc/ssh/sshd_config.d/*.conf
+AuthenticationMethods publickey password
+'
+  converge >/dev/null
+  [ -f "${ROOT}/etc/ssh/sshd_config.d/99-pve-config-admin.conf" ]
+}
+
+@test "sshd that will not forward an agent stops the root lock" {
+  export PVE_GUEST_ADMIN_ROOT_LOCK='yes'
+  converge >/dev/null
+  printf 'root:x:20000:0:99999:7:::\n' >"${ROOT}/etc/shadow"
+  seed_guest_file /etc/ssh/sshd_config.d/10-site.conf 'AllowAgentForwarding no
+'
+  run guest_admin_root_lock "${GUEST}"
+  [ "${status}" -ne 0 ]
+  [[ ${output} == *'allowagentforwarding no'* ]]
+  run grep -q '^root:!' "${ROOT}/etc/shadow"
+  [ "${status}" -ne 0 ]
+}
+
 @test "the Include is added only after the fragment is in place" {
   seed_guest_file /etc/ssh/sshd_config 'PermitRootLogin yes
 '
@@ -832,8 +929,8 @@ policy.conf" 'AllowUsers root
 	chain input {
 		type filter hook input priority filter; policy accept;
 		tcp dport 22 drop
-		ip saddr 100.64.0.0/10 tcp dport 22 accept
-		ip6 saddr fd7a:115c:a1e0::/48 tcp dport 22 accept
+		iifname "tailscale0" ip saddr 100.64.0.0/10 tcp dport 22 accept
+		iifname "tailscale0" ip6 saddr fd7a:115c:a1e0::/48 tcp dport 22 accept
 	}
 }
 '
@@ -850,8 +947,8 @@ policy.conf" 'AllowUsers root
 table inet other {
 	chain input {
 		type filter hook input priority filter; policy accept;
-		ip saddr 100.64.0.0/10 tcp dport 22 accept
-		ip6 saddr fd7a:115c:a1e0::/48 tcp dport 22 accept
+		iifname "tailscale0" ip saddr 100.64.0.0/10 tcp dport 22 accept
+		iifname "tailscale0" ip6 saddr fd7a:115c:a1e0::/48 tcp dport 22 accept
 		tcp dport 22 drop
 	}
 }
@@ -864,8 +961,8 @@ table inet other {
   seed_ruleset 'table inet pve_config_admin {
 	chain input {
 		type filter hook output priority filter; policy accept;
-		ip saddr 100.64.0.0/10 tcp dport 22 accept
-		ip6 saddr fd7a:115c:a1e0::/48 tcp dport 22 accept
+		iifname "tailscale0" ip saddr 100.64.0.0/10 tcp dport 22 accept
+		iifname "tailscale0" ip6 saddr fd7a:115c:a1e0::/48 tcp dport 22 accept
 		tcp dport 22 drop
 	}
 }
@@ -883,8 +980,8 @@ table inet other {
 	chain input {
 		type filter hook input priority filter; policy accept;
 		tcp dport 22 drop
-		ip saddr 100.64.0.0/10 tcp dport 22 accept
-		ip6 saddr fd7a:115c:a1e0::/48 tcp dport 22 accept
+		iifname "tailscale0" ip saddr 100.64.0.0/10 tcp dport 22 accept
+		iifname "tailscale0" ip6 saddr fd7a:115c:a1e0::/48 tcp dport 22 accept
 	}
 }
 '
@@ -1061,8 +1158,8 @@ table inet other {
 	chain input {
 		type filter hook input priority filter; policy accept;
 		iif "lo" counter packets 12 bytes 840 accept
-		ip saddr 100.64.0.0/10 tcp dport 22 counter packets 3 bytes 180 accept comment "tailnet v4"
-		ip6 saddr fd7a:115c:a1e0::/48 tcp dport 22 accept
+		iifname "tailscale0" ip saddr 100.64.0.0/10 tcp dport 22 counter packets 3 bytes 180 accept comment "tailnet v4"
+		iifname "tailscale0" ip6 saddr fd7a:115c:a1e0::/48 tcp dport 22 accept
 		tcp dport 22 counter packets 0 bytes 0 drop
 	}
 }
@@ -1096,10 +1193,14 @@ table inet other {
   # drop, no IPv6 accept, the chain on the forward hook, an accept
   # narrowed to one interface, a second chain in the table, a table with
   # nothing in it, a chain whose policy is drop, a chain holding every
-  # required rule behind an accept that admits the whole LAN, and one
-  # with a rule this module never wrote.
+  # required rule behind an accept that admits the whole LAN, one with a
+  # rule this module never wrote, a table carrying `flags dormant` --
+  # whose base chain is unregistered from its hook, so the rules below
+  # it filter nothing at all -- and one whose accepts match the tailnet
+  # address without naming the interface it arrives on, which a LAN host
+  # addressed out of 100.64.0.0/10 also matches.
   for name in dropfirst nov6 forwardhook narrowed twochains empty policydrop \
-    openaccept extrarule; do
+    openaccept extrarule dormant saddronly; do
     run _guest_admin_firewall_rules_restrict \
       "$(cat "${REPO_ROOT}/tests/fixtures/nft/${name}.txt")"
     [ "${status}" -eq 1 ] || {

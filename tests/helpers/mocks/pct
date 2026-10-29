@@ -39,7 +39,8 @@ guest_root() {
   dir=$(mock_state_dir) || return 1
   local root="${dir}/guests/${vmid}/rootfs"
   if [[ ! -d ${root}/etc ]]; then
-    mkdir -p -- "${root}/etc" "${root}/home"
+    mkdir -p -- "${root}/etc" "${root}/home" \
+      "${root}/sys/class/net/lo" "${root}/sys/class/net/tailscale0"
     printf 'root:x:0:0::/root:/bin/bash\n' >"${root}/etc/passwd"
     printf 'root:x:0:\nsudo:x:27:\n' >"${root}/etc/group"
     # A container knows which Debian it is, and the toolkit reads that
@@ -69,6 +70,8 @@ is_path_tool() {
     ls | find) return 0 ;;
     # sha256sum is given the keyring's path inside the container.
     sha256sum) return 0 ;;
+    # grep is handed the nftables fragment directory to search.
+    grep) return 0 ;;
     # `nft -f` names a ruleset file in the container. Its other forms
     # (`list ruleset`, `delete table inet ...`) have no absolute operand,
     # so relocation leaves them alone.

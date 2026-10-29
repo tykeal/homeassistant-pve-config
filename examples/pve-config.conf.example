@@ -93,6 +93,12 @@ PVE_GUEST_ADMIN_SSH_ACCESS='lan'
 # keeps its root password as a fallback.
 PVE_GUEST_ADMIN_ROOT_LOCK='no'
 
+# The interface a container's tunnel traffic arrives on. The tailnet
+# restriction binds its accepts to this as well as to the tailnet address
+# range, because 100.64.0.0/10 is carrier-grade NAT space a LAN can use
+# too. Only read when PVE_GUEST_ADMIN_SSH_ACCESS is 'tailnet'.
+PVE_GUEST_ADMIN_TAILNET_IFACE='tailscale0'
+
 # --- Certificates ---------------------------------------------------------
 
 # Order a Let's Encrypt certificate for PVE_FQDN over the DNS-01 challenge.

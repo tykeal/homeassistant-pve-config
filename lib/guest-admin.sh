@@ -64,6 +64,17 @@ GUEST_ADMIN_TAILNET_CIDRS=('100.64.0.0/10' 'fd7a:115c:a1e0::/48')
 GUEST_ADMIN_TAILNET_V4='100.64.0.0/10'
 GUEST_ADMIN_TAILNET_V6='fd7a:115c:a1e0::/48'
 
+# The interface the tunnel's packets arrive on. The tailnet accepts are
+# bound to it as well as to the source address, because 100.64.0.0/10 is
+# carrier-grade NAT space and nothing stops a LAN from using it: an
+# address-only rule admits a spoofed LAN packet to sshd's
+# pre-authentication protocol, which is the exposure `tailnet` is asked
+# for to close. `iifname` matches by name and is resolved per packet, so
+# the rule loads whether or not the interface is up yet.
+guest_admin_tailnet_iface() {
+  printf '%s\n' "${PVE_GUEST_ADMIN_TAILNET_IFACE:-tailscale0}"
+}
+
 # The packet filter. Its own table, because nftables evaluates every table
 # and a drop in any of them ends the packet: this can restrict ssh without
 # owning, reading or disturbing whatever else the container filters.
@@ -385,6 +396,8 @@ export TERM
 # accept and the only drop in it is for ssh from off-tailnet, so a
 # container that filters nothing still filters nothing else.
 guest_admin_firewall_fragment() {
+  local iface
+  iface=$(guest_admin_tailnet_iface)
   printf '%s\n' \
     '#!/usr/sbin/nft -f' \
     '# Managed by pve-config. Reachability of sshd, not authorization.' \
@@ -394,8 +407,8 @@ guest_admin_firewall_fragment() {
     '	chain input {' \
     '		type filter hook input priority filter; policy accept;' \
     '		iif "lo" accept' \
-    "		ip saddr ${GUEST_ADMIN_TAILNET_V4} tcp dport ${GUEST_ADMIN_SSH_PORT} accept" \
-    "		ip6 saddr ${GUEST_ADMIN_TAILNET_V6} tcp dport ${GUEST_ADMIN_SSH_PORT} accept" \
+    "		iifname \"${iface}\" ip saddr ${GUEST_ADMIN_TAILNET_V4} tcp dport ${GUEST_ADMIN_SSH_PORT} accept" \
+    "		iifname \"${iface}\" ip6 saddr ${GUEST_ADMIN_TAILNET_V6} tcp dport ${GUEST_ADMIN_SSH_PORT} accept" \
     "		tcp dport ${GUEST_ADMIN_SSH_PORT} drop" \
     '	}' \
     '}'
@@ -468,10 +481,17 @@ _guest_admin_firewall_rules_restrict() {
   local body=$1 line trimmed
   local chains=0 in_chain=0 saw_header=0 step=0 closed=0
 
+  local iface
+  iface=$(guest_admin_tailnet_iface)
   local lo_rule='iif "lo" accept'
   local lo_rule_alt='iifname "lo" accept'
-  local v4_rule="ip saddr ${GUEST_ADMIN_TAILNET_V4} tcp dport ${GUEST_ADMIN_SSH_PORT} accept"
-  local v6_rule="ip6 saddr ${GUEST_ADMIN_TAILNET_V6} tcp dport ${GUEST_ADMIN_SSH_PORT} accept"
+  # The interface the tunnel's packets arrive on, named in both accepts:
+  # a rule matched on the source address alone also admits a LAN host
+  # addressed out of 100.64.0.0/10, which is ordinary address space on a
+  # network that has not heard of the tunnel.
+  local on_iface="iifname \"${iface}\" "
+  local v4_rule="${on_iface}ip saddr ${GUEST_ADMIN_TAILNET_V4} tcp dport ${GUEST_ADMIN_SSH_PORT} accept"
+  local v6_rule="${on_iface}ip6 saddr ${GUEST_ADMIN_TAILNET_V6} tcp dport ${GUEST_ADMIN_SSH_PORT} accept"
 
   while IFS= read -r line; do
     trimmed=${line#"${line%%[![:space:]]*}"}
@@ -479,13 +499,26 @@ _guest_admin_firewall_rules_restrict() {
     [[ -n ${trimmed} ]] || continue
 
     if [[ ${in_chain} -eq 0 ]]; then
-      if [[ ${trimmed} == 'chain '*'{' ]]; then
-        chains=$((chains + 1))
-        # This module writes one chain and owns the table, so a second
-        # one is a table this cannot speak for.
-        [[ ${chains} -eq 1 && ${trimmed} == 'chain input {' ]] || return 1
-        in_chain=1
-      fi
+      case ${trimmed} in
+        'chain '*'{')
+          chains=$((chains + 1))
+          # This module writes one chain and owns the table, so a second
+          # one is a table this cannot speak for.
+          [[ ${chains} -eq 1 && ${trimmed} == 'chain input {' ]] || return 1
+          in_chain=1
+          ;;
+        "table inet ${GUEST_ADMIN_NFT_TABLE} {" | '}')
+          # The table's own header and its closing brace.
+          ;;
+        *)
+          # Anything else between the braces of the table is something
+          # this module did not write: a set, a second table's header --
+          # or `flags dormant`, which unregisters every base chain from
+          # its hook and leaves the rules below filtering nothing while
+          # reading back exactly as written.
+          return 1
+          ;;
+      esac
       continue
     fi
 
@@ -670,6 +703,22 @@ guest_admin_firewall_converge() {
     return
   fi
 
+  # The rules name the tunnel interface, so a container that has no such
+  # interface would be given a restriction that drops every ssh packet
+  # including the ones over the tunnel. Refusing here leaves the
+  # container as it is and says which name was looked for; a deployment
+  # whose tunnel is called something else sets
+  # PVE_GUEST_ADMIN_TAILNET_IFACE.
+  local iface
+  iface=$(guest_admin_tailnet_iface)
+  if ! target_test "${target}" d "/sys/class/net/${iface}"; then
+    if dry_run_enabled; then
+      log_warn "$(target_describe "${target}") has no ${iface} interface yet; the tailnet restriction needs one before it can be applied"
+    else
+      die "$(target_describe "${target}") has no ${iface} interface, so a tailnet restriction bound to it would cut ssh off entirely; set PVE_GUEST_ADMIN_TAILNET_IFACE to the tunnel's name or bring the tunnel up first."
+    fi
+  fi
+
   state_of state target_ensure_dir "${target}" "${GUEST_ADMIN_NFT_DIR}" 0755
   if [[ ${state} == changed ]]; then
     changed=1
@@ -718,6 +767,8 @@ guest_admin_firewall_converge() {
   [[ ${check_rc} -eq 0 ]] ||
     die "${GUEST_ADMIN_NFT_MAIN} in $(target_describe "${target}") does not load, so the ssh restriction would not survive a reboot: ${check}"
 
+  _guest_admin_firewall_boot_keeps "${target}"
+
   _guest_admin_firewall_live "${target}" || live=$?
   case ${live} in
     0) ;;
@@ -740,6 +791,60 @@ guest_admin_firewall_converge() {
   else
     printf 'unchanged\n'
   fi
+}
+
+# Dies unless the boot configuration still has this module's table in it
+# once it has finished loading.
+#
+# `nft -c -f` says the file is a valid transaction, which is a different
+# claim from the table surviving it. Boot replays /etc/nftables.conf and
+# everything it includes, in order, and a later statement can take the
+# table away again: `flush ruleset` in a fragment that sorts after this
+# module's wipes it, and the container comes back from a reboot with ssh
+# open to the LAN while every check here reported it restricted.
+#
+# Narrow rather than clever, as elsewhere in this module. After this
+# module's include, /etc/nftables.conf may hold comments and nothing
+# else, and no other fragment in the directory may flush the ruleset or
+# name this module's table. A configuration that does something this
+# cannot account for stops the run instead of being interpreted.
+_guest_admin_firewall_boot_keeps() {
+  local target=$1 body='' line trimmed seen=0
+
+  target_slurp body "${target}" "${GUEST_ADMIN_NFT_MAIN}" ||
+    die "Unable to read ${GUEST_ADMIN_NFT_MAIN} in $(target_describe "${target}"); refusing to call a restriction it cannot read persistent."
+
+  while IFS= read -r line || [[ -n ${line} ]]; do
+    trimmed=${line#"${line%%[![:space:]]*}"}
+    trimmed=${trimmed%"${trimmed##*[![:space:]]}"}
+    if [[ ${seen} -eq 0 ]]; then
+      grep -Eq "${GUEST_ADMIN_NFT_INCLUDE_MATCH}" <<<"${line}" && seen=1
+      continue
+    fi
+    [[ -z ${trimmed} || ${trimmed} == '#'* ]] && continue
+    die "${GUEST_ADMIN_NFT_MAIN} in $(target_describe "${target}") goes on past the include of ${GUEST_ADMIN_NFT_DIR} with ${trimmed}, and what that leaves of the ssh restriction at boot is not something this can judge; move it above the include."
+  done <<<"${body}"
+
+  # Any other fragment that flushes the ruleset or names this table. Its
+  # own `delete table` is how it replaces itself, so it is excluded by
+  # name; the grep answers with the status, so a name this cannot carry
+  # back out of the container changes nothing about the decision.
+  # shellcheck disable=SC2034  # target_capture fills it; only the status decides
+  local own hits='' hits_rc=0
+  own=$(basename -- "${GUEST_ADMIN_NFT_PATH}")
+  target_capture hits "${target}" \
+    grep -rlE --exclude="${own}" \
+    "flush[[:space:]]+ruleset|(flush|delete|destroy)[[:space:]]+table[[:space:]].*${GUEST_ADMIN_NFT_TABLE}" \
+    "${GUEST_ADMIN_NFT_DIR}" || hits_rc=$?
+  case ${hits_rc} in
+    1) ;;
+    0)
+      die "Something else in ${GUEST_ADMIN_NFT_DIR} in $(target_describe "${target}") flushes the ruleset or takes the ${GUEST_ADMIN_NFT_TABLE} table away, so the ssh restriction would not survive a reboot."
+      ;;
+    *)
+      die "Unable to read ${GUEST_ADMIN_NFT_DIR} in $(target_describe "${target}"); refusing to call a restriction it cannot read persistent."
+      ;;
+  esac
 }
 
 # Takes the restriction away again, for a container the configuration says
@@ -1172,6 +1277,40 @@ _guest_admin_sshd_admits() {
   fi
 }
 
+# Dies unless sudo's agent authentication can still reach an agent.
+#
+# The administrative access that replaces root's password is a key login
+# plus sudo authenticated by the forwarded agent. sshd refusing to forward
+# the agent takes the second half away: the administrators can log in and
+# none of them can become root. That is only a question for the lock,
+# which is why it is asked here and not with the hardening -- a container
+# whose root password is still set has lost nothing.
+_guest_admin_sshd_forwarding_guard() {
+  local target=$1 mirror=$2
+  local main="${mirror}${GUEST_ADMIN_SSHD_MAIN}"
+  [[ -f ${main} ]] || return 0
+
+  local file criteria keyword value setting display
+  while IFS=$'\x1f' read -r file criteria keyword value; do
+    case ${keyword} in
+      allowagentforwarding | disableforwarding) ;;
+      *) continue ;;
+    esac
+    setting=${value%%[[:space:]]*}
+    setting=${setting,,}
+    case ${keyword}:${setting} in
+      allowagentforwarding:no | disableforwarding:yes) ;;
+      *) continue ;;
+    esac
+    display=${file#"${mirror}"}
+    if [[ -n ${criteria} ]]; then
+      die "${display} in $(target_describe "${target}") sets ${keyword} ${setting} under 'Match ${criteria}', and sudo there authenticates with a forwarded agent key; refusing to lock the root password."
+    fi
+    die "${display} in $(target_describe "${target}") sets ${keyword} ${setting}, so no administrator can forward the agent key sudo authenticates with; refusing to lock the root password."
+  done < <(_sshd_config_directives "${main}" "${mirror}" "${mirror}")
+  return 0
+}
+
 # Dies unless every administrator's configured key is installed, active and
 # unrestricted in the container right now.
 #
@@ -1420,6 +1559,12 @@ _guest_admin_access_confirmed() {
     die "${GUEST_ADMIN_AGENT_KEYS_PATH} in $(target_describe "${target}") does not hold the administrators' keys; refusing to lock the root password."
 
   _guest_admin_keys_live "${target}"
+
+  # And that a login can still carry the agent key sudo asks for.
+  local mirror=''
+  _guest_admin_sshd_mirror "${target}" "${fragment}" mirror
+  _guest_admin_sshd_forwarding_guard "${target}" "${mirror}"
+  rm -rf -- "${mirror}"
 }
 
 # Locks root's password, once key-based access has been confirmed working.

@@ -162,12 +162,15 @@ _ssh_key_options() {
 # Whether an entry would let an administrator log in from anywhere and get
 # a shell. Source restrictions and forced commands may well be deliberate,
 # but they are not something this toolkit can verify remote access through.
+# no-agent-forwarding belongs in that list because the forwarded agent key
+# is what sudo authenticates with here, so a login that cannot carry it is
+# not the administrative access this toolkit is about to rely on.
 ssh_key_entry_is_unrestricted() {
   local opts
   opts=$(_ssh_key_options "$1")
   [[ -n ${opts} ]] || return 0
   case ",${opts,,}," in
-    *from=* | *command=* | *restrict* | *no-pty*) return 1 ;;
+    *from=* | *command=* | *restrict* | *no-pty* | *no-agent-forwarding*) return 1 ;;
   esac
   return 0
 }
@@ -251,7 +254,7 @@ authorized_keys_access_problem() {
       return 1
     fi
     if [[ -z ${unrestricted[${key}]+set} ]]; then
-      printf "%s's only entry for that key in %s carries restrictions (from=, command=, restrict or no-pty) that this toolkit cannot verify remote logins through; add an unrestricted entry or relax the restriction before hardening SSH.\n" \
+      printf "%s's only entry for that key in %s carries restrictions (from=, command=, restrict, no-pty or no-agent-forwarding) that this toolkit cannot verify remote logins through; add an unrestricted entry or relax the restriction before hardening SSH.\n" \
         "${user}" "${file}"
       return 1
     fi

@@ -250,6 +250,7 @@ The driver resolves these keys on every run.
 | `PVE_NO_SUBSCRIPTION` | yes | `yes` | Use the no-subscription repository and suppress the subscription notice |
 | `PVE_SUDO_SSH_AGENT` | yes | `yes` | Let `sudo` accept a forwarded SSH agent key |
 | `PVE_GUEST_ADMIN_SSH_ACCESS` | yes | `lan` | Where the administrators mirrored into a container may reach its sshd from: `lan` admits anything that can route to it, `tailnet` restricts it to the tunnel in the container's packet filter |
+| `PVE_GUEST_ADMIN_TAILNET_IFACE` | yes | `tailscale0` | Interface a container's tunnel traffic arrives on, which the `tailnet` restriction binds its accepts to |
 | `PVE_GUEST_ADMIN_ROOT_LOCK` | yes | `no` | Lock the root password of a container this toolkit mirrors the administrators into |
 | `PVE_ZULIP_ENABLED` | yes | `no` | Send boot and shutdown notices to Zulip |
 | `PVE_ZULIP_STREAM` | no | the stage falls back to `infrastructure` | Zulip stream for the notices |
@@ -791,15 +792,30 @@ the tailnet address does not exist until the container joins the tunnel,
 and sshd refuses to start without it. Moving a container from `tailnet`
 to `lan` takes the table away again on the next run.
 
+The accepts name the interface the tunnel's traffic arrives on rather
+than matching its source address alone: `100.64.0.0/10` is ordinary
+address space, and the table would otherwise admit a LAN host that holds
+an address out of it. `PVE_GUEST_ADMIN_TAILNET_IFACE` names that interface and
+defaults to `tailscale0`. A container that has no such interface stops
+the run, because the table it would get there drops ssh from everywhere,
+the tunnel included -- bring the tunnel up first, or set the
+key to the name it uses.
+
 Under `tailnet` the toolkit also refuses a container whose configuration
 puts sshd on any port other than 22, or adds a listener on one: the
 table it writes covers port 22, and a second port would be reachable
 from the LAN while every check here reported the container restricted.
 
-The toolkit also checks that `/etc/nftables.conf` and everything it
-includes still load, because one malformed file in `/etc/nftables.d`
-takes the whole boot configuration down and a container restricted now
-would come back from a reboot restricting nothing.
+The toolkit also checks that the restriction survives a reboot, because
+one restricted now and open after a restart is the worst of both. That
+means `/etc/nftables.conf` and everything it includes still loading --
+one malformed file in `/etc/nftables.d` takes the whole boot
+configuration down -- and that nothing replays over the top of it
+afterwards. `/etc/nftables.conf` may hold comments and nothing else past
+the include of `/etc/nftables.d`, and no other fragment in that
+directory may flush the ruleset or take this toolkit's table away.
+Either stops the run: a boot sequence this cannot account for is not one
+to lock a root password on the strength of.
 
 Before it hardens anything, the toolkit copies the container's
 `sshd_config` and the whole of `/etc/ssh/sshd_config.d` -- subdirectories
@@ -808,6 +824,15 @@ naming anything the copy does not hold, or a path that resolves outside
 that directory, stops the run: a configuration this node cannot reproduce
 is one it cannot judge, and disabling passwords against a guess is how
 operators get locked out.
+
+Two settings in that configuration stop the run outright. An
+`AuthenticationMethods` value no alternative of which a key alone
+satisfies -- `publickey,password`, where the comma means *and* -- would
+leave every administrator unable to finish authenticating once passwords
+go away. And `AllowAgentForwarding no` or `DisableForwarding yes`, in the
+main file or under a `Match`, blocks the root lock: `sudo` in the
+container authenticates with the forwarded agent key, so a daemon that
+will not carry one is not access worth giving the root password up for.
 
 That reading is deliberately narrow, and it refuses two things sshd
 itself accepts:
@@ -873,8 +898,10 @@ before you let a run touch networking or SSH policy.
 - **It verifies SSH keys before turning passwords off.** Stage 70 checks,
   for every administrator, that the account exists, that their
   `authorized_keys` carries the configured key as an active entry, and that
-  at least one entry for that key carries no `from=`, `command=`, `restrict`
-  or `no-pty` restriction the stage cannot verify a login through. It also
+  at least one entry for that key carries no `from=`, `command=`, `restrict`,
+  `no-pty` or `no-agent-forwarding` restriction the stage cannot verify a
+  login through. `no-agent-forwarding` matters as much as the rest: the
+  agent key is what `sudo` authenticates with. It also
   checks that no `AuthorizedKeysFile` directive — global or under a `Match`
   — points anywhere other than `~/.ssh/authorized_keys`, and that
   `AllowUsers`, `DenyUsers`, `AllowGroups` and `DenyGroups` still admit

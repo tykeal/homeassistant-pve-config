@@ -35,6 +35,7 @@ PVE_NO_SUBSCRIPTION|no|yes|_schema_default_yes|Use the no-subscription repositor
 PVE_SUDO_SSH_AGENT|no|yes|_schema_default_yes|Allow sudo to accept a forwarded SSH agent key
 PVE_GUEST_ADMIN_SSH_ACCESS|no|yes|_schema_default_lan|Where the administrators mirrored into a container may reach its sshd from, lan or tailnet
 PVE_GUEST_ADMIN_ROOT_LOCK|no|yes|_schema_default_no|Lock the root password of a container the administrators are mirrored into
+PVE_GUEST_ADMIN_TAILNET_IFACE|no|yes|_schema_default_tailscale0|Interface a container's tunnel traffic arrives on, which the tailnet restriction binds to
 PVE_ACME_ENABLED|no|yes|_schema_default_no|Order a certificate for this host over the DNS-01 challenge
 PVE_ACME_ENVIRONMENT|no|yes|_schema_default_staging|ACME directory to order from, staging or production
 PVE_ACME_EMAIL|no|no||Contact address for the ACME account and for expiry warnings
@@ -87,6 +88,13 @@ _schema_default_dnsmadeeasy() { printf 'dnsmadeeasy\n'; }
 # narrowing it to the tailnet is something an operator asks for rather
 # than something that happens to them.
 _schema_default_lan() { printf 'lan\n'; }
+
+# tailscaled names its tunnel tailscale0 unless it is told otherwise. The
+# tailnet restriction binds to the interface rather than trusting the
+# source address alone: 100.64.0.0/10 is carrier-grade NAT space that a
+# LAN can also use, and a rule that matches only the address admits a
+# spoofed LAN packet to sshd's pre-authentication protocol.
+_schema_default_tailscale0() { printf 'tailscale0\n'; }
 
 # The uplink, and only the uplink. Bridging every port the host happens to
 # have risks an L2 loop between two live ports and merges networks that
@@ -217,6 +225,16 @@ _schema_validate_PVE_GUEST_ADMIN_SSH_ACCESS() {
 _schema_validate_PVE_GUEST_ADMIN_ROOT_LOCK() {
   _schema_yes_no_valid "$1" && return 0
   printf 'it is yes or no\n'
+  return 1
+}
+
+# shellcheck disable=SC2329  # called indirectly, by name, from schema_resolve
+_schema_validate_PVE_GUEST_ADMIN_TAILNET_IFACE() {
+  # IFNAMSIZ is 16 with the terminator, and the name goes into an nft
+  # rule in quotes: anything outside this set is either not a name the
+  # kernel would take or not one that can be written there plainly.
+  [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,14}$ ]] && return 0
+  printf 'an interface name is at most 15 letters, digits, dots, dashes and underscores\n'
   return 1
 }
 

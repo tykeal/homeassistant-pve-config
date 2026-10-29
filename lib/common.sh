@@ -736,7 +736,13 @@ _sshd_effective_config() {
   # configuration the daemon does not have.
   local src="${root}/etc/ssh/sshd_config.d"
   if [[ -d ${src} ]]; then
-    cp -a -- "${src}/." "${conf_d}/" || return 1
+    # Dereferenced: a drop-in that is a symlink is a file sshd reads
+    # through the link, and copying the link itself would leave it
+    # dangling in the scratch tree -- or, for an absolute one, pointing
+    # back at the live policy this is standing in for. `cp` reports a
+    # link it cannot follow, and a cycle, with a non-zero status, which
+    # is the abort this wants.
+    cp -a -L -- "${src}/." "${conf_d}/" || return 1
     rm -f -- "${conf_d}/${base}" || return 1
   fi
   cp -- "${candidate}" "${conf_d}/${base}" || return 1
@@ -1066,7 +1072,7 @@ sshd_admission_problem() {
       # account the daemon will not talk to. The contradiction is the
       # operator's to resolve.
       case ${keyword} in
-        allowusers | denyusers | allowgroups | denygroups)
+        allowusers | denyusers | allowgroups | denygroups | authenticationmethods)
           local conditional=${file}
           [[ -n ${display_root} ]] && conditional=${conditional#"${display_root}"}
           printf "%s sets %s under 'Match %s', and who that admits cannot be judged ahead of a connection; resolve that before hardening.\n" \
@@ -1078,6 +1084,26 @@ sshd_admission_problem() {
     fi
     read -r -a more <<<"${value}"
     case ${keyword} in
+      authenticationmethods)
+        # Password authentication is about to go away, so a required
+        # chain that asks for anything besides a key leaves the
+        # administrators with no way of completing it. sshd takes
+        # alternatives separated by spaces and requirements separated by
+        # commas, and succeeds when one alternative is satisfied in
+        # full: `publickey,password` is not an alternative a key alone
+        # finishes, `publickey password` is.
+        local method methods_ok=0
+        for method in ${more[@]+"${more[@]}"}; do
+          [[ ${method} == any || ${method} == publickey ]] && methods_ok=1
+        done
+        if [[ ${methods_ok} -ne 1 ]]; then
+          local where=${file}
+          [[ -n ${display_root} ]] && where=${where#"${display_root}"}
+          printf "%s requires 'AuthenticationMethods %s', which no key alone satisfies; hardening would leave every administrator unable to finish authenticating.\n" \
+            "${where}" "${value}"
+          return 1
+        fi
+        ;;
       allowusers) allow_users+=(${more[@]+"${more[@]}"}) ;;
       denyusers) deny_users+=(${more[@]+"${more[@]}"}) ;;
       allowgroups) allow_groups+=(${more[@]+"${more[@]}"}) ;;
