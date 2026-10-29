@@ -66,13 +66,16 @@ exit 2 unless defined $mode;
 binmode STDIN, ':raw';
 binmode STDOUT, ':utf8';
 my $raw = do { local $/; <STDIN> };
-# Each of these three is reached, and each is also behaviourally
-# redundant: an empty document, a whitespace-only one and one that is
-# not UTF-8 all fail the decode below as well, so removing any of them
-# still answers 2. They are defence in depth, not load-bearing -- kept
-# because a document that never reaches a parser is the cheapest kind to
-# refuse, and because the decode is the part most likely to be swapped.
-# Do not read "redundant" as "dead": they do run.
+# The UTF-8 check is load-bearing and the other two are not. Removing
+# utf8::decode leaves JSON::PP decoding bytes rather than characters,
+# and a quoted value holding 0xC3 0x28 then passes every later check;
+# tests/tools/red-verify.sh reports RED for its removal. The other two
+# are reached, and are also behaviourally redundant: an empty document
+# and a whitespace-only one both fail the decode below as well, so
+# removing either still answers 2. They are defence in depth -- a
+# document that never reaches a parser is the cheapest kind to refuse,
+# and the decode is the part most likely to be swapped -- and they do
+# run, so "redundant" is not "dead".
 exit 2 unless defined $raw && length $raw;
 exit 2 unless utf8::decode($raw);
 exit 2 unless $raw =~ /\S/;
