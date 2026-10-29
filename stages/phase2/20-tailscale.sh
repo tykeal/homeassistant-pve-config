@@ -72,7 +72,7 @@ stage_require PVE_TAILSCALE_HOSTNAME
 # The daemon's own report is read with a JSON decoder, and a run that
 # cannot decode it refuses to spend an auth key. Saying so here, once,
 # beats the same answer arriving as "could not tell" much later.
-acme_require_json_decoder
+json_require_decoder
 
 # Put back whatever this run moves aside, and take the auth key file with
 # it, however the run ends.

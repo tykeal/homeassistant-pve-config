@@ -420,12 +420,11 @@ guest_admin_firewall_fragment() {
 # This reads nft's text output rather than the JSON of `nft -j`. JSON
 # would be the more stable interface and the choice here is not an
 # argument that it would not: it was rejected only because decoding it
-# means a perl JSON program, this toolkit already carries three
-# near-identical ones (_ACME_JSON_PROGRAM, _TAILSCALE_JSON_PROGRAM,
-# _HAOS_JSON_PROGRAM), none of them answers a question shaped like this
-# one, and a fourth copy would deepen a duplication the owner has already
-# raised. Whoever consolidates those should revisit this with the shared
-# decoder in hand.
+# means a perl JSON program and none of the modes this toolkit already
+# declares answers a question shaped like this one. The hardened core is
+# now shared (lib/json.sh), so what a JSON reading would cost here is a
+# mode over that core rather than a fourth copy of the decoder; whoever
+# revisits this should weigh it on those terms.
 #
 # What the text form actually varies in was measured against nftables
 # 1.1.6 rather than guessed, and tests/fixtures/nft holds what it printed.

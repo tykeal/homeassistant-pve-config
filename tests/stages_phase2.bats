@@ -810,6 +810,17 @@ EXPECTED
   [ "$status" -eq 2 ]
 }
 
+@test "the decoder refuses a control character a valid document escaped" {
+  # A raw control byte never reaches the shape checks: JSON::PP refuses
+  # the document itself. An escaped one decodes to a perfectly good
+  # string, and would then be read back by the caller as a line of its
+  # own. This is the guard that stops it, and it is the one the Tailscale
+  # and Home Assistant readers share.
+  run _acme_json_cmd scalar directory -- printf '%s' '{"directory":"a\u0001b"}'
+  [ "$status" -eq 2 ]
+  [ -z "$output" ]
+}
+
 @test "the decoder refuses a listing whose filename is not a string" {
   # Not "the certificate is absent from this listing": a listing this
   # code cannot read says nothing about what is in it.

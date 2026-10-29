@@ -85,7 +85,7 @@ stage_require PVE_FQDN
 
 # Said once, by name, rather than as "the certificate listing could not be
 # read" at the far end of the stage.
-acme_require_json_decoder
+json_require_decoder
 
 environment=${PVE_ACME_ENVIRONMENT:-staging}
 case ${environment} in

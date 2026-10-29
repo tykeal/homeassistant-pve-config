@@ -23,6 +23,15 @@
 # therefore reads the file itself, keeps the values in shell variables that
 # are never exported, and drops the inherited copies.
 
+# The hardened JSON core, the pipeline that hands a command's output to
+# perl without it passing through a shell variable, and the decoder
+# preflight. Located the way lib/stage.sh locates its own: through
+# PVE_CONFIG_LIB_DIR when the driver set one, and beside this file
+# otherwise, because a test may source this library before exporting it.
+_PVE_ACME_LIB_DIR=${PVE_CONFIG_LIB_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}
+# shellcheck source=lib/json.sh
+source "${_PVE_ACME_LIB_DIR}/json.sh"
+
 # The two Let's Encrypt endpoints. Staging issues from an untrusted root
 # and carries far looser rate limits, which is why it is what this toolkit
 # reaches for unless a deployment says otherwise.
@@ -254,19 +263,21 @@ acme_account_name() {
   esac
 }
 
-# JSON is decoded by perl, not by this shell.
+# The JSON this stage reads is decoded by the shared hardened core in
+# lib/json.sh. Only the modes this path understands live here: a flat
+# field read, the names in a listing, and the entry for one certificate
+# file.
 #
-# The parser that used to live here split on commas and stopped at the
-# first `]`, so a string holding either one moved every field after it.
-# That is not a corner case: an issuer DN is full of commas. Worse, the
-# three-valued answer acme_cert_is_current gives rests on knowing the
-# difference between "the host says no" and "this code could not read the
-# answer", and a parser that silently reads the wrong field cannot tell
-# them apart.
+# Keeping the dispatch here is what the old comment about not widening
+# this decoder was protecting. The core is shared because three copies of
+# the byte handling -- reading the document as bytes, refusing what is
+# not UTF-8, refusing a control character in anything emitted, deciding a
+# value's shape by re-encoding it -- were three places a fix could be
+# applied to two. The modes are not shared, so the program this
+# secret-bearing path runs still understands these three and nothing
+# else.
 #
-# perl with JSON::PP is a core module, and Proxmox itself is written in
-# perl, so this adds nothing to what a PVE host already carries. The
-# program below is a constant: the document arrives on standard input and
+# The program is a constant. The document arrives on standard input and
 # the parameters arrive in @ARGV, so nothing from the host is ever
 # interpolated into code.
 #
@@ -275,75 +286,20 @@ acme_account_name() {
 #   1  the document was read and does not have it
 #   2  anything else, including a document that will not decode, a field
 #      of the wrong shape, and a perl that is not there at all
-#
-# lib/tailscale.sh carries a second program of its own rather than
-# extending this one. That is deliberate: it needs to refuse a duplicated
-# key, which JSON::PP cannot report, and to walk an array of cluster
-# resources, and neither belongs in the decoder this secret-bearing path
-# depends on. The two share acme_require_json_decoder and the pipeline
-# shape below; the comment above _TAILSCALE_JSON_PROGRAM has the detail.
-read -r -d '' _ACME_JSON_PROGRAM <<'PERL' || true
-use strict;
-use warnings;
-use JSON::PP ();
-
-my $mode = shift @ARGV;
-exit 2 unless defined $mode;
-
-# The document is read as bytes. That is what lets a NUL byte, or a
-# sequence that is not UTF-8 at all, be seen and refused here: a NUL that
-# travelled through a shell variable on its way would have been dropped
-# silently, and the text either side of it would have been joined into a
-# value nobody sent.
-binmode STDIN, ':raw';
-binmode STDOUT, ':utf8';
-my $raw = do { local $/; <STDIN> };
-exit 2 unless defined $raw && length $raw;
-exit 2 unless utf8::decode($raw);
-exit 2 unless $raw =~ /\S/;
-
-my $data = eval { JSON::PP->new->decode($raw) };
-exit 2 if $@ or !defined $data;
-
-# A JSON string, and nothing else.
-#
-# null, a number, a boolean and a structure are each refused where a
-# string is required, because each of them has a stringification that
-# reads like an answer -- the empty string for null, the digits for a
-# number -- and would then be compared against a directory, an issuer or
-# a filename as though the host had said it. Re-encoding is how the shape
-# is decided, since by this point perl has only a scalar either way.
-my $probe = JSON::PP->new->allow_nonref;
-
-sub text {
-    my ($value) = @_;
-    exit 2 unless defined $value;
-    exit 2 if ref $value;
-    exit 2 unless $probe->encode($value) =~ /\A"/;
-    return $value;
-}
-
-# Only printable scalars leave here. A control character in a value would
-# be read back as a line of its own by the caller.
-sub emit {
-    my ($prefix, $value) = @_;
-    exit 2 if $value =~ /[\x00-\x1f\x7f]/;
-    print defined $prefix ? "$prefix\t$value\n" : "$value\n";
-}
-
+read -r -d '' _ACME_JSON_MODES <<'PERL' || true
 if ($mode eq 'scalar') {
     my $key = shift @ARGV;
     exit 2 unless defined $key;
     exit 2 unless ref $data eq 'HASH';
     exit 1 unless exists $data->{$key};
-    emit(undef, text($data->{$key}));
+    emit(text($data->{$key}));
 } elsif ($mode eq 'names') {
     my $key = shift @ARGV;
     $key = 'name' unless defined $key;
     exit 2 unless ref $data eq 'ARRAY';
     for my $item (@$data) {
         exit 2 unless ref $item eq 'HASH' && exists $item->{$key};
-        emit(undef, text($item->{$key}));
+        emit(text($item->{$key}));
     }
 } elsif ($mode eq 'entry') {
     my $filename = shift @ARGV;
@@ -389,15 +345,16 @@ if ($mode eq 'scalar') {
 }
 exit 0;
 PERL
+_ACME_JSON_PROGRAM=$(_json_program "${_ACME_JSON_MODES}")
 
-# Runs a command and decodes what it printed.
+# Runs a command and decodes what it printed with the program above.
 #
-# The output goes from the command to perl through a pipe and never
-# through a shell variable. A variable cannot hold a NUL byte: bash drops
-# it, and the text either side closes up, so an issuer of
-# "O=(STAGING) Let's Encrypt\0 and friends" would arrive at the issuer
-# check as the exact string the check accepts. On the pipe the byte
-# survives to be refused.
+# The pipeline is _json_decode_cmd's: the output goes from the command to
+# perl through a pipe and never through a shell variable. A variable
+# cannot hold a NUL byte: bash drops it, and the text either side closes
+# up, so an issuer of "O=(STAGING) Let's Encrypt\0 and friends" would
+# arrive at the issuer check as the exact string the check accepts. On
+# the pipe the byte survives to be refused.
 #
 # The arguments are the decoder's parameters, then --, then the command.
 # Nothing the host said is ever an argument of the decoder, and the
@@ -410,54 +367,7 @@ PERL
 #   2  anything else, including a command that failed, a document that
 #      will not decode, and a field of the wrong shape
 _acme_json_cmd() {
-  local arg seen=0
-  local -a params=() cmd=()
-  for arg in "$@"; do
-    if ((seen)); then
-      cmd+=("${arg}")
-    elif [[ ${arg} == '--' ]]; then
-      seen=1
-    else
-      params+=("${arg}")
-    fi
-  done
-  ((seen)) || return 2
-  ((${#cmd[@]} > 0)) || return 2
-
-  local captured states source_status decode_status
-  captured=$(
-    # Without this the pipeline's failure would end the subshell under
-    # `set -e` before either status could be reported.
-    set +e
-    "${cmd[@]}" 2>/dev/null |
-      perl -e "${_ACME_JSON_PROGRAM}" -- ${params[@]+"${params[@]}"} 2>/dev/null
-    printf '\n%s' "${PIPESTATUS[*]}"
-  )
-  states=${captured##*$'\n'}
-  captured=${captured%$'\n'*}
-  source_status=${states%% *}
-  decode_status=${states##* }
-  [[ ${source_status} == 0 ]] || return 2
-  while [[ ${captured} == *$'\n' ]]; do
-    captured=${captured%$'\n'}
-  done
-  case ${decode_status} in
-    0) printf '%s' "${captured}" ;;
-    1) return 1 ;;
-    *) return 2 ;;
-  esac
-}
-
-# The decoder, checked once and by name.
-#
-# Without it every reading of a pvenode answer returns "I could not tell",
-# which stops the stage with a message about unreadable certificates --
-# true, and unhelpful. JSON::PP is a core module, and Debian keeps the
-# core modules in perl-modules rather than perl-base, so the one host that
-# could lack it is one stripped down to the essential package set.
-acme_require_json_decoder() {
-  perl -MJSON::PP -e 'exit 0' >/dev/null 2>&1 ||
-    die 'This stage reads what pvenode reports with perl and JSON::PP, and one of them is missing. Install the perl package (JSON::PP ships with the core modules, not with perl-base).'
+  _json_decode_cmd "${_ACME_JSON_PROGRAM}" "$@"
 }
 
 # Whether the host already holds this account.
