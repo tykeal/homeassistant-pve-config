@@ -203,7 +203,8 @@ sysroot_file() {
 guest_root() {
   local root="${PVE_CONFIG_MOCK_STATE}/guests/$1/rootfs"
   if [[ ! -d ${root}/etc ]]; then
-    mkdir -p -- "${root}/etc" "${root}/home"
+    mkdir -p -- "${root}/etc" "${root}/home" \
+      "${root}/sys/class/net/lo" "${root}/sys/class/net/tailscale0"
     printf 'root:x:0:0::/root:/bin/bash\n' >"${root}/etc/passwd"
     printf 'root:x:0:\nsudo:x:27:\n' >"${root}/etc/group"
     # A container knows which Debian it is, and the toolkit reads that

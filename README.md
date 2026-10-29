@@ -249,6 +249,9 @@ The driver resolves these keys on every run.
 | `PVE_NETWORK_WAIT_SECONDS` | yes | `60` | Seconds to wait for `vmbr0` to pick up an address, from 0 to 86400 |
 | `PVE_NO_SUBSCRIPTION` | yes | `yes` | Use the no-subscription repository and suppress the subscription notice |
 | `PVE_SUDO_SSH_AGENT` | yes | `yes` | Let `sudo` accept a forwarded SSH agent key |
+| `PVE_GUEST_ADMIN_SSH_ACCESS` | yes | `lan` | Where the administrators mirrored into a container may reach its sshd from: `lan` admits anything that can route to it, `tailnet` restricts it to the tunnel in the container's packet filter |
+| `PVE_GUEST_ADMIN_TAILNET_IFACE` | yes | `tailscale0` | Interface a container's tunnel traffic arrives on, which the `tailnet` restriction binds its accepts to |
+| `PVE_GUEST_ADMIN_ROOT_LOCK` | yes | `no` | Lock the root password of a container this toolkit mirrors the administrators into |
 | `PVE_ZULIP_ENABLED` | yes | `no` | Send boot and shutdown notices to Zulip |
 | `PVE_ZULIP_STREAM` | no | the stage falls back to `infrastructure` | Zulip stream for the notices |
 | `PVE_ZULIP_TOPIC` | no | the notifier falls back to the host FQDN | Zulip topic for the notices |
@@ -751,6 +754,129 @@ The stage applies the resources as it creates the machine. On a machine
 that already exists the stage reports a configured value disagreeing with
 the machine's and leaves it alone, because writing one would mean
 rebooting a running Home Assistant to apply a number.
+### Administrators in a container
+
+Every container this toolkit builds gets the administrators named by
+`PVE_ADMIN_USERS`, with the same keys, the same sshd policy and the same
+`pam_ssh_agent_auth` sudo the host has. One library does the work for both,
+so host and container share the reasoning and differ only in plumbing: the
+host path writes files, the container path reaches through `pct`.
+
+What a container ends up with:
+
+- `sudo`, `openssh-server`, `libpam-ssh-agent-auth` and `nftables`;
+- an account per administrator, in `sudo`, with their own
+  `~/.ssh/authorized_keys`;
+- `/etc/security/authorized_keys` at `0600` holding every administrator's
+  key, and exactly one `pam_ssh_agent_auth` line in `/etc/pam.d/sudo`;
+- a `0440` sudoers drop-in keeping `SSH_AUTH_SOCK` across `sudo`, which
+  `visudo -c` on the host approves before the push;
+- sshd with `PasswordAuthentication no` and `KbdInteractiveAuthentication
+  no`, in a drop-in the host's `sshd -t` judges against a copy of the
+  container's own configuration;
+- `TERM` set for the sessions `pct enter` starts;
+- where `PVE_GUEST_ADMIN_ROOT_LOCK` is `yes`, a locked root password,
+  once the toolkit has read every one of those back out of the container
+  and found them working. The default is `no`: a root password that is
+  still set is one more way in that does not depend on this toolkit
+  having got the keys right, and giving that up is the operator's call.
+
+`PVE_GUEST_ADMIN_SSH_ACCESS` decides where that sshd answers. `lan`, the
+default, lets anything that can route to the container reach sshd.
+`tailnet` restricts it two ways: an `AllowUsers` qualified with the
+tailnet's address space, and a small nftables table in the container that
+drops port 22 from anywhere else. The nftables rule is the one that bounds
+exposure, because `AllowUsers` still talks to a LAN client and only then
+declines to authenticate it. sshd's own `ListenAddress` cannot do the job:
+the tailnet address does not exist until the container joins the tunnel,
+and sshd refuses to start without it. Moving a container from `tailnet`
+to `lan` takes the table away again on the next run.
+
+The accepts name the interface the tunnel's traffic arrives on rather
+than matching its source address alone: `100.64.0.0/10` is ordinary
+address space, and the table would otherwise admit a LAN host that holds
+an address out of it. `PVE_GUEST_ADMIN_TAILNET_IFACE` names that interface and
+defaults to `tailscale0`. A container that has no such interface stops
+the run, because the table it would get there drops ssh from everywhere,
+the tunnel included -- bring the tunnel up first, or set the
+key to the name it uses.
+
+Under `tailnet` the toolkit also refuses a container whose configuration
+puts sshd on any port other than 22, or adds a listener on one: the
+table it writes covers port 22, and a second port would be reachable
+from the LAN while every check here reported the container restricted.
+
+The toolkit also checks that the restriction survives a reboot, because
+one restricted now and open after a restart is the worst of both. That
+means `/etc/nftables.conf` and everything it includes still loading --
+one malformed file in `/etc/nftables.d` takes the whole boot
+configuration down -- and that nothing replays over the top of it
+afterwards. `/etc/nftables.conf` may hold comments and nothing else past
+the include of `/etc/nftables.d`, and no other fragment in that
+directory may flush the ruleset or take this toolkit's table away.
+Either stops the run: a boot sequence this cannot account for is not one
+to lock a root password on the strength of.
+
+Before it hardens anything, the toolkit copies the container's
+`sshd_config` and the whole of `/etc/ssh/sshd_config.d` -- subdirectories
+included -- and works out who that configuration admits. An `Include`
+naming anything the copy does not hold, or a path that resolves outside
+that directory, stops the run: a configuration this node cannot reproduce
+is one it cannot judge, and disabling passwords against a guess is how
+operators get locked out.
+
+Two settings in that configuration stop the run outright. An
+`AuthenticationMethods` value no alternative of which a key alone
+satisfies -- `publickey,password`, where the comma means *and* -- would
+leave every administrator unable to finish authenticating once passwords
+go away. And `AllowAgentForwarding no` or `DisableForwarding yes`, in the
+main file or under a `Match`, blocks the root lock: `sudo` in the
+container authenticates with the forwarded agent key, so a daemon that
+will not carry one is not access worth giving the root password up for.
+
+That reading is deliberately narrow, and it refuses two things sshd
+itself accepts:
+
+- an `Include` operand holding a quote, a backslash, whitespace or a
+  control character -- `Include "/etc/ssh/sshd_config.d/*.conf"` stops
+  the run, although sshd reads it;
+- a drop-in filename with anything in it beyond letters, digits, dots,
+  dashes and underscores, including one with a newline in the name.
+
+Both abort with a message naming the file. Rename the file, or write the
+`Include` unquoted, and the run proceeds. The narrowness is the point:
+each of these is a place where this toolkit would otherwise have to
+reproduce a corner of OpenSSH's own parser, and a wrong guess there is a
+lockout rather than a failed run. Issue #30 replaces the whole reading
+with `sshd -T` -- sshd's parser answering for itself -- and lifts these
+restrictions. The copy keeps a filename that begins with a dot rather
+than refusing it: `Include .../*.conf` does not load one, but an
+`Include` naming it outright does.
+
+Treat the container-side filter as hardening, not as a boundary against
+the container itself. Root inside the container can flush the table; a
+later run reads the running ruleset back and notices, but between runs
+nothing stops it. It shrinks what the LAN can reach, and it does not make
+a container's root account somebody you can distrust.
+
+The ordering carries the safety. The toolkit turns password authentication
+off only after reading every administrator's key back out of the container
+and finding one sshd would accept. A configuration that turns the root
+lock on gets it only after the hardened sshd runs, the restriction holds,
+and a second check confirms that access. A run interrupted between writing the hardening and
+reloading sshd leaves a marker in the container, so the next run reloads
+the daemon rather than reading the files, finding them right, and locking
+root against a daemon still serving the old policy. Anything it cannot
+read aborts the run rather than counting as a `no`. `pct enter` from the
+node survives every step and remains the recovery path.
+
+One thing this deliberately avoids: linking `/etc/pam.d/sudo-i` to
+`/etc/pam.d/sudo`. Debian ships both files and they differ -- `sudo` ends
+with `@include common-session-noninteractive` and `sudo-i` with `@include
+common-session`, which is what gives a `sudo -i` login shell its logind
+session -- so the toolkit converges the agent line into each of them
+instead. Where somebody has already linked `sudo-i` to `sudo`, it changes
+nothing.
 
 ## Idempotency and safety
 
@@ -772,8 +898,10 @@ before you let a run touch networking or SSH policy.
 - **It verifies SSH keys before turning passwords off.** Stage 70 checks,
   for every administrator, that the account exists, that their
   `authorized_keys` carries the configured key as an active entry, and that
-  at least one entry for that key carries no `from=`, `command=`, `restrict`
-  or `no-pty` restriction the stage cannot verify a login through. It also
+  at least one entry for that key carries no `from=`, `command=`, `restrict`,
+  `no-pty` or `no-agent-forwarding` restriction the stage cannot verify a
+  login through. `no-agent-forwarding` matters as much as the rest: the
+  agent key is what `sudo` authenticates with. It also
   checks that no `AuthorizedKeysFile` directive — global or under a `Match`
   — points anywhere other than `~/.ssh/authorized_keys`, and that
   `AllowUsers`, `DenyUsers`, `AllowGroups` and `DenyGroups` still admit

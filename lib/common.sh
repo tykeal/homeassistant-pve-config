@@ -665,8 +665,8 @@ _sshd_redirect_includes() {
   local -a operands=()
   while IFS= read -r line || [[ -n ${line} ]]; do
     trimmed=${line#"${line%%[![:space:]]*}"}
-    if [[ ${trimmed} == [Ii]nclude[[:space:]]* ]]; then
-      keyword=${trimmed%%[[:space:]]*}
+    keyword=${trimmed%%[[:space:]]*}
+    if [[ ${keyword,,} == include ]]; then
       rewritten=''
       # read, not an unquoted expansion: the operand is a pattern naming
       # files on the host, and letting the shell expand it here would
@@ -699,11 +699,12 @@ _sshd_redirect_includes() {
 # how a host ends up reporting itself hardened and still taking passwords.
 _sshd_includes_candidate() {
   local body=$1 candidate=$2
-  local line trimmed glob match
+  local line trimmed keyword glob match
   local -a operands=()
   while IFS= read -r line || [[ -n ${line} ]]; do
     trimmed=${line#"${line%%[![:space:]]*}"}
-    [[ ${trimmed} == [Ii]nclude[[:space:]]* ]] || continue
+    keyword=${trimmed%%[[:space:]]*}
+    [[ ${keyword,,} == include ]] || continue
     read -r -a operands <<<"${trimmed#*[[:space:]]}"
     for glob in ${operands[@]+"${operands[@]}"}; do
       for match in ${glob}; do
@@ -722,25 +723,43 @@ _sshd_includes_candidate() {
 _sshd_effective_config() {
   local candidate=$1 target=$2 dir=$3
   local conf_d="${dir}/sshd_config.d"
-  local base main body='' existing root
+  local base main body='' root
   root=$(sysroot)
   base=$(basename -- "${target}")
 
   mkdir -p -- "${conf_d}" || return 1
 
-  # Every file in the directory, not only *.conf: an Include naming
-  # `site-policy` or `*.cfg` pulls in whatever it names, and leaving those
-  # out of the scratch tree would validate a configuration the daemon does
-  # not have.
+  # The whole directory, structure and all: not only *.conf, because an
+  # Include naming `site-policy` or `*.cfg` pulls in whatever it names,
+  # and not only its immediate children, because a drop-in may itself
+  # Include a subdirectory. Leaving either out would validate a
+  # configuration the daemon does not have.
   local src="${root}/etc/ssh/sshd_config.d"
   if [[ -d ${src} ]]; then
-    for existing in "${src}"/*; do
-      [[ -f ${existing} ]] || continue
-      [[ $(basename -- "${existing}") == "${base}" ]] && continue
-      cp -- "${existing}" "${conf_d}/" || return 1
-    done
+    # Dereferenced: a drop-in that is a symlink is a file sshd reads
+    # through the link, and copying the link itself would leave it
+    # dangling in the scratch tree -- or, for an absolute one, pointing
+    # back at the live policy this is standing in for. `cp` reports a
+    # link it cannot follow, and a cycle, with a non-zero status, which
+    # is the abort this wants.
+    cp -a -L -- "${src}/." "${conf_d}/" || return 1
+    rm -f -- "${conf_d}/${base}" || return 1
   fi
   cp -- "${candidate}" "${conf_d}/${base}" || return 1
+
+  # Every copied file's own Includes are redirected too. Rewriting only
+  # the main file would leave a nested Include naming the real
+  # /etc/ssh/sshd_config.d, so sshd would read the live directory while
+  # being asked about the scratch copy of it.
+  local copied copied_body='' redirected
+  while IFS= read -r -d '' copied; do
+    [[ ${copied} == "${conf_d}/${base}" ]] && continue
+    [[ -r ${copied} ]] || return 1
+    _slurp copied_body "${copied}"
+    [[ ${copied_body} == *[Ii][Nn][Cc][Ll][Uu][Dd][Ee]* ]] || continue
+    redirected=$(_sshd_redirect_includes "${copied_body}" "${src}" "${conf_d}")
+    printf '%s\n' "${redirected}" >"${copied}" || return 1
+  done < <(find "${conf_d}" -type f -print0 2>/dev/null)
 
   main="${dir}/sshd_config"
   local host_main="${root}/etc/ssh/sshd_config"
@@ -967,6 +986,184 @@ _sshd_conditional_overrides() {
   done < <(_sshd_config_directives "${main}" "$(sysroot)" "$(dirname -- "${main}")")
 }
 
+# --- who an sshd configuration will admit ---------------------------------
+#
+# AllowUsers, DenyUsers, AllowGroups and DenyGroups decide who sshd will
+# even talk to, before any key is considered. A host or a container that
+# admits only root would reject every administrator configured here, and
+# disabling password authentication on top of that leaves nobody able to
+# log in at all.
+#
+# Both checks report a reason rather than dying, because phase 1 hardens
+# the host and lib/guest-admin.sh hardens a container: the same question
+# is asked of two configurations with two different consequences, and the
+# answer must not depend on which one is asking.
+#
+# display_root is stripped from the paths named in a reason, so a
+# container's configuration -- which is examined through a copy on this
+# host -- is reported under the path the container knows it by.
+_ssh_name_matches() {
+  local name=$1 pattern=$2
+  # A pattern may be qualified with the host it applies from; the account
+  # it admits is the part before the '@'.
+  pattern=${pattern%%@*}
+  [[ -n ${pattern} ]] || return 1
+  # shellcheck disable=SC2053 # the pattern is one, and matching it is the point
+  [[ ${name} == ${pattern} ]]
+}
+
+# sshd only reads ~/.ssh/authorized_keys because that is the default; a
+# configuration that names somewhere else, or `none`, ignores every key
+# installed for an administrator. Disabling passwords on top of that
+# removes the last way in.
+sshd_authorized_keys_problem() {
+  local main=$1 root=$2 literal=$3 display_root=$4
+  [[ -f ${main} ]] || return 0
+
+  local file criteria keyword value operand ok
+  while IFS=$'\x1f' read -r file criteria keyword value; do
+    [[ ${keyword} == authorizedkeysfile ]] || continue
+    ok=0
+    for operand in ${value}; do
+      operand=${operand#'%h/'}
+      [[ ${operand} == '.ssh/authorized_keys' ]] && ok=1
+    done
+    [[ ${ok} -eq 1 ]] && continue
+    [[ -n ${display_root} ]] && file=${file#"${display_root}"}
+    if [[ -n ${criteria} ]]; then
+      printf "%s sets AuthorizedKeysFile to '%s' under 'Match %s', so the keys installed for the administrators would be ignored.\n" \
+        "${file}" "${value}" "${criteria}"
+    else
+      printf "%s sets AuthorizedKeysFile to '%s', so the keys installed for the administrators would be ignored.\n" \
+        "${file}" "${value}"
+    fi
+    return 1
+  done < <(_sshd_config_directives "${main}" "${root}" "${literal}")
+  return 0
+}
+
+# Why this configuration would not let one of these administrators in, or
+# nothing when it would let all of them in.
+#
+# The administrators are given as pairs: a username, then the groups that
+# account belongs to as a comma separated list. The groups come from the
+# database of whichever system is being hardened, so a container is judged
+# by its own group file rather than by the host's.
+sshd_admission_problem() {
+  local main=$1 root=$2 literal=$3 display_root=$4
+  shift 4
+  [[ -f ${main} ]] || return 0
+
+  local display=${main}
+  [[ -n ${display_root} ]] && display=${display#"${display_root}"}
+
+  local -a allow_users=() deny_users=() allow_groups=() deny_groups=()
+  local file criteria keyword value
+  local -a more=()
+  # sshd accumulates every occurrence of these keywords rather than
+  # letting the first one win, so each directive adds to the list.
+  while IFS=$'\x1f' read -r file criteria keyword value; do
+    if [[ -n ${criteria} ]]; then
+      # A conditional one cannot be answered here: whether it applies
+      # depends on the address, the user and the host a connection
+      # arrives with, none of which exist yet. Reading past it would have
+      # a `Match User alice` carrying `DenyUsers alice` judged as though
+      # it were not there, and password authentication taken away from an
+      # account the daemon will not talk to. The contradiction is the
+      # operator's to resolve.
+      case ${keyword} in
+        allowusers | denyusers | allowgroups | denygroups | authenticationmethods)
+          local conditional=${file}
+          [[ -n ${display_root} ]] && conditional=${conditional#"${display_root}"}
+          printf "%s sets %s under 'Match %s', and who that admits cannot be judged ahead of a connection; resolve that before hardening.\n" \
+            "${conditional}" "${keyword}" "${criteria}"
+          return 1
+          ;;
+      esac
+      continue
+    fi
+    read -r -a more <<<"${value}"
+    case ${keyword} in
+      authenticationmethods)
+        # Password authentication is about to go away, so a required
+        # chain that asks for anything besides a key leaves the
+        # administrators with no way of completing it. sshd takes
+        # alternatives separated by spaces and requirements separated by
+        # commas, and succeeds when one alternative is satisfied in
+        # full: `publickey,password` is not an alternative a key alone
+        # finishes, `publickey password` is.
+        local method methods_ok=0
+        for method in ${more[@]+"${more[@]}"}; do
+          [[ ${method} == any || ${method} == publickey ]] && methods_ok=1
+        done
+        if [[ ${methods_ok} -ne 1 ]]; then
+          local where=${file}
+          [[ -n ${display_root} ]] && where=${where#"${display_root}"}
+          printf "%s requires 'AuthenticationMethods %s', which no key alone satisfies; hardening would leave every administrator unable to finish authenticating.\n" \
+            "${where}" "${value}"
+          return 1
+        fi
+        ;;
+      allowusers) allow_users+=(${more[@]+"${more[@]}"}) ;;
+      denyusers) deny_users+=(${more[@]+"${more[@]}"}) ;;
+      allowgroups) allow_groups+=(${more[@]+"${more[@]}"}) ;;
+      denygroups) deny_groups+=(${more[@]+"${more[@]}"}) ;;
+    esac
+  done < <(_sshd_config_directives "${main}" "${root}" "${literal}")
+
+  local user pattern group admitted
+  local -a groups=()
+  while [[ $# -gt 0 ]]; do
+    user=$1
+    IFS=',' read -r -a groups <<<"${2:-}"
+    shift 2
+
+    for pattern in ${deny_users[@]+"${deny_users[@]}"}; do
+      if _ssh_name_matches "${user}" "${pattern}"; then
+        printf "%s denies %s with 'DenyUsers %s', so hardening would leave them unable to log in.\n" \
+          "${display}" "${user}" "${pattern}"
+        return 1
+      fi
+    done
+    if [[ ${#allow_users[@]} -gt 0 ]]; then
+      admitted=0
+      for pattern in "${allow_users[@]}"; do
+        _ssh_name_matches "${user}" "${pattern}" && admitted=1
+      done
+      if [[ ${admitted} -ne 1 ]]; then
+        printf "%s admits only '%s', which does not include %s; hardening would leave them unable to log in.\n" \
+          "${display}" "${allow_users[*]}" "${user}"
+        return 1
+      fi
+    fi
+
+    [[ ${#deny_groups[@]} -gt 0 || ${#allow_groups[@]} -gt 0 ]] || continue
+    for pattern in ${deny_groups[@]+"${deny_groups[@]}"}; do
+      for group in ${groups[@]+"${groups[@]}"}; do
+        if _ssh_name_matches "${group}" "${pattern}"; then
+          printf "%s denies %s's group %s with 'DenyGroups %s', so hardening would leave them unable to log in.\n" \
+            "${display}" "${user}" "${group}" "${pattern}"
+          return 1
+        fi
+      done
+    done
+    if [[ ${#allow_groups[@]} -gt 0 ]]; then
+      admitted=0
+      for pattern in "${allow_groups[@]}"; do
+        for group in ${groups[@]+"${groups[@]}"}; do
+          _ssh_name_matches "${group}" "${pattern}" && admitted=1
+        done
+      done
+      if [[ ${admitted} -ne 1 ]]; then
+        printf "%s admits only the groups '%s', none of which %s is in; hardening would leave them unable to log in.\n" \
+          "${display}" "${allow_groups[*]}" "${user}"
+        return 1
+      fi
+    fi
+  done
+  return 0
+}
+
 # Validators receive the candidate and the path it is destined for, and
 # return non-zero when installing it would be a mistake. They never read the
 # installed file, so a dry run checks exactly what a real run would write.
@@ -1061,11 +1258,16 @@ validate_interfaces_file() {
 #
 # Validation runs during a dry run too, and leaves nothing behind on either
 # path: the scratch directory is removed before this returns.
-install_validated() {
+# Dies unless the validator accepts this content as the file at path.
+#
+# Separate from the install so that a file destined for a container is
+# checked by exactly the tools and the reasoning the host's copy is: the
+# candidate is prepared and validated here either way, and only where it
+# is finally written differs.
+assert_candidate_valid() {
   local path=$1 content=$2 mode=$3 validator=$4
-  _refuse_symlink "${path}"
   declare -F "${validator}" >/dev/null 2>&1 ||
-    die "install_validated: no such validator '${validator}'"
+    die "assert_candidate_valid: no such validator '${validator}'"
 
   local dir status=0
   dir=$(_validation_dir) || die "Unable to create a validation directory for ${path}"
@@ -1086,6 +1288,11 @@ install_validated() {
   [[ ${status} -ne 2 ]] || die "Unable to prepare the candidate for ${path}"
   [[ ${status} -eq 0 ]] ||
     die "Refusing to install ${path}: the candidate failed validation"
+}
 
+install_validated() {
+  local path=$1 content=$2 mode=$3 validator=$4
+  _refuse_symlink "${path}"
+  assert_candidate_valid "${path}" "${content}" "${mode}" "${validator}"
   write_file "${path}" "${content}" "${mode}"
 }

@@ -29,8 +29,10 @@ done
   exit 1
 }
 
-known='Match Include AcceptEnv AllowGroups AllowUsers AuthorizedKeysFile ChallengeResponseAuthentication
-GatewayPorts HostKey KbdInteractiveAuthentication ListenAddress LogLevel
+known='Match Include AcceptEnv AllowAgentForwarding AllowGroups AllowUsers
+AuthenticationMethods AuthorizedKeysFile ChallengeResponseAuthentication
+DisableForwarding GatewayPorts HostKey KbdInteractiveAuthentication
+ListenAddress LogLevel
 PasswordAuthentication PermitRootLogin Port PubkeyAuthentication Subsystem
 UsePAM X11Forwarding'
 

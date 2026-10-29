@@ -93,13 +93,14 @@ user_in_group() {
 
 # Every group the account belongs to: the primary one named by its passwd
 # entry, and each group that lists it as a member.
-user_groups() {
-  local name=$1 gid
-  gid=$(user_gid "${name}") || gid=''
-  local file
-  file=$(_users_group_file)
+#
+# Parsed from the contents of a group database rather than from a path, so
+# a container's copy -- which is read out through pct -- is understood by
+# exactly the same code as the host's.
+_groups_from_body() {
+  local body=$1 name=$2 gid=$3
   awk -F: -v n="${name}" -v g="${gid}" '
-    $3 == g { print $1; next }
+    $3 == g && g != "" { print $1; next }
     {
       split($4, members, ",")
       for (i in members) {
@@ -109,7 +110,14 @@ user_groups() {
         }
       }
     }
-  ' "${file}" 2>/dev/null
+  ' <<<"${body}" 2>/dev/null
+}
+
+user_groups() {
+  local name=$1 gid body=''
+  gid=$(user_gid "${name}") || gid=''
+  _slurp body "$(_users_group_file)"
+  _groups_from_body "${body}" "${name}" "${gid}"
 }
 
 user_join_group() {
@@ -154,12 +162,15 @@ _ssh_key_options() {
 # Whether an entry would let an administrator log in from anywhere and get
 # a shell. Source restrictions and forced commands may well be deliberate,
 # but they are not something this toolkit can verify remote access through.
+# no-agent-forwarding belongs in that list because the forwarded agent key
+# is what sudo authenticates with here, so a login that cannot carry it is
+# not the administrative access this toolkit is about to rely on.
 ssh_key_entry_is_unrestricted() {
   local opts
   opts=$(_ssh_key_options "$1")
   [[ -n ${opts} ]] || return 0
   case ",${opts,,}," in
-    *from=* | *command=* | *restrict* | *no-pty*) return 1 ;;
+    *from=* | *command=* | *restrict* | *no-pty* | *no-agent-forwarding*) return 1 ;;
   esac
   return 0
 }
@@ -208,6 +219,88 @@ _ssh_keys_normalise() {
   done <<<"${text}"
 }
 
+# Why these keys would not get this administrator in through the given
+# authorized_keys body, or nothing when they all would.
+#
+# Reported rather than fatal, because the host hardens itself and
+# lib/guest-admin.sh hardens a container: the same question is asked of
+# two systems, and the answer must not depend on which one is asking.
+# Judged on contents rather than on a path for the same reason -- a
+# container's file is read out through pct and never opened here.
+authorized_keys_access_problem() {
+  local body=$1 keys=$2 user=$3 file=$4 remedy=$5
+  local -A active=() unrestricted=()
+  local entry identity key
+
+  # Active entries only. A commented out key is not one sshd would
+  # accept, and taking it for one would disable passwords behind a login
+  # nobody has.
+  while IFS= read -r entry || [[ -n ${entry} ]]; do
+    _is_comment "${entry}" && continue
+    identity=$(_ssh_key_identity "${entry}") || continue
+    active["${identity}"]=1
+    # An entry carrying from= or a forced command may be deliberate, but
+    # it is not one this toolkit can call a working remote login, and
+    # rewriting someone else's restriction is not ours to do either.
+    ssh_key_entry_is_unrestricted "${entry}" && unrestricted["${identity}"]=1
+  done <<<"${body}"
+
+  while IFS= read -r key || [[ -n ${key} ]]; do
+    [[ -n ${key} ]] || continue
+    key=$(_ssh_key_identity "${key}") || continue
+    if [[ -z ${active[${key}]+set} ]]; then
+      printf "%s's configured key is not active in %s; %s.\n" \
+        "${user}" "${file}" "${remedy}"
+      return 1
+    fi
+    if [[ -z ${unrestricted[${key}]+set} ]]; then
+      printf "%s's only entry for that key in %s carries restrictions (from=, command=, restrict, no-pty or no-agent-forwarding) that this toolkit cannot verify remote logins through; add an unrestricted entry or relax the restriction before hardening SSH.\n" \
+        "${user}" "${file}"
+      return 1
+    fi
+  done <<<"${keys}"
+  return 0
+}
+
+# The authorized_keys body that holds everything the file already had plus
+# every wanted key that is not in it yet, assigned to the named variable.
+#
+# A key is installed only once ssh-keygen has accepted it, and an entry
+# already present is matched on its identity rather than on its text, so a
+# key whose comment changed is not added a second time. Both targets merge
+# through this, so a container's file cannot drift away from the rule the
+# host's follows.
+_authorized_keys_merged() {
+  local __var=$1 __body=$2 __keys=$3 __who=$4
+  local __merged='' __line __identity
+  local -A __seen=()
+
+  if [[ -n ${__body} ]]; then
+    while IFS= read -r __line || [[ -n ${__line} ]]; do
+      __merged+="${__line}"$'\n'
+      # A commented out key is kept, but it is not an active entry:
+      # counting it as one would suppress the real key and leave the
+      # administrator without a usable login once passwords are disabled.
+      _is_comment "${__line}" && continue
+      __identity=$(_ssh_key_identity "${__line}") || continue
+      __seen["${__identity}"]=1
+    done <<<"${__body%$'\n'}"
+  fi
+
+  while IFS= read -r __line || [[ -n ${__line} ]]; do
+    [[ -n ${__line} ]] || continue
+    __identity=$(_ssh_key_identity "${__line}") ||
+      die "Not an SSH public key: ${__line}"
+    ssh_key_is_valid "${__line}" ||
+      die "ssh-keygen rejects this key for ${__who}: ${__line}"
+    [[ -n ${__seen[${__identity}]+set} ]] && continue
+    __seen["${__identity}"]=1
+    __merged+="${__line}"$'\n'
+  done < <(_ssh_keys_normalise "${__keys}")
+
+  printf -v "${__var}" '%s' "${__merged}"
+}
+
 # Merges keys into a user's authorized_keys without ever duplicating one,
 # and leaves the directory and file with the ownership and permissions sshd
 # insists on before it will read them.
@@ -240,30 +333,9 @@ authorized_keys_install() {
     changed=1
   fi
 
-  local merged='' existing identity wanted
-  local -A seen=()
-  if [[ -f ${file} ]]; then
-    while IFS= read -r existing || [[ -n ${existing} ]]; do
-      merged+="${existing}"$'\n'
-      # A commented out key is kept, but it is not an active entry: counting
-      # it as one would suppress the real key and leave the administrator
-      # without a usable login once passwords are disabled.
-      _is_comment "${existing}" && continue
-      identity=$(_ssh_key_identity "${existing}") || continue
-      seen["${identity}"]=1
-    done <"${file}"
-  fi
-
-  while IFS= read -r wanted || [[ -n ${wanted} ]]; do
-    [[ -n ${wanted} ]] || continue
-    identity=$(_ssh_key_identity "${wanted}") ||
-      die "Not an SSH public key: ${wanted}"
-    ssh_key_is_valid "${wanted}" ||
-      die "ssh-keygen rejects this key for ${user}: ${wanted}"
-    [[ -n ${seen[${identity}]+set} ]] && continue
-    seen["${identity}"]=1
-    merged+="${wanted}"$'\n'
-  done < <(_ssh_keys_normalise "${keys}")
+  local existing='' merged
+  [[ -f ${file} ]] && _slurp existing "${file}"
+  _authorized_keys_merged merged "${existing}" "${keys}" "${user}"
 
   state_of state write_file "${file}" "${merged}" 0600
   if [[ ${state} == changed ]]; then

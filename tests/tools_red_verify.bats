@@ -13,7 +13,19 @@ setup() {
   # Breaking the tool in place is not safe: bash reads a script as it
   # runs it, so these cases are pointed at a copy when the tool itself is
   # the thing under mutation.
-  TOOL="${PVE_CONFIG_TEST_RED_VERIFY:-${REPO_ROOT}/tests/tools/red-verify.sh}"
+  TOOL="${PVE_CONFIG_TEST_RED_VERIFY:-}"
+  if [[ -z ${TOOL} ]]; then
+    # The tool keeps its backups in the root of the tree it is run from,
+    # which under `bats --jobs` is a directory every other case running
+    # at the same time is writing to as well. Each case gets its own
+    # copy, so a leftover found below is this case's leftover and not a
+    # neighbour's.
+    mkdir -p -- "${BATS_TEST_TMPDIR}/tool/tests/tools"
+    cp -p -- "${REPO_ROOT}/tests/tools/red-verify.sh" \
+      "${BATS_TEST_TMPDIR}/tool/tests/tools/red-verify.sh"
+    TOOL="${BATS_TEST_TMPDIR}/tool/tests/tools/red-verify.sh"
+  fi
+  TOOL_ROOT=$(cd -- "$(dirname -- "${TOOL}")/../.." && pwd)
   export FIXTURE_SOURCE="${BATS_TEST_TMPDIR}/fixture.sh"
   FIXTURE_TESTS="${BATS_TEST_TMPDIR}/fixture.bats"
 
@@ -53,7 +65,7 @@ run_tool() {
 }
 
 leftover_backups() {
-  find "${REPO_ROOT}" -maxdepth 1 -name '.red-verify.*' | sort | tr '\n' ' '
+  find "${TOOL_ROOT}" -maxdepth 1 -name '.red-verify.*' | sort | tr '\n' ' '
 }
 
 source_digest() {

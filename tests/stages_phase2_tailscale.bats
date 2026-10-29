@@ -19,6 +19,11 @@ KEYRING_PAYLOAD='pve-config test fixture: Tailscale repository signing key'
 # The tag the stage puts on the container it owns.
 OWNER_TAG='pve-config-tailscale'
 
+# A real ed25519 public key: ssh-keygen is not mocked, and the stage
+# mirrors the node's administrators into the container it builds, so a
+# key-shaped string that ssh-keygen rejects would stop every test here.
+ADMIN_KEY='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHICzn119CbPFScmFx6z3R+fB1xufI4WNnsZ0U7HUtEM alice@example.net'
+
 setup() {
   load_libs
   isolate_env
@@ -30,6 +35,37 @@ setup() {
   # fixture tree rather than at GitHub.
   export COMMUNITY_SCRIPTS_URL="file://${REPO_ROOT}/tests/helpers/community-scripts"
   export COMMUNITY_SCRIPTS_CORE_URL='file:///nonexistent/core'
+  stub_guest_admin
+}
+
+# Mirroring the node's administrators into the container is minutes of
+# work per case and nothing a case about routes, auth keys or tags is
+# asking about. tests/guest_admin.bats covers the module itself; the
+# cases below that call mirror_administrators run the real thing, so the
+# stage really calling it is still verified here.
+#
+# Substituted whole, through the PVE_CONFIG_LIB_DIR the driver already
+# sets, rather than by reaching into the module: a stub that stood in for
+# part of it would be a second implementation to keep honest.
+stub_guest_admin() {
+  local dir="${BATS_TEST_TMPDIR}/stub-lib" file
+  mkdir -p -- "${dir}"
+  for file in "${REPO_ROOT}"/lib/*.sh; do
+    ln -sfn "${file}" "${dir}/$(basename -- "${file}")"
+  done
+  # Removed before it is written, not written over: writing to a symlink
+  # writes through it, and the file on the other end is the module this
+  # suite is standing in for.
+  rm -f -- "${dir}/guest-admin.sh"
+  printf '%s\n' 'guest_admin_converge() { printf "unchanged\\n"; }' \
+    >"${dir}/guest-admin.sh"
+  export PVE_CONFIG_LIB_DIR="${dir}"
+}
+
+# Puts the real module back, for a case that is about the stage mirroring
+# the administrators rather than about what else the stage does.
+mirror_administrators() {
+  export PVE_CONFIG_LIB_DIR="${REPO_ROOT}/lib"
 }
 
 stage_config() {
@@ -39,6 +75,8 @@ stage_config() {
   export PVE_TAILSCALE_ENABLED='yes'
   export PVE_TAILSCALE_HOSTNAME='ts-pve1'
   export PVE_ACME_ENABLED='no'
+  export PVE_ADMIN_USERS='alice'
+  export PVE_ADMIN_KEY_SOURCE="${ADMIN_KEY}"
   export PVE_TAILSCALE_KEYRING_SHA256
   PVE_TAILSCALE_KEYRING_SHA256=$(printf '%s\n' "${KEYRING_PAYLOAD}" |
     sha256sum | cut -d' ' -f1)
@@ -96,6 +134,7 @@ advertised_routes() {
 }
 
 @test "20-tailscale builds the container, installs tailscale and joins the tailnet" {
+  mirror_administrators
   run run_tailscale
   [ "$status" -eq 0 ]
 
@@ -110,6 +149,25 @@ advertised_routes() {
 
   mock_calls | grep -q 'tailscale up '
   [ "$(advertised_routes 100)" = "${LAN_SUBNET}" ]
+
+  # And the node's administrators are in it, which is the part the other
+  # cases here stub out.
+  grep -q '^alice:' "$(guest_file 100 /etc/passwd)"
+  grep -qx 'PasswordAuthentication no' \
+    "$(guest_file 100 /etc/ssh/sshd_config.d/99-pve-config-admin.conf)"
+  # The root password is left as the operator's fallback unless they ask
+  # for it to be locked, so nothing here has touched it.
+  run grep -q 'passwd -l root' <(mock_calls)
+  [ "$status" -ne 0 ]
+}
+
+@test "20-tailscale locks the container's root password when asked to" {
+  export PVE_GUEST_ADMIN_ROOT_LOCK='yes'
+  mirror_administrators
+
+  run run_tailscale
+  [ "$status" -eq 0 ]
+  grep -q '^root:!' "$(guest_file 100 /etc/shadow)"
 }
 
 @test "a freshly built container ends up with both TUN lines and the device" {
@@ -308,6 +366,10 @@ advertised_routes() {
 }
 
 @test "20-tailscale converges on a second run" {
+  # With the real mirror, because a second run over a container whose
+  # administrators are already in it is where this stage would most
+  # easily stop being convergent.
+  mirror_administrators
   assert_stage_converges_with run_phase2_stage 20-tailscale.sh
 }
 
