@@ -399,6 +399,9 @@ _target_file_has_no_nul() {
   local file=$1 total stripped
   total=$(wc -c <"${file}") || return 1
   stripped=$(tr -d '\000' <"${file}" | wc -c) || return 1
+  # -eq evaluates both sides arithmetically, so each is proven a count
+  # first; anything else is treated as a file that cannot be carried.
+  [[ ${total} =~ ^[0-9]+$ && ${stripped} =~ ^[0-9]+$ ]] || return 1
   [[ ${total} -eq ${stripped} ]]
 }
 
@@ -446,15 +449,6 @@ target_slurp() {
   _target_scratch_release "${__tmp}"
 }
 
-# True for a mode that is safe to hand to `$((8#...))`.
-#
-# One to four octal digits, optionally prefixed with a zero. `stat -c '%a'`
-# drops every leading zero, so it reports 0000 as `0` and 0070 as `70`, and
-# both have to pass.
-_is_octal_mode() {
-  [[ $1 =~ ^0?[0-7]{1,4}$ ]]
-}
-
 # The permission bits as the target reports them, or non-zero when the path
 # is not there.
 #
@@ -462,7 +456,10 @@ _is_octal_mode() {
 # Every consumer feeds it to `$((8#...))`, and bash arithmetic evaluates an
 # array subscript, so an unvalidated string from a container would run
 # commands as root on the host -- during a dry run as readily as any other
-# time. The guest is not trusted to answer this question sensibly.
+# time. The guest is not trusted to answer this question sensibly, and the
+# host's answer is held to the same rule so neither branch can hand back a
+# mode the other would refuse. The check is _is_octal_mode in
+# lib/common.sh, the one every mode in the toolkit passes through.
 target_mode() {
   local __var=$1 target=$2 path=$3 __mode_raw
   _target_valid "${target}"
@@ -470,15 +467,16 @@ target_mode() {
     __mode_raw=$(stat -c '%a' -- "$(target_path "${target}" "${path}")" 2>/dev/null) || return 1
   else
     target_capture __mode_raw "${target}" stat -c '%a' -- "${path}" || return 1
-    _is_octal_mode "${__mode_raw}" ||
-      die "$(target_describe "${target}") reported a mode for ${path} that is not octal: '${__mode_raw}'"
   fi
+  _is_octal_mode "${__mode_raw}" ||
+    die "$(target_describe "${target}") reported a mode for ${path} that is not octal: '${__mode_raw}'"
   printf -v "${__var}" '%s' "${__mode_raw}"
   return 0
 }
 
 _target_mode_matches() {
   local target=$1 path=$2 mode=$3 current
+  _is_octal_mode "${mode}" || die "Not an octal file mode: '${mode}'"
   target_mode current "${target}" "${path}" || return 1
   [[ $((8#${current})) -eq $((8#${mode})) ]]
 }

@@ -107,9 +107,30 @@ _squash_ws() {
   printf '%s' "${text% }"
 }
 
+# True for a mode that is safe to hand to `$((8#...))`.
+#
+# One to four octal digits, optionally prefixed with a zero. `stat -c '%a'`
+# drops every leading zero, so it reports 0000 as `0` and 0070 as `70`, and
+# both have to pass.
+#
+# Every mode is checked with this before it reaches arithmetic, whoever
+# supplied it. Bash evaluates an array subscript inside an arithmetic
+# context, so a string such as `0+a[$(cmd)]` arriving from stat, a guest or
+# a caller would run cmd as root.
+_is_octal_mode() {
+  [[ $1 =~ ^0?[0-7]{1,4}$ ]]
+}
+
+# A mode that is not octal digits is a die rather than a mismatch, whether
+# the caller or stat supplied it. Calling it a mismatch would send a dry run
+# off to report a chmod it cannot know is needed, and a stat that answers
+# with something other than a mode is not one to keep converging against.
 _mode_matches() {
   local path=$1 mode=$2 current
+  _is_octal_mode "${mode}" || die "Not an octal file mode: '${mode}'"
   current=$(stat -c '%a' -- "${path}" 2>/dev/null) || return 1
+  _is_octal_mode "${current}" ||
+    die "stat reported a mode for ${path} that is not octal: '${current}'"
   [[ $((8#${current})) -eq $((8#${mode})) ]]
 }
 
@@ -492,6 +513,10 @@ ensure_not_group_other_writable() {
     return 0
   fi
   mode=$(stat -c '%a' -- "${path}" 2>/dev/null) || die "Unable to read the mode of ${path}"
+  # A mode that cannot be read is not a mode known to be safe, so this
+  # stops rather than reporting the path unchanged.
+  _is_octal_mode "${mode}" ||
+    die "stat reported a mode for ${path} that is not octal: '${mode}'"
   if ((8#${mode} & 8#22)); then
     if dry_run_enabled; then
       log_info "would clear the group and other write bits on ${path}"

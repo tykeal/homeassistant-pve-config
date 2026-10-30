@@ -512,18 +512,68 @@ guest_commands() {
 # Bash arithmetic evaluates an array subscript, so `$((8#${mode}))` on a
 # string a container chose would run commands as root on the host. The mode
 # is validated where it enters, before any consumer does arithmetic on it.
+#
+# The payload leads with `0+`: after `8#` a bare `x[...]` is a bad digit,
+# which bash rejects before it reaches the subscript, so it would leave no
+# marker whether or not anything validated it.
 @test "a mode a container makes up is refused before arithmetic sees it" {
-  local hostile="x[\$(touch \"${TMPDIR}/pwned\")]"
+  local hostile="0+a[\$(touch \"${TMPDIR}/pwned\")]"
   target_capture() { printf -v "$1" '%s' "${hostile}"; }
+
+  run target_ensure_not_group_other_writable "${GUEST}" /etc/pve-config.conf
+  [ ! -e "${TMPDIR}/pwned" ]
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'not octal'* ]]
 
   run target_mode mode "${GUEST}" /etc/pve-config.conf
   [ "$status" -ne 0 ]
   [[ "$output" == *'not octal'* ]]
-  [ ! -e "${TMPDIR}/pwned" ]
+}
 
-  run target_ensure_not_group_other_writable "${GUEST}" /etc/pve-config.conf
-  [ "$status" -ne 0 ]
+# The host's stat is held to the same rule, so target_mode cannot hand a
+# caller a value from one branch that the other would have refused.
+@test "a mode the host's stat makes up is refused by target_mode" {
+  local file="${PVE_CONFIG_ROOT}/etc/pve-config.conf"
+  printf 'x' >"${file}"
+  stat() {
+    if [[ $# -eq 4 && $1 == -c && $2 == '%a' && $4 == "${file}" ]]; then
+      # shellcheck disable=SC2016  # the unexpanded substitution is the payload
+      printf '0+a[$(touch %s)]\n' "${TMPDIR}/pwned"
+      return 0
+    fi
+    command stat "$@"
+  }
+
+  local mode=''
+  run target_mode mode "${HOST}" /etc/pve-config.conf
   [ ! -e "${TMPDIR}/pwned" ]
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'the host reported a mode'*'not octal'* ]]
+}
+
+# The mode a caller asks for meets the guest's in the same comparison, so it
+# is held to the same rule before it gets there.
+@test "a mode argument that is not octal is refused before a guest comparison" {
+  seed_guest_file "${CT}" /etc/pve-config.conf 'same' 0644
+
+  run target_write_file "${GUEST}" /etc/pve-config.conf 'same' \
+    "0+a[\$(touch \"${TMPDIR}/pwned\")]"
+  [ ! -e "${TMPDIR}/pwned" ]
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'Not an octal file mode'* ]]
+  [ "$(stat -c '%a' "$(guest_file "${CT}" /etc/pve-config.conf)")" = 644 ]
+}
+
+# The byte counts meet in -eq, which evaluates both sides arithmetically.
+@test "a byte count that is not a number is refused before -eq sees it" {
+  local file="${BATS_TEST_TMPDIR}/pulled"
+  printf 'x' >"${file}"
+  # shellcheck disable=SC2016  # the unexpanded substitution is the payload
+  wc() { printf '0+a[$(touch %s)]\n' "${TMPDIR}/pwned"; }
+
+  run _target_file_has_no_nul "${file}"
+  [ ! -e "${TMPDIR}/pwned" ]
+  [ "$status" -ne 0 ]
 }
 
 @test "a container file holding a NUL byte is refused, not truncated" {
