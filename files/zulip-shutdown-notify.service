@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: 2026 Andrew Grimberg <tykeal@bardicgrove.org>
+# SPDX-License-Identifier: Apache-2.0
+
+[Unit]
+Description=Send Zulip shutdown notification
+DefaultDependencies=no
+Before=shutdown.target
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/zulip-notify.sh shutdown
+TimeoutStartSec=15
+
+[Install]
+WantedBy=shutdown.target

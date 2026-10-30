@@ -1,8 +1,0 @@
-#!/usr/bin/env bash
-# SPDX-FileCopyrightText: 2026 Andrew Grimberg <tykeal@bardicgrove.org>
-# SPDX-License-Identifier: Apache-2.0
-
-# Records the invocation and succeeds. Stage tests assert on the log rather
-# than on a host whose networking they must not touch.
-printf '%s %s\n' "$(basename -- "$0")" "$*" >>"${PVE_CONFIG_MOCK_LOG:-/dev/null}"
-exit 0

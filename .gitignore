@@ -25,9 +25,6 @@ Thumbs.db
 .idea/
 .worktrees/
 
-# Generated on the Proxmox host by the toolkit; never committed.
-pve-config.conf
-secrets.env
-state/
-.bootstrap/
+# Operator settings with credentials; never committed.
+pve-config.env
 .bats-tmp/

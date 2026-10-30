@@ -1,2 +1,0 @@
-table inet pve_config_admin {
-}
