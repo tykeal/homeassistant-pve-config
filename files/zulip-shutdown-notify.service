@@ -1,16 +1,19 @@
 # SPDX-FileCopyrightText: 2026 Andrew Grimberg <tykeal@bardicgrove.org>
 # SPDX-License-Identifier: Apache-2.0
 
+# Sends the notice from ExecStop: ordered after network-online.target, the
+# unit stops before networking does at shutdown.
 [Unit]
 Description=Send Zulip shutdown notification
-DefaultDependencies=no
-Before=shutdown.target
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/zulip-notify.sh shutdown
-TimeoutStartSec=15
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=/usr/local/bin/zulip-notify.sh shutdown
+TimeoutStopSec=15
 
 [Install]
-WantedBy=shutdown.target
+WantedBy=multi-user.target

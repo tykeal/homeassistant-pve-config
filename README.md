@@ -132,7 +132,8 @@ To turn it on later:
 
 ```bash
 nano /etc/zulip-notify.env       # fill in all four values
-systemctl enable zulip-boot-notify.service zulip-shutdown-notify.service
+systemctl enable zulip-boot-notify.service
+systemctl enable --now zulip-shutdown-notify.service
 /usr/local/bin/zulip-notify.sh boot
 ```
 

@@ -299,7 +299,8 @@ EOF
 # Credentials for /usr/local/bin/zulip-notify.sh. While any value is blank
 # the notifier does nothing. To activate it later:
 #   1. fill in all four values below
-#   2. systemctl enable zulip-boot-notify.service zulip-shutdown-notify.service
+#   2. systemctl enable zulip-boot-notify.service
+#      systemctl enable --now zulip-shutdown-notify.service
 #   3. test with: /usr/local/bin/zulip-notify.sh boot
 EOF
     printf 'ZULIP_URL=%q\nZULIP_BOT_EMAIL=%q\nZULIP_API_KEY=%q\nZULIP_STREAM=%q\n' \
@@ -309,7 +310,8 @@ EOF
   local zulip="inactive (no credentials; see /etc/zulip-notify.env)"
   if [[ -n "${ZULIP_URL:-}" && -n "${ZULIP_BOT_EMAIL:-}" &&
     -n "${ZULIP_API_KEY:-}" && -n "${ZULIP_STREAM:-}" ]]; then
-    systemctl enable zulip-boot-notify.service zulip-shutdown-notify.service
+    systemctl enable zulip-boot-notify.service
+    systemctl enable --now zulip-shutdown-notify.service
     zulip="enabled"
   fi
 

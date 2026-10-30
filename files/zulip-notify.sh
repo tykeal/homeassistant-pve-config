@@ -9,7 +9,8 @@
 #
 #   1. Fill in ZULIP_URL, ZULIP_BOT_EMAIL, ZULIP_API_KEY and ZULIP_STREAM
 #      in /etc/zulip-notify.env
-#   2. systemctl enable zulip-boot-notify.service zulip-shutdown-notify.service
+#   2. systemctl enable zulip-boot-notify.service
+#      systemctl enable --now zulip-shutdown-notify.service
 #   3. Test: /usr/local/bin/zulip-notify.sh boot
 
 set -euo pipefail
