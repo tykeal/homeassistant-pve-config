@@ -11,37 +11,42 @@ established development conventions.
 
 ## Repository Purpose
 
-`pve-config` provides a series of scripts that are executed from a **Proxmox
-VE shell** (as `root`, on the bare metal host) to configure a Proxmox system
-in a reproducible, repeatable fashion. The target base configuration is:
+`pve-config` is two bash scripts run as `root` on a **freshly installed
+Proxmox VE host** to baseline it before it ships to its site, where final
+configuration happens remotely over Tailscale:
 
-- A **Proxmox VE on-metal host** (storage, networking, repositories, host
-  tuning)
-- A **Home Assistant OS VM** guest
-- A **Tailscale LXC container** guest
-- A **Frigate LXC container** guest
+- `pve-baseline.sh` — the host: hostname, DHCP bridge over every wired NIC,
+  repositories, admin user, SSH policy, SSH-agent `sudo`, Zulip notifier.
+  Run once, then reboot.
+- `pve-guests.sh` — the ACME certificate, a **Home Assistant OS VM**, a
+  **Tailscale LXC** subnet router and a **Frigate LXC**. Run once after the
+  reboot.
+
+Files the scripts install on the host or into guests live in `files/`.
+Settings come from `pve-config.env` (copied from `pve-config.env.example`).
 
 ### Design Constraints
 
 These constraints shape every change made to this repository:
 
-- **Idempotent**: Every script MUST be safe to re-run. Detect existing state
-  and skip or converge rather than failing or duplicating resources.
-- **Replicable**: Running the scripts on a fresh Proxmox install MUST produce
-  the same result. No hidden manual steps.
+- **One-shot and simple**: Each script runs once on a fresh install. Keep
+  them plain, linear and readable. Do not add idempotency machinery,
+  dry-run modes, state markers or abstraction layers; re-running on a
+  configured host is out of scope (reinstall Proxmox instead).
+- **Fail fast**: `set -euo pipefail`; stop at the first error rather than
+  trying to recover.
+- **Simple sanity checks only**: running as root, on a Proxmox host, and
+  required settings present (not blank, not the `CHANGEME` placeholder).
 - **Minimal dependencies**: Scripts run on a stock Proxmox VE host. Prefer
   tools present in the Proxmox/Debian base install (`bash`, `pvesh`, `qm`,
-  `pct`, `pvesm`, `curl`, `jq`, `awk`, `sed`). Install anything else
-  explicitly from within the scripts.
-- **Non-interactive by default**: Scripts MUST be runnable unattended.
-  Configuration comes from variables, config files, or environment, not
-  prompts. Interactive prompts MAY exist only behind an explicit opt-in flag.
-- **Destructive operations are opt-in**: Anything that deletes, reformats, or
-  overwrites existing guests or storage MUST require an explicit flag and
-  MUST print what it will do first.
+  `pct`, `pvesm`, `curl`, `awk`, `sed`). Install anything else explicitly
+  from within the scripts.
+- **Non-interactive**: Scripts MUST run unattended. Configuration comes
+  from `pve-config.env`, not prompts.
 - **No secrets in the repository**: API tokens, Tailscale auth keys, and
-  passwords are supplied at runtime (environment variables or an ignored
-  local config file). NEVER commit secrets.
+  passwords are supplied at runtime through the git-ignored
+  `pve-config.env`. Examples use obvious placeholders. NEVER commit
+  secrets or real public keys.
 
 ### Shell Script Conventions
 
@@ -50,7 +55,7 @@ These constraints shape every change made to this repository:
 - Quote all variable expansions; use `"${var}"` form.
 - Use `local` for all function-scoped variables.
 - Provide a `usage()` function and support `-h`/`--help`.
-- Log progress to stderr; keep stdout for machine-consumable output.
+- Log progress to stderr.
 - Validate that the script is running on a Proxmox host before mutating
   state (e.g. check for `pveversion`).
 - Make scripts executable (`chmod +x`) and commit them with the executable
@@ -354,50 +359,25 @@ git branch -D <branch-name>
 
 ## Testing Requirements
 
-These scripts mutate a hypervisor. They cannot be fully exercised on a
-developer workstation, so verification is layered:
+These scripts mutate a hypervisor. They cannot be exercised on a
+developer workstation, so verification is light and layered:
 
 1. **Static analysis** — `shellcheck` and `shfmt` MUST be clean for every
-   shell script. Both run as pre-commit hooks.
-2. **Unit tests** — Testable helper functions (argument parsing, ID
-   allocation, config validation, idempotency checks) SHOULD be covered by
+   shell script, and `bash -n` MUST pass. The linters run as pre-commit
+   hooks.
+2. **Unit tests** — Small pure helpers (NIC detection, resource sizing)
+   and the helper scripts under `files/` have
    [`bats`](https://github.com/bats-core/bats-core) tests under `tests/`:
 
    ```bash
    bats tests/
    ```
 
-3. **Red verification** — A test that passes whether or not the code is
-   right reports coverage it does not have. Before claiming a test covers
-   something, break the code and check that the test notices:
-
-   ```bash
-   tests/tools/red-verify.sh lib/tailscale.sh tests/stages_phase2_tailscale.bats \
-     'the name of the test' 'literal text to break' 'what to put there'
-   ```
-
-   It prints `RED` when the test caught the change, `GREEN` when it did
-   not, `NOCHANGE` when the text was not found, `NOMATCH` when the name
-   selected no test, `AMBIGUOUS` when the text or the name picks out more
-   than one thing, and `ERROR` when the run never happened. Treat `GREEN`
-   as a broken test, not a passing one, and treat everything other than
-   `RED` and `GREEN` as "no result yet".
-
-   Those refusals matter more than they look, because each of them once
-   produced a false `RED`. `bats` exits non-zero when a filter selects
-   nothing, so a misspelled test name reports failure while proving
-   nothing. `bats -f` takes a regex, so a loose name such as `builder`
-   runs eight tests and any unrelated failure among them reads as this
-   mutation being caught. The replacement takes the first occurrence
-   only, so text appearing twice breaks whichever site comes first. Give
-   one test name and enough surrounding context to be unique.
-4. **Dry run** — Scripts SHOULD support a `--dry-run` flag that prints the
-   commands it would execute without running them. Exercise it before
-   proposing a change as complete.
-5. **Host validation** — Changes affecting real Proxmox state MUST be
-   validated by the repository owner on a test host. Agents MUST NOT claim a
-   provisioning change is verified based on static analysis alone; say
-   explicitly what was and was not tested.
+   Keep these few and focused. Do not contort the scripts to make them
+   testable, and do not mock Proxmox commands to simulate whole runs.
+3. **Host validation** — The repository owner validates changes on real
+   hardware. Agents MUST NOT claim a provisioning change works based on
+   static analysis alone; say explicitly what was and was not tested.
 
 This repository is currently pure shell: there is no Python package, no
 `pyproject.toml`, and no Python hooks in `.pre-commit-config.yaml`. If
@@ -465,9 +445,8 @@ Specific things worth knowing:
 2. Make changes to the scripts
 3. Lint shell scripts: `pre-commit run shellcheck shfmt --all-files`
 4. Run tests if present: `bats tests/`
-5. Exercise the change with `--dry-run` where possible
-6. Stage changes: `git add <files>`
-7. Commit with sign-off and co-authorship:
+5. Stage changes: `git add <files>`
+6. Commit with sign-off and co-authorship:
 
    ```bash
    git commit -s -m "Type(scope): Short imperative description
@@ -477,8 +456,8 @@ Specific things worth knowing:
    Co-authored-by: <AI Model> <email@provider.com>"
    ```
 
-8. If pre-commit fails, fix issues and commit again (don't reset)
-9. Push and open a pull request when ready
+7. If pre-commit fails, fix issues and commit again (don't reset)
+8. Push and open a pull request when ready
 
 ## Quick Reference
 
@@ -496,6 +475,6 @@ Specific things worth knowing:
 | Branching | Feature branch required; `main` is blocked |
 | Shell shebang | `#!/usr/bin/env bash` + `set -euo pipefail` |
 | Shell lint | `shellcheck` + `shfmt` pre-commit hooks (auto) |
-| Script behavior | Idempotent, non-interactive, `--dry-run` capable |
+| Script behavior | One-shot, linear, non-interactive, fail fast |
 | Secrets | Runtime only; never committed |
 | After failed commit | Fix and retry (no reset) |
