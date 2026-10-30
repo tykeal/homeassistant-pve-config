@@ -676,6 +676,70 @@ setup() {
   [ "$(stat -c '%a' "${dir}")" = 777 ]
 }
 
+# Bash evaluates an array subscript inside an arithmetic context, so a mode
+# such as `0+a[$(cmd)]` reaching `$((8#...))` runs cmd as root. Each case
+# below hands one in and checks that the command it names never ran. The
+# `0+` matters: after `8#` a bare `x[...]` is a bad digit, which bash
+# rejects before it looks at the subscript, so a payload without it would
+# prove nothing whether or not the mode was validated.
+hostile_mode() {
+  # shellcheck disable=SC2016  # the unexpanded substitution is the payload
+  printf '0+a[$(touch %s)]' "$1"
+}
+
+# Makes `stat -c %a` report a chosen string for one path, the way a stat
+# answering for a tampered filesystem might, and leaves every other call
+# to the real tool.
+stat_reports_mode() {
+  HOSTILE_STAT_PATH=$1
+  HOSTILE_STAT_MODE=$2
+  stat() {
+    if [[ $# -eq 4 && $1 == -c && $2 == '%a' && $3 == -- && $4 == "${HOSTILE_STAT_PATH}" ]]; then
+      printf '%s\n' "${HOSTILE_STAT_MODE}"
+      return 0
+    fi
+    command stat "$@"
+  }
+}
+
+@test "ensure_not_group_other_writable refuses a mode from stat that is not octal" {
+  local dir="${PVE_CONFIG_ROOT}/home/alice" marker="${BATS_TEST_TMPDIR}/evaluated"
+  mkdir -p "${dir}"
+  chmod 0775 "${dir}"
+  stat_reports_mode "${dir}" "$(hostile_mode "${marker}")"
+
+  run ensure_not_group_other_writable "${dir}"
+  [ ! -e "${marker}" ]
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"reported a mode for ${dir} that is not octal"* ]]
+  [ "$(command stat -c '%a' "${dir}")" = 775 ]
+}
+
+@test "ensure_dir refuses a mode from stat that is not octal" {
+  local dir="${PVE_CONFIG_ROOT}/etc/private" marker="${BATS_TEST_TMPDIR}/evaluated"
+  mkdir -p "${dir}"
+  chmod 0700 "${dir}"
+  stat_reports_mode "${dir}" "$(hostile_mode "${marker}")"
+
+  run ensure_dir "${dir}" 0700
+  [ ! -e "${marker}" ]
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"reported a mode for ${dir} that is not octal"* ]]
+  [ "$(command stat -c '%a' "${dir}")" = 700 ]
+}
+
+@test "write_file refuses a mode argument that is not octal" {
+  local file="${PVE_CONFIG_ROOT}/etc/settled" marker="${BATS_TEST_TMPDIR}/evaluated"
+  printf 'same' >"${file}"
+  chmod 0644 "${file}"
+
+  run write_file "${file}" 'same' "$(hostile_mode "${marker}")"
+  [ ! -e "${marker}" ]
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'Not an octal file mode'* ]]
+  [ "$(command stat -c '%a' "${file}")" = 644 ]
+}
+
 # --- node identity --------------------------------------------------------
 
 mark_pmxcfs() {
