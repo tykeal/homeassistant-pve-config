@@ -75,13 +75,17 @@ first_storage() {
 # from /dev/null. The engine's own prompts read /dev/tty (the GPU choice,
 # the "remove failed container?" question); without a terminal they fail
 # at once and take their defaults instead of waiting for a keyboard.
+# TERM still has to name a real terminal type: the engine runs `clear`
+# under `set -e`, and `clear` fails on an unset or "dumb" TERM.
 run_builder() {
-  local script="$1"
+  local script="$1" term="${TERM:-dumb}" rc=0
   shift
+  [[ "${term}" == dumb ]] && term=xterm-256color
   local file="${CS_DIR}/pve-config-${script//\//-}"
   curl -fsSL "${COMMUNITY_SCRIPTS_URL}/${script}" -o "${file}"
-  env TERM=dumb "$@" setsid bash "${file}" </dev/null
+  env TERM="${term}" "$@" setsid bash "${file}" </dev/null || rc=$?
   rm -f "${file}"
+  ((rc == 0)) || die "${script} failed (exit ${rc}); see its output above"
 }
 
 ct_ip() {
