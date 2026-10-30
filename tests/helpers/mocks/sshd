@@ -2,11 +2,180 @@
 # SPDX-FileCopyrightText: 2026 Andrew Grimberg <tykeal@bardicgrove.org>
 # SPDX-License-Identifier: Apache-2.0
 
-# Stands in for `sshd -t -f FILE`. It rejects an unknown keyword the way the
-# real binary does, which is what the validation tests need: a candidate
-# that would lock the operator out must never reach /etc/ssh.
+# Stands in for `sshd -t`, `sshd -T` and `sshd -G`.
+#
+# The toolkit no longer reads a container's sshd configuration itself; it
+# asks sshd what that configuration resolves to. That makes this mock the
+# only place left where OpenSSH's reading is reproduced, so it is written
+# to refuse what the real binary refuses as well as to resolve what it
+# resolves. A mock that accepted more than production tests half of what
+# it looks like it tests.
+#
+# Refused here because the real binary refuses it:
+#
+#   * an option it does not know, with a usage message and status 1;
+#   * a -f operand it cannot read, with status 1;
+#   * an unknown configuration keyword, with status 255;
+#   * a keyword that is not allowed inside a Match block, with status 255
+#     -- the real binary's status for that, which is deliberately not 1;
+#   * a Match line whose criteria sshd does not know, or that names a
+#     criterion without the value it takes, with status 255;
+#   * an Include whose glob reaches a file it cannot read, with status 1
+#     -- a dangling link and a link loop among them;
+#   * an explicitly configured HostKey none of whose files exist.
+#
+# Accepted here because the real binary accepts it:
+#
+#   * a Match block keyed on anything other than All, which with no
+#     connection to resolve against simply does not fire;
+#   * an Include operand that is quoted, backslash-escaped, relative,
+#     wildcarded or names nothing at all;
+#   * a file whose name holds a newline or any other byte, as long as the
+#     glob reaches it, and a dotfile that the glob therefore does not;
+#   * a drop-in directory that cannot be listed, which contributes
+#     nothing rather than failing, and likewise a directory a glob
+#     reaches and an operand whose path runs through a link loop.
+#
+# Not modelled, and so refused as an option this does not know: -C. The
+# toolkit asks for the global dump and nothing else, so a -C reaching
+# this mock is a test asking a question production never asks, and the
+# useful answer to that is a loud one.
+#
+# One thing else is deliberately not modelled: the order of the dump's lines is this mock's, not OpenSSH's: nothing in
+# this toolkit reads the dump positionally, it reads the keywords it cares
+# about by name.
+#
+# PVE_CONFIG_MOCK_GUEST_ROOT makes every absolute path resolve under the
+# simulated container, which is what running inside one does to them. The
+# host path leaves it unset and nothing is relocated.
 # shellcheck source=tests/helpers/mocks/_record
 source "$(dirname -- "$0")/_record"
+
+# sshd sorts an Include's matches with strcmp, and so does a C-locale glob.
+export LC_ALL=C
+
+# A container that has no sshd to ask. The toolkit has to tell that apart
+# from a configuration sshd rejected, so the mock reports it the way a
+# shell reports a command it could not run.
+if [[ -n ${PVE_CONFIG_MOCK_SSHD_MISSING:-} ]]; then
+  printf 'sh: 1: sshd: not found\n' >&2
+  exit 127
+fi
+
+guest_root=${PVE_CONFIG_MOCK_GUEST_ROOT:-}
+
+# Every bind the mount mock has put in place in the namespace this
+# process is running in, newest last. The real kernel resolves a path
+# through the mount table; this reproduces that for the one form of
+# mount the toolkit makes.
+mock_binds=()
+if [[ -n ${guest_root} && -f ${guest_root}/run/pve-config/mock-mount-binds ]]; then
+  while IFS= read -r mock_bind_line; do
+    [[ -n ${mock_bind_line} ]] && mock_binds+=("${mock_bind_line}")
+  done <"${guest_root}/run/pve-config/mock-mount-binds"
+fi
+
+# Paths are resolved the way the kernel resolves them, because the
+# overlay is only faithful if a symbolic link in it leads where it would
+# lead in the container. One component at a time, from the simulated
+# root: a component that is a link is replaced by what it points to,
+# from the simulated root again if that is absolute and from the
+# directory holding the link if it is relative, and the mount table is
+# consulted afresh at every step. Rewriting a bind's prefix once and
+# then letting this shell open the result would follow an absolute link
+# out of the simulated container and onto the host running the suite,
+# which is how an included policy once vanished from the dump while the
+# real sshd read it.
+#
+# Probed against OpenSSH 10.2p1 under a real bind, an absolute link in
+# /etc/ssh reads the overlay, one pointing outside /etc/ssh reads the
+# container's own file, `..` after a link climbs from where the link
+# led, and a loop is ELOOP after the kernel's forty links.
+COMPS=()
+PHYS=''
+RESOLVED=''
+
+# Splits a path at its slashes without reading it as lines, so a name
+# holding a newline stays one component.
+split_path() {
+  local s=$1
+  COMPS=()
+  while [[ -n ${s} ]]; do
+    COMPS+=("${s%%/*}")
+    if [[ ${s} == */* ]]; then
+      s=${s#*/}
+    else
+      s=''
+    fi
+  done
+}
+
+# The file a symlink-free path in the namespace is, on the disk this
+# suite has: the newest bind covering it, then the simulated root.
+physical() {
+  local path=$1 i bind source target
+  for ((i = ${#mock_binds[@]} - 1; i >= 0; i--)); do
+    bind=${mock_binds[i]}
+    target=${bind#*$'\t'}
+    source=${bind%%$'\t'*}
+    if [[ ${path} == "${target}" ]]; then
+      path=${source}
+      break
+    elif [[ ${path} == "${target}"/* ]]; then
+      path=${source}/${path#"${target}"/}
+      break
+    fi
+  done
+  PHYS=${guest_root}${path}
+}
+
+# Sets RESOLVED to the path this suite opens for one the configuration
+# names, or returns 1 for ELOOP. With a second argument of 1 the last
+# component is not followed, which is what lstat does.
+resolve() {
+  local nofollow=${2:-0} cur='' comp target hops=0
+  local -a todo=()
+  if [[ $1 != /* ]]; then
+    RESOLVED=$1
+    return 0
+  fi
+  split_path "$1"
+  todo=(${COMPS[@]+"${COMPS[@]}"})
+  while [[ ${#todo[@]} -gt 0 ]]; do
+    comp=${todo[0]}
+    todo=(${todo[@]+"${todo[@]:1}"})
+    case ${comp} in
+      '' | .) continue ;;
+      ..)
+        cur=${cur%/*}
+        continue
+        ;;
+    esac
+    physical "${cur}/${comp}"
+    if [[ -L ${PHYS} ]] && ! [[ ${nofollow} -eq 1 && ${#todo[@]} -eq 0 ]]; then
+      hops=$((hops + 1))
+      [[ ${hops} -le 40 ]] || return 1
+      # readlink's own newline is stripped, and nothing of the target's.
+      target=$(
+        readlink -- "${PHYS}"
+        printf x
+      )
+      target=${target%$'\nx'}
+      split_path "${target}"
+      [[ ${target} == /* ]] && cur=''
+      todo=(${COMPS[@]+"${COMPS[@]}"} ${todo[@]+"${todo[@]}"})
+      continue
+    fi
+    cur=${cur}/${comp}
+  done
+  physical "${cur:-/}"
+  RESOLVED=${PHYS}
+}
+
+usage() {
+  printf 'usage: sshd [-46DdeGiqTtV] [-C connection_spec] [-f config_file]\n' >&2
+  exit 1
+}
 
 file=''
 want_test=0
@@ -15,101 +184,434 @@ while [[ $# -gt 0 ]]; do
   case $1 in
     -t) want_test=1 ;;
     -T) want_dump=1 ;;
+    -G) want_dump=1 ;;
     -f)
+      [[ $# -ge 2 ]] || usage
       file=$2
       shift
+      ;;
+    *)
+      printf 'sshd: unknown option -- %s\n' "${1#-}" >&2
+      usage
       ;;
   esac
   shift
 done
 
 [[ ${want_test} -eq 1 || ${want_dump} -eq 1 ]] || exit 0
-[[ -r ${file} ]] || {
-  printf 'sshd: %s: No such file\n' "${file}" >&2
-  exit 1
-}
+[[ -n ${file} ]] || file='/etc/ssh/sshd_config'
+
+# --- reading the configuration --------------------------------------------
 
 known='Match Include AcceptEnv AllowAgentForwarding AllowGroups AllowUsers
-AuthenticationMethods AuthorizedKeysFile ChallengeResponseAuthentication
+AuthenticationMethods AuthorizedKeysCommand AuthorizedKeysFile Banner
+ChallengeResponseAuthentication ClientAliveInterval DenyGroups DenyUsers
 DisableForwarding GatewayPorts HostKey KbdInteractiveAuthentication
-ListenAddress LogLevel
-PasswordAuthentication PermitRootLogin Port PubkeyAuthentication Subsystem
-UsePAM X11Forwarding'
+ListenAddress LoginGraceTime LogLevel MaxAuthTries PermitEmptyPasswords
+PasswordAuthentication PermitRootLogin PermitTunnel PidFile PrintMotd Port
+PubkeyAuthentication StrictModes Subsystem UsePAM X11Forwarding'
 
-check_file() {
-  local path=$1 lineno=0 line trimmed keyword rest glob
+# Two layers, because that is how sshd resolves a configuration. Outside a
+# Match block the first value for a keyword wins. Inside one that the
+# connection matches, the first value wins again and overrides whatever the
+# global layer holds -- including replacing an AllowUsers or DenyUsers list
+# outright rather than adding to it.
+declare -A resolved=()
+declare -a list_lines=()
+declare -A match_resolved=()
+declare -a match_list_lines=()
+declare -A match_list_block=()
+match_block_no=0
+declare -a hostkeys=()
+declare -a ports=()
+declare -a listens=()
+declare -a OPERANDS=()
+declare -a HITS=()
+in_match=0
+skip=0
+
+# sshd's own operand tokeniser: whitespace separates, double quotes group
+# and a backslash escapes the byte after it. Reproduced here because this
+# is the mock; production no longer reproduces it anywhere.
+split_operands() {
+  OPERANDS=()
+  local s=$1 cur='' i c quoted=0 started=0
+  for ((i = 0; i < ${#s}; i++)); do
+    c=${s:i:1}
+    case ${c} in
+      \\)
+        i=$((i + 1))
+        cur+=${s:i:1}
+        started=1
+        ;;
+      '"')
+        quoted=$((1 - quoted))
+        started=1
+        ;;
+      ' ' | $'\t')
+        if [[ ${quoted} -eq 1 ]]; then
+          cur+=${c}
+        elif [[ ${started} -eq 1 ]]; then
+          OPERANDS+=("${cur}")
+          cur=''
+          started=0
+        fi
+        ;;
+      *)
+        cur+=${c}
+        started=1
+        ;;
+    esac
+  done
+  [[ ${started} -eq 1 ]] && OPERANDS+=("${cur}")
+  return 0
+}
+
+# The paths in the namespace a pattern reaches, as glob(3) finds them:
+# each component with a wildcard in it is matched against the entries of
+# the directory reached so far, that directory reached the way the
+# kernel reaches it, and a literal component is kept as written. What
+# survives is anything lstat finds, a dangling link included, sorted
+# with strcmp over the whole path. Matching is done with this shell's
+# own glob against one directory at a time, with word splitting
+# disabled so a name holding whitespace or a newline survives.
+glob_into() {
+  local comp dir hit
+  local -a comps=() cands=('') next=() found=()
+  HITS=()
+  split_path "$1"
+  comps=(${COMPS[@]+"${COMPS[@]}"})
+  for comp in ${comps[@]+"${comps[@]}"}; do
+    [[ -z ${comp} ]] && continue
+    next=()
+    for dir in "${cands[@]}"; do
+      if [[ ${comp} == *[\*\?\[]* ]]; then
+        resolve "${dir:-/}" || continue
+        [[ -d ${RESOLVED} ]] || continue
+        found=()
+        local IFS=''
+        shopt -s nullglob
+        # shellcheck disable=SC2206 # the component is a pattern and IFS is empty
+        found=("${RESOLVED}"/${comp})
+        shopt -u nullglob
+        unset IFS
+        for hit in ${found[@]+"${found[@]}"}; do
+          next+=("${dir}/${hit##*/}")
+        done
+      else
+        next+=("${dir}/${comp}")
+      fi
+    done
+    cands=(${next[@]+"${next[@]}"})
+  done
+  for hit in ${cands[@]+"${cands[@]}"}; do
+    resolve "${hit}" 1 || continue
+    [[ -e ${RESOLVED} || -L ${RESOLVED} ]] || continue
+    HITS+=("${hit}")
+  done
+  [[ ${#HITS[@]} -gt 1 ]] || return 0
+  local -a sorted=()
+  while IFS= read -r -d '' hit; do
+    sorted+=("${hit}")
+  done < <(printf '%s\0' "${HITS[@]}" | sort -z)
+  HITS=("${sorted[@]}")
+}
+
+# Whether the Match block a line opens applies.
+#
+# Nothing is asked about a connection, so nothing but `Match all` can
+# apply: probed against OpenSSH 10.2p1, `sshd -T` with no -C resolves
+# `Match User alice` and `Match Address 10.0.0.0/8` to the global value,
+# while `Match all` takes effect. The criteria are still read, because
+# the real binary still refuses a Match line it cannot make sense of --
+# `Match Nosuchcrit x` and `Match User` both exit 255 with no connection
+# in sight.
+match_criteria() {
+  local rest=$1 path=$2 lineno=$3
+  split_operands "${rest}"
+  local -a toks=(${OPERANDS[@]+"${OPERANDS[@]}"})
+
+  if [[ ${#toks[@]} -eq 1 && ${toks[0],,} == all ]]; then
+    skip=0
+    return 0
+  fi
+  if [[ ${#toks[@]} -eq 0 ]]; then
+    printf '%s: line %s: Bad Match condition\n' "${path}" "${lineno}" >&2
+    return 255
+  fi
+  local i=0 crit
+  while [[ ${i} -lt ${#toks[@]} ]]; do
+    crit=${toks[i],,}
+    case ${crit} in
+      invalid-user)
+        i=$((i + 1))
+        continue
+        ;;
+      user | group | host | address | localaddress | localport | rdomain | version) ;;
+      *)
+        printf 'Unsupported Match attribute %s\n' "${toks[i]}" >&2
+        printf '%s: line %s: Bad Match condition\n' "${path}" "${lineno}" >&2
+        return 255
+        ;;
+    esac
+    if [[ $((i + 1)) -ge ${#toks[@]} ]]; then
+      printf 'Missing Match criteria for %s\n' "${toks[i]}" >&2
+      printf '%s: line %s: Bad Match condition\n' "${path}" "${lineno}" >&2
+      return 255
+    fi
+    i=$((i + 2))
+  done
+  skip=1
+  return 0
+}
+
+record() {
+  local key=$1 value=$2 word
+  case ${key} in
+    port) ports+=("${value%%[[:space:]]*}") ;;
+    listenaddress) listens+=("${value}") ;;
+    hostkey) hostkeys+=("${value}") ;;
+    allowusers | denyusers | allowgroups | denygroups)
+      # These accumulate rather than letting the first occurrence win, and
+      # the dump prints one line per entry.
+      if [[ ${in_match} -eq 1 ]]; then
+        # The first matching block to name one of these owns it; a later
+        # block adds nothing, and the global list is replaced rather than
+        # extended.
+        if [[ -z ${match_list_block[${key}]+set} ]]; then
+          match_list_block[${key}]=${match_block_no}
+        fi
+        [[ ${match_list_block[${key}]} -eq ${match_block_no} ]] || return 0
+        for word in ${value}; do
+          match_list_lines+=("${key} ${word}")
+        done
+        return 0
+      fi
+      for word in ${value}; do
+        list_lines+=("${key} ${word}")
+      done
+      ;;
+    *)
+      if [[ ${in_match} -eq 1 ]]; then
+        [[ -n ${match_resolved[${key}]+set} ]] && return 0
+        match_resolved[${key}]=${value}
+        return 0
+      fi
+      [[ -n ${resolved[${key}]+set} ]] && return 0
+      resolved[${key}]=${value}
+      ;;
+  esac
+  return 0
+}
+
+# Probed against OpenSSH 10.2p1: a file that ends inside a Match block
+# does not carry that block into whatever is read next -- the context it
+# was entered in is restored when it ends. A mock that let it leak would
+# read the next drop-in inside somebody else's conditional.
+walk() {
+  local __saved_skip=${skip} __saved_in_match=${in_match} __walk_rc=0
+  walk_file "$@" || __walk_rc=$?
+  skip=${__saved_skip}
+  in_match=${__saved_in_match}
+  return "${__walk_rc}"
+}
+
+walk_file() {
+  local path=$1 real lineno=0 line trimmed keyword rest lower rc
+  if ! resolve "${path}"; then
+    printf '%s: Too many levels of symbolic links\n' "${path}" >&2
+    return 1
+  fi
+  real=${RESOLVED}
+  if [[ ! -r ${real} ]]; then
+    if [[ -e ${real} ]]; then
+      printf '%s: Permission denied\n' "${path}" >&2
+    else
+      printf '%s: No such file or directory\n' "${path}" >&2
+    fi
+    return 1
+  fi
   while IFS= read -r line || [[ -n ${line} ]]; do
     lineno=$((lineno + 1))
     trimmed=${line#"${line%%[![:space:]]*}"}
     [[ -z ${trimmed} || ${trimmed} == '#'* ]] && continue
     keyword=${trimmed%%[[:space:]]*}
-    if ! grep -qiw -- "${keyword}" <<<"${known}"; then
-      printf '%s: line %s: Bad configuration option: %s\n' \
-        "${path}" "${lineno}" "${keyword}" >&2
-      return 1
-    fi
-    # Fragments are part of the effective configuration, so a bad option in
-    # one has to be reported just as the real binary reports it.
-    if [[ ${keyword} == [Ii]nclude ]]; then
-      rest=${trimmed#"${keyword}"}
-      rest=${rest#"${rest%%[![:space:]]*}"}
-      for glob in ${rest}; do
-        for included in ${glob}; do
-          [[ -r ${included} ]] || continue
-          check_file "${included}" || return 1
-        done
-      done
-    fi
-  done <"${path}"
-}
-
-# Stands in for `sshd -T -f FILE`: the keyword values the assembled
-# configuration resolves to. sshd keeps the first value it obtains, and so
-# does this, because that first-wins rule is exactly what the caller is
-# checking for.
-declare -A resolved=()
-
-dump_file() {
-  local path=$1 line trimmed keyword rest glob included lower
-  while IFS= read -r line || [[ -n ${line} ]]; do
-    trimmed=${line#"${line%%[![:space:]]*}"}
-    [[ -z ${trimmed} || ${trimmed} == '#'* ]] && continue
-    keyword=${trimmed%%[[:space:]]*}
     rest=${trimmed#"${keyword}"}
     rest=${rest#"${rest%%[![:space:]]*}"}
-    if [[ ${keyword} == [Ii]nclude ]]; then
-      for glob in ${rest}; do
-        for included in ${glob}; do
-          [[ -r ${included} ]] || continue
-          dump_file "${included}"
-        done
-      done
+    rest=${rest%"${rest##*[![:space:]]}"}
+    lower=${keyword,,}
+
+    if ! grep -qiwF -- "${keyword}" <<<"${known}"; then
+      printf '%s: line %s: Bad configuration option: %s\n' \
+        "${path}" "${lineno}" "${keyword}" >&2
+      printf '%s: terminating, 1 bad configuration options\n' "${path}" >&2
+      return 255
+    fi
+
+    if [[ ${lower} == include ]]; then
+      rc=0
+      include_operands "${rest}" "${path}" "${lineno}" || rc=$?
+      [[ ${rc} -eq 0 ]] || return "${rc}"
       continue
     fi
-    # Without -C the real binary never enters a conditional block, so
-    # nothing after one is part of the dump.
-    if [[ ${keyword,,} == match ]]; then
-      [[ ${rest,,} == all ]] && continue
-      return 0
+    if [[ ${lower} == match ]]; then
+      in_match=1
+      match_block_no=$((match_block_no + 1))
+      rc=0
+      match_criteria "${rest}" "${path}" "${lineno}" || rc=$?
+      [[ ${rc} -eq 0 ]] || return "${rc}"
+      continue
     fi
-    lower=${keyword,,}
-    [[ -n ${resolved[${lower}]+set} ]] && continue
-    resolved[${lower}]=${rest}
-  done <"${path}"
+    if [[ ${in_match} -eq 1 ]]; then
+      case ${lower} in
+        port | listenaddress | hostkey | subsystem | usepam | acceptenv)
+          printf "%s: line %s: Directive '%s' is not allowed within a Match block\n" \
+            "${path}" "${lineno}" "${keyword}" >&2
+          return 255
+          ;;
+      esac
+    fi
+    [[ ${skip} -eq 1 ]] && continue
+    [[ ${lower} == challengeresponseauthentication ]] &&
+      lower=kbdinteractiveauthentication
+    record "${lower}" "${rest}"
+  done <"${real}"
+  return 0
 }
 
-if [[ ${want_dump} -eq 1 ]]; then
-  dump_file "${file}"
-  for key in "${!resolved[@]}"; do
-    value=${resolved[${key}]}
-    # The real binary reports the canonical spelling, not the synonym a
-    # file happened to use.
-    [[ ${key} == permitrootlogin && ${value} == prohibit-password ]] &&
-      value='without-password'
-    printf '%s %s\n' "${key}" "${value}"
+include_operands() {
+  local rest=$1 path=$2 lineno=$3 op hit rc
+  split_operands "${rest}"
+  if [[ ${#OPERANDS[@]} -eq 0 ]]; then
+    printf '%s: line %s: Include missing filename argument\n' \
+      "${path}" "${lineno}" >&2
+    return 1
+  fi
+  for op in "${OPERANDS[@]}"; do
+    # A relative operand is taken from /etc/ssh, as sshd takes it.
+    [[ ${op} == /* ]] || op="/etc/ssh/${op}"
+    # Probed: a literal operand goes through glob(3) as well, which finds
+    # it with lstat. One naming nothing, or reached only through a loop,
+    # is skipped; a dangling link is found, and then cannot be opened.
+    glob_into "${op}"
+    for hit in ${HITS[@]+"${HITS[@]}"}; do
+      # A directory a glob reaches, through a link or not, is skipped.
+      resolve "${hit}" && [[ -d ${RESOLVED} ]] && continue
+      rc=0
+      walk "${hit}" || rc=$?
+      [[ ${rc} -eq 0 ]] || return "${rc}"
+    done
   done
-  exit 0
+  return 0
+}
+
+rc=0
+walk "${file}" || rc=$?
+[[ ${rc} -eq 0 ]] || exit "${rc}"
+
+# An explicitly configured host key that is not there leaves the daemon
+# with nothing to offer, which both -t and -T report.
+if [[ ${#hostkeys[@]} -gt 0 ]]; then
+  available=0
+  for key in "${hostkeys[@]}"; do
+    resolve "${key}" && [[ -e ${RESOLVED} ]] && available=1
+  done
+  if [[ ${available} -eq 0 ]]; then
+    printf 'sshd: no hostkeys available -- exiting.\n' >&2
+    exit 1
+  fi
 fi
 
-check_file "${file}" || exit 1
+[[ ${want_dump} -eq 1 ]] || exit 0
+
+# --- the dump -------------------------------------------------------------
+
+declare -A defaults=(
+  [permitrootlogin]=prohibit-password
+  [pubkeyauthentication]=yes
+  [passwordauthentication]=yes
+  [kbdinteractiveauthentication]=yes
+  [authorizedkeysfile]='.ssh/authorized_keys .ssh/authorized_keys2'
+  [authenticationmethods]=any
+  [allowagentforwarding]=yes
+  [disableforwarding]=no
+  [x11forwarding]=no
+  [gatewayports]=no
+  [loglevel]=INFO
+  [usepam]=no
+)
+
+canonical() {
+  local key=$1 value=$2
+  if [[ ${key} == permitrootlogin && ${value} == without-password ]]; then
+    # OpenSSH 10.2 reports the deprecated synonym under its current name.
+    printf 'prohibit-password'
+    return 0
+  fi
+  printf '%s' "${value}"
+}
+
+for key in "${!match_resolved[@]}"; do
+  resolved[${key}]=${match_resolved[${key}]}
+done
+
+for key in "${!defaults[@]}"; do
+  [[ -n ${resolved[${key}]+set} ]] || resolved[${key}]=${defaults[${key}]}
+done
+
+for key in $(printf '%s\n' "${!resolved[@]}" | sort); do
+  printf '%s %s\n' "${key}" "$(canonical "${key}" "${resolved[${key}]}")"
+done
+
+[[ ${#ports[@]} -gt 0 ]] || ports=(22)
+printf 'port %s\n' "${ports[@]}"
+
+emit_listener() {
+  local addr=$1 port
+  # `ListenAddress addr rdomain N`: the routing domain is not part of the
+  # address, and the dump reports every listener as host:port.
+  addr=${addr%%[[:space:]]*}
+  case ${addr} in
+    \[*\]:*) printf 'listenaddress %s\n' "${addr}" ;;
+    \[*\])
+      for port in "${ports[@]}"; do
+        printf 'listenaddress %s:%s\n' "${addr}" "${port}"
+      done
+      ;;
+    *:*:*)
+      # A bare IPv6 address, which the dump always reports bracketed.
+      for port in "${ports[@]}"; do
+        printf 'listenaddress [%s]:%s\n' "${addr}" "${port}"
+      done
+      ;;
+    *:*) printf 'listenaddress %s\n' "${addr}" ;;
+    *)
+      for port in "${ports[@]}"; do
+        printf 'listenaddress %s:%s\n' "${addr}" "${port}"
+      done
+      ;;
+  esac
+}
+
+if [[ ${#listens[@]} -eq 0 ]]; then
+  for port in "${ports[@]}"; do
+    printf 'listenaddress [::]:%s\n' "${port}"
+    printf 'listenaddress 0.0.0.0:%s\n' "${port}"
+  done
+else
+  for addr in "${listens[@]}"; do
+    emit_listener "${addr}"
+  done
+fi
+
+emitted=()
+for line in ${list_lines[@]+"${list_lines[@]}"}; do
+  # A list a matching block set replaces the global one entirely.
+  [[ -n ${match_list_block[${line%% *}]+set} ]] && continue
+  emitted+=("${line}")
+done
+emitted+=(${match_list_lines[@]+"${match_list_lines[@]}"})
+if [[ ${#emitted[@]} -gt 0 ]]; then
+  printf '%s\n' "${emitted[@]}"
+fi
 exit 0

@@ -65,6 +65,9 @@ guest_state() {
 is_path_tool() {
   case $1 in
     mkdir | rmdir | chmod | chown | rm | stat | test | cat | touch | ln | readlink) return 0 ;;
+    # `cp -a /etc/ssh/. ...` copies the container's sshd configuration
+    # into the overlay the container's own sshd is then asked about.
+    cp) return 0 ;;
     # `ls` is given the sshd drop-in directory to enumerate, and `find`
     # counts what is in it without depending on the names.
     ls | find) return 0 ;;
@@ -274,7 +277,11 @@ case ${verb} in
       PVE_CONFIG_MOCK_PASSWD_S_FAIL \
       PVE_CONFIG_MOCK_PASSWD_LOCK_FAIL \
       PVE_CONFIG_MOCK_NFT_LIST_FAIL \
-      PVE_CONFIG_MOCK_NFT_LOAD_FAIL; do
+      PVE_CONFIG_MOCK_NFT_LOAD_FAIL \
+      PVE_CONFIG_MOCK_SSHD_MISSING \
+      PVE_CONFIG_MOCK_UNSHARE_MISSING \
+      PVE_CONFIG_MOCK_UNSHARE_DENIED \
+      PVE_CONFIG_MOCK_MOUNT_DENIED; do
       if [[ -n ${!knob:-} ]]; then
         container_env+=("${knob}=${!knob}")
       fi
