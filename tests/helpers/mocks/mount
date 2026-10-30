@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Andrew Grimberg <tykeal@bardicgrove.org>
+# SPDX-License-Identifier: Apache-2.0
+
+# Stands in for `mount --bind SRC TARGET`.
+#
+# Only the one form the toolkit uses is accepted. A mock that took more
+# than production asks for would be a mock that could pass a test
+# production would fail, and this suite has been bitten by that nine
+# times.
+#
+# Refused here because the real binary refuses it, with the statuses
+# probed against util-linux 2.41:
+#
+#   * a source that does not exist -- `special device ... does not
+#     exist`, status 32;
+#   * a target that does not exist -- `mount point does not exist`,
+#     status 32;
+#   * a single operand -- status 1, `mount failed: Invalid argument`;
+#   * too many operands -- status 1, `bad usage`;
+#   * an option util-linux does not know -- status 1, `unrecognized
+#     option`;
+#   * the kernel refusing the mount, status 32 and `permission denied`,
+#     which is what container root without the privilege gets. Driven by
+#     a fault knob, because the suite runs as an ordinary user.
+#
+# Refused here although the real binary accepts it: every option but
+# --bind, --rbind included, and a file rather than a directory as the
+# target. Production asks for neither, so a test reaching for one is
+# asking a question production never asks. Those refusals are this
+# mock's, and the status is the one util-linux gives a bad command line.
+#
+# A successful bind appends `SRC<TAB>TARGET` to the record the unshare
+# mock created, and the sshd mock reads that record to decide which
+# bytes a path resolves to. No record, no namespace: a bind outside an
+# `unshare -m` fails here the way it would be pointless there.
+# shellcheck source=tests/helpers/mocks/_record
+source "$(dirname -- "$0")/_record"
+
+guest_root=${PVE_CONFIG_MOCK_GUEST_ROOT:-}
+
+rooted() {
+  if [[ -n ${guest_root} && $1 == /* ]]; then
+    printf '%s' "${guest_root}$1"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+usage() {
+  printf 'mount: %s\nTry '\''mount --help'\'' for more information.\n' \
+    "${1:-bad usage}" >&2
+  exit 1
+}
+
+# The target is named as the container knows it, which is what the real
+# diagnostic carries.
+refuse() {
+  printf 'mount: %s: %s.\n' "$1" "$2" >&2
+  exit 32
+}
+
+[[ $# -gt 0 ]] || usage
+[[ $1 == '--bind' ]] || usage "unrecognized option '$1'"
+shift
+[[ $# -gt 0 ]] || usage
+[[ $# -le 2 ]] || usage
+[[ $# -eq 2 ]] || {
+  printf 'mount: %s: mount failed: Invalid argument.\n' "$1" >&2
+  exit 1
+}
+
+src=$1
+target=$2
+[[ ${src} == -* ]] && usage "unrecognized option '${src}'"
+[[ ${target} == -* ]] && usage "unrecognized option '${target}'"
+
+if [[ -n ${PVE_CONFIG_MOCK_MOUNT_DENIED:-} ]]; then
+  refuse "${target}" 'permission denied'
+fi
+
+[[ -e $(rooted "${src}") ]] ||
+  refuse "${target}" "special device ${src} does not exist"
+[[ -d $(rooted "${target}") ]] ||
+  refuse "${target}" 'mount point does not exist'
+
+binds="${guest_root}/run/pve-config/mock-mount-binds"
+[[ -f ${binds} ]] ||
+  refuse "${target}" 'must be superuser to use mount'
+
+printf '%s\t%s\n' "${src}" "${target}" >>"${binds}"

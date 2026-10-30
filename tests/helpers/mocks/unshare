@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Andrew Grimberg <tykeal@bardicgrove.org>
+# SPDX-License-Identifier: Apache-2.0
+
+# Stands in for `unshare -m COMMAND`.
+#
+# The toolkit asks the container's sshd what it would run by mounting an
+# overlay over /etc/ssh inside a mount namespace, so a suite with no
+# mount namespace in it has to model two things: that the mount is
+# visible to what runs inside, and that it is gone the moment this
+# process is.
+#
+# Refused here because the real binary refuses it:
+#
+#   * any option other than -m, with the status and message util-linux
+#     gives an unrecognised one;
+#   * -m with nothing to run. Real unshare starts a login shell for
+#     that, which a test harness has no use for; production always
+#     passes a command, so refusing is both honest about what this
+#     stands in for and the stricter of the two.
+#   * the namespace itself being refused, which is status 1 and the
+#     message `unshare` prints for EPERM. That one is driven by a fault
+#     knob rather than by privilege, because the suite runs as an
+#     ordinary user and would otherwise get it every time.
+#
+# Deliberately not modelled: every namespace flag but -m. Production asks
+# for -m and nothing else, so a test reaching for -u or -p is asking a
+# question production never asks, and the useful answer to that is a
+# loud one.
+#
+# The mount record lives beside the simulated container's root, where the
+# sshd mock reads it. It is removed when this process exits, however it
+# exits, which is what a mount namespace does for real -- probed against
+# util-linux: a child SIGKILLed while holding a bind leaves no mount
+# behind, and a reader outside the namespace never saw it at all.
+# shellcheck source=tests/helpers/mocks/_record
+source "$(dirname -- "$0")/_record"
+
+guest_root=${PVE_CONFIG_MOCK_GUEST_ROOT:-}
+
+usage() {
+  [[ $# -gt 0 ]] && printf 'unshare: %s\n' "$1" >&2
+  printf 'Try '\''unshare --help'\'' for more information.\n' >&2
+  exit 1
+}
+
+# A container with no util-linux in it. A shell reports a command it
+# cannot run as 127, and that is what the toolkit has to read as "no
+# answer" rather than as a configuration it may act on.
+if [[ -n ${PVE_CONFIG_MOCK_UNSHARE_MISSING:-} ]]; then
+  printf 'sh: 1: unshare: not found\n' >&2
+  exit 127
+fi
+
+want_mount=0
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -m | --mount)
+      want_mount=1
+      shift
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*) usage "unrecognized option '$1'" ;;
+    *) break ;;
+  esac
+done
+
+[[ ${want_mount} -eq 1 ]] || usage
+[[ $# -gt 0 ]] || usage
+
+# The namespace the kernel would not give us. Status 1, which is also the
+# status a refused sshd would have had: the toolkit must not be able to
+# tell them apart by status alone and must treat both as unreadable.
+if [[ -n ${PVE_CONFIG_MOCK_UNSHARE_DENIED:-} ]]; then
+  printf 'unshare: unshare failed: Operation not permitted\n' >&2
+  exit 1
+fi
+
+binds="${guest_root}/run/pve-config/mock-mount-binds"
+mkdir -p -- "$(dirname -- "${binds}")"
+: >"${binds}"
+# However this process ends, the namespace ends with it.
+trap 'rm -f -- "${binds}"' EXIT
+
+"$@"

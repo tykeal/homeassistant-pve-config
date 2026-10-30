@@ -43,11 +43,49 @@ GUEST_ADMIN_PAM_SUDO_I_PATH='/etc/pam.d/sudo-i'
 GUEST_ADMIN_PAM_MATCH='pam_ssh_agent_auth\.so'
 GUEST_ADMIN_PAM_LINE='auth sufficient pam_ssh_agent_auth.so file=/etc/security/authorized_keys'
 GUEST_ADMIN_SUDOERS_PATH='/etc/sudoers.d/90-ssh-agent'
+GUEST_ADMIN_SSHD_ETC='/etc/ssh'
 GUEST_ADMIN_SSHD_DIR='/etc/ssh/sshd_config.d'
 GUEST_ADMIN_SSHD_PATH='/etc/ssh/sshd_config.d/99-pve-config-admin.conf'
 GUEST_ADMIN_SSHD_MAIN='/etc/ssh/sshd_config'
-GUEST_ADMIN_SSHD_INCLUDE='Include /etc/ssh/sshd_config.d/*.conf'
-GUEST_ADMIN_SSHD_INCLUDE_MATCH='^[[:space:]]*[Ii][Nn][Cc][Ll][Uu][Dd][Ee][[:space:]]+.*sshd_config\.d'
+# The line that makes sshd read this module's fragment, and the pattern
+# that identifies it.
+#
+# It names the fragment outright rather than the directory it sits in. A
+# container whose own configuration includes that directory may include
+# it by a glob that does not cover this file -- `*.cfg`, or one drop-in
+# by name -- and a check that only asked whether the directory was
+# mentioned would judge a fragment the daemon never reads. Naming the
+# file is the only form of the question with one answer.
+#
+# Prepended, always, and every line matching the pattern is taken out
+# first. Finding an existing copy and leaving it where it is would mean
+# deciding whether the place it sits in is conditional, which is reading
+# OpenSSH's syntax again; the top of the file is the one position that
+# cannot be inside a Match block. A duplicate include is harmless --
+# probed against OpenSSH 10.2p1, a second copy of AllowUsers alice adds a
+# second identical line to the dump and changes nothing, and a scalar
+# keeps its first value -- so this sits happily beside a container's own
+# `Include .../*.conf` that already covers the file. The container's own
+# list keywords survive alongside this module's and may admit further
+# key-authenticated accounts, which is in scope and accepted: an extra
+# AllowUsers entry cannot keep an administrator out.
+GUEST_ADMIN_SSHD_INCLUDE='Include /etc/ssh/sshd_config.d/99-pve-config-admin.conf'
+GUEST_ADMIN_SSHD_INCLUDE_MATCH='^[[:space:]]*[Ii][Nn][Cc][Ll][Uu][Dd][Ee][[:space:]]+/etc/ssh/sshd_config\.d/99-pve-config-admin\.conf[[:space:]]*$'
+GUEST_ADMIN_SSHD_INCLUDE_POSITION='prepend'
+# Where the overlay is built, inside the container, for the container's
+# own sshd to be asked about. /run is a tmpfs, and nothing reads this
+# directory but the `sshd -T` that runs with it mounted over /etc/ssh: a
+# file an interrupted run leaves behind changes nothing about the daemon.
+#
+# The layout under it is the real layout, derived rather than written out
+# a second time. A path that had to be kept in step by hand is a path
+# that drifts, and drift between what sshd was asked about and what sshd
+# ends up running is the whole family of defects this replaced.
+GUEST_ADMIN_SSHD_CHECK_DIR='/run/pve-config/sshd-check'
+GUEST_ADMIN_SSHD_CHECK_ETC="${GUEST_ADMIN_SSHD_CHECK_DIR}/etc-ssh"
+GUEST_ADMIN_SSHD_CHECK_DROPIN="${GUEST_ADMIN_SSHD_CHECK_ETC}${GUEST_ADMIN_SSHD_DIR#"${GUEST_ADMIN_SSHD_ETC}"}"
+GUEST_ADMIN_SSHD_CHECK_MAIN="${GUEST_ADMIN_SSHD_CHECK_ETC}${GUEST_ADMIN_SSHD_MAIN#"${GUEST_ADMIN_SSHD_ETC}"}"
+GUEST_ADMIN_SSHD_CHECK_FRAGMENT="${GUEST_ADMIN_SSHD_CHECK_ETC}${GUEST_ADMIN_SSHD_PATH#"${GUEST_ADMIN_SSHD_ETC}"}"
 GUEST_ADMIN_SSH_UNIT='ssh.service'
 GUEST_ADMIN_STATE_DIR='/var/lib/pve-config'
 GUEST_ADMIN_SSHD_RELOAD_MARKER='/var/lib/pve-config/sshd-reload-pending'
@@ -921,274 +959,231 @@ guest_admin_sshd_fragment() {
     "AllowUsers${allow}"
 }
 
-# The container's own name for the drop-in directory, with every symlink
-# resolved. Asked of the container, because the question is what sshd in
-# it would open.
-_guest_admin_sshd_dir_canon() {
-  local target=$1 canon=''
-  target_capture canon "${target}" readlink -f -- "${GUEST_ADMIN_SSHD_DIR}" ||
-    return 1
-  canon=${canon%$'\n'}
-  [[ -n ${canon} ]] || return 1
-  printf '%s' "${canon}"
+# --- what sshd in the container will actually run -------------------------
+#
+# Nothing below reads an sshd configuration. Five rounds of review found
+# five separate ways a bash reimplementation of OpenSSH's parser disagreed
+# with OpenSSH -- a nested Include that was noticed and not followed, a
+# `..` that a lexical containment check let through, a keyword spelled
+# iNcLuDe, a filename holding a newline, a quoted operand -- and every one
+# of them was a false accept on the path that disables password
+# authentication. They are all the same defect: checking a proxy for the
+# property instead of the property.
+#
+# The property is what the container's sshd will run, and the only thing
+# that answers that without guessing is the container's sshd. `sshd -T`
+# prints the configuration it resolved, after every Include has been
+# followed by the parser that will follow them for real, one lowercase
+# `keyword value` to a line, and exits non-zero on a configuration it will
+# not run. It is run inside the container, so those Includes resolve
+# against the container's filesystem and not this host's.
+
+# The main configuration as it has to be for sshd to read a fragment:
+# the Include that names that fragment, once, at the top, with any
+# earlier copy of a managed Include taken out.
+#
+# The same transformation, with the same three constants, that
+# target_ensure_exact_line applies when converge writes the real
+# /etc/ssh/sshd_config. The overlay sshd is asked about, the check for
+# whether publishing would change anything, and the lock's check that
+# the hardening is in force all go through here, so none of them can
+# drift from the file converge leaves on disk.
+_guest_admin_sshd_main_with_include() {
+  local __gasm_var=$1 __gasm_body=$2
+  _exact_line_body "${__gasm_var}" "${__gasm_body}" \
+    "${GUEST_ADMIN_SSHD_INCLUDE_MATCH}" "${GUEST_ADMIN_SSHD_INCLUDE}" \
+    "${GUEST_ADMIN_SSHD_INCLUDE_POSITION}"
 }
 
-# Whether an Include operand names something inside the mirrored drop-in
-# directory, as the container resolves it.
+# Builds the overlay the container's sshd is asked about.
 #
-# Three things are asked, and all three have to hold:
+# No candidate is constructed. A candidate is a second configuration
+# written by this module in the hope that it resolves the way the real
+# one will, and every round of review has found another way for that
+# hope to be wrong: a glob that did not cover the fragment, an existing
+# Include that pulled in the very fragment converge was about to
+# replace. The answer is to stop guessing and reproduce the container's
+# own /etc/ssh, change in it exactly what converge changes, and let sshd
+# read it at its real name.
 #
-#   * the operand is absolute and lexically inside the directory, which
-#     is cheap and rejects the obvious;
-#   * no component of it is `..`, because `/etc/ssh/sshd_config.d/../x`
-#     is lexically inside the directory and is not inside it at all;
-#   * the part of it that is a real directory resolves, in the container,
-#     to that directory or something under it. A string comparison cannot
-#     see a symlink; this asks the filesystem sshd will ask.
+# `cp -a SRC/. DST/` copies the contents of a directory without this
+# module ever naming a file inside it. That matters more than it looks:
+# the one time this toolkit listed that directory by name, a drop-in
+# whose filename held a newline defeated the listing, and sshd read a
+# file nothing had judged.
 #
-# A path that will not resolve is a failure, not a pass: the caller dies
-# on anything but 0.
-_guest_admin_sshd_include_ok() {
-  local operand=$1 target=$2 canon_dir=$3
-  local probe canon=''
+# Two files are then put over the copy, and they are the two files
+# converge writes: the main configuration, through the same
+# transformation converge applies to it, and the fragment. Everything
+# else in the overlay is the container's own bytes.
+_guest_admin_sshd_stage() {
+  local target=$1 fragment=$2 main_body='' overlay=''
 
-  # Only a plain, unquoted path. sshd's own parser handles quoting,
-  # backslash escapes and whitespace inside operands, and every attempt
-  # here to reproduce that has missed something; refusing what this
-  # cannot read with certainty is the recoverable direction. Issue #30
-  # replaces this whole surface with `sshd -T`, which is sshd's parser
-  # rather than an imitation of it, and lifts the restriction.
-  [[ ${operand} == *[!A-Za-z0-9/._*?-]* ]] && return 1
-  [[ ${operand} == "${GUEST_ADMIN_SSHD_DIR}"/* ]] || return 1
-  [[ ${operand} == */../* || ${operand} == */.. ]] && return 1
+  target_slurp main_body "${target}" "${GUEST_ADMIN_SSHD_MAIN}" || main_body=''
+  _guest_admin_sshd_main_with_include overlay "${main_body}"
 
-  # The longest leading part of the path with no wildcard in it, which is
-  # the deepest directory that can be resolved rather than matched.
-  probe=${operand%/*}
-  while [[ ${probe} == *[\*\?\[]* ]]; do
-    probe=${probe%/*}
-    [[ -n ${probe} ]] || return 1
-  done
+  # Whatever an interrupted run left behind is not part of the container
+  # and must not be judged as though it were. Checked here, unlike in
+  # _guest_admin_sshd_unstage: `cp -a` merges into a directory that is
+  # already there, so a removal that failed would leave a drop-in the
+  # container no longer has sitting in the overlay for sshd to read.
+  target_run "${target}" rm -rf -- "${GUEST_ADMIN_SSHD_CHECK_DIR}" >/dev/null ||
+    die "Unable to clear ${GUEST_ADMIN_SSHD_CHECK_DIR} inside $(target_describe "${target}"); refusing to judge a configuration an earlier run may have left there."
+  target_ensure_dir "${target}" "${GUEST_ADMIN_SSHD_CHECK_DIR}" 0700 >/dev/null
+  target_ensure_dir "${target}" "${GUEST_ADMIN_SSHD_CHECK_ETC}" 0755 >/dev/null
+  target_run "${target}" cp -a "${GUEST_ADMIN_SSHD_ETC}/." \
+    "${GUEST_ADMIN_SSHD_CHECK_ETC}/" >/dev/null ||
+    die "Unable to copy ${GUEST_ADMIN_SSHD_ETC} inside $(target_describe "${target}"); refusing to judge anything but the container's own configuration."
+  target_ensure_dir "${target}" "${GUEST_ADMIN_SSHD_CHECK_DROPIN}" 0755 >/dev/null
+  # No mode: the copy already carries the container's own, and converge
+  # keeps it when it rewrites the file, so this keeps it too.
+  target_write_file "${target}" "${GUEST_ADMIN_SSHD_CHECK_MAIN}" \
+    "${overlay}" >/dev/null
+  target_write_file "${target}" "${GUEST_ADMIN_SSHD_CHECK_FRAGMENT}" \
+    "${fragment}" 0644 >/dev/null
+}
 
-  target_capture canon "${target}" readlink -f -- "${probe}" || return 1
-  canon=${canon%$'\n'}
-  [[ -n ${canon} ]] || return 1
-  [[ ${canon} == "${canon_dir}" || ${canon} == "${canon_dir}"/* ]] || return 1
+# Takes the overlay away again. A failure to remove it is not worth
+# stopping a run over and is deliberately not checked: the directory is a
+# tmpfs path no daemon reads, and the next run rebuilds it from scratch.
+_guest_admin_sshd_unstage() {
+  local target=$1
+  target_run "${target}" rm -rf -- "${GUEST_ADMIN_SSHD_CHECK_DIR}" >/dev/null 2>&1 ||
+    log_warn "Unable to remove ${GUEST_ADMIN_SSHD_CHECK_DIR} from $(target_describe "${target}")"
   return 0
 }
 
-# Dies unless every Include in this body names the mirrored drop-in
-# directory.
+# The configuration the container's sshd resolves with the overlay in
+# place.
 #
-# Only a configuration whose Includes all name that directory can be
-# reproduced on this host, and a configuration that cannot be reproduced
-# cannot be judged. Refusing is the fail-closed answer: the alternative is
-# approving a fragment against a configuration that is missing whatever
-# the other Include supplies -- an AllowUsers, an AuthorizedKeysFile, a
-# Match block -- and then disabling password authentication against it.
+#   0  sshd ran and accepted it; the variable holds the dump
+#   1  sshd ran and refused it; the variable holds what it said
+#   2  no answer that can be read; abort rather than mutate
 #
-# Asked of every file that is mirrored, not only of the main one: an
-# Include nests, and sshd resolves each one against the container. What
-# makes "inside the directory" enough is that the mirror below copies the
-# whole of that directory, subdirectories included, so an operand that
-# resolves inside it names something this host is holding a copy of.
-_guest_admin_sshd_includes_local() {
-  local body=$1 origin=$2 target=$3 dir=$4 canon_dir=$5
-  local line trimmed keyword operand
-  local -a operands=()
+# The overlay is mounted over /etc/ssh inside a mount namespace of its
+# own, and `sshd -T` is then run with no -f at all, so it opens
+# /etc/ssh/sshd_config exactly as the daemon will. Every Include in it,
+# every glob, every sort order is sshd's own work on the real pathnames.
+# There is nothing left for this module to get wrong about them.
+#
+# The namespace is made by the same `unshare -m` that runs the mount and
+# the dump, so it and every mount in it cease to exist when that process
+# does -- on a normal exit, on a failure, or on a kill. Probed: a child
+# SIGKILLed while holding the bind leaves no mount behind, and a process
+# outside the namespace reading /etc/ssh while the child holds it still
+# sees the container's own file. util-linux sets the new namespace's
+# propagation to private for exactly this reason.
+#
+# The two scripts exist to keep the statuses apart, which matters more
+# here than it looks. `unshare` refused for want of privilege exits 1,
+# and so does a great deal else; 1 is also the status this contract
+# reads as "sshd ran and refused the configuration", which is the one
+# status that lets a run carry on and mutate the container. So the inner
+# script never passes a status through: it reports 0 for a dump, 2 for
+# anything that stopped sshd being asked, and 3 -- a status it alone
+# chooses -- for sshd having run and said no. sshd says no with 1 or
+# 255 and nothing else (probed against OpenSSH 10.2p1: 255 for a bad
+# keyword or Match line, 1 for a missing file or no usable host key), so
+# only those become 3; 126, 127 and a death by signal are a shell or a
+# kernel talking, not sshd, and are 2. The outer script maps 3 back to
+# 1 and everything that is neither 0 nor 3 to 2. A namespace that could
+# not be made, a mount that was refused, an sshd that is not installed,
+# a shell that could not start: every one of them is 2.
+#
+# Nothing looks at the text of any of it. The status is the judgement.
+# The commands' stderr is folded into the output so a refusal arrives
+# with its reason attached for the operator, not for this code to read.
+#
+# A container that cannot be reached at all never reaches the case
+# statement: target_capture dies on a transport that failed, rather than
+# returning a status that could be read as a configuration verdict.
+_guest_admin_sshd_dump() {
+  local __dump_var=$1 __dump_target=$2 __dump_rc=0
 
+  # Both scripts take the overlay as $1 and the directory it stands in
+  # for as $2; the outer one takes the inner as $3. Passing the inner
+  # script as an argument rather than quoting it inside the outer one
+  # means neither has to escape the other, and no path is written out
+  # twice. The $ signs below belong to the container's shell, not to
+  # this one. Each script is one line, so the command as logged and
+  # recorded is one line too.
+  # shellcheck disable=SC2016
+  local __dump_inner='mount --bind "$1" "$2" || exit 2; sshd -T; case $? in 0) exit 0 ;; 1 | 255) exit 3 ;; esac; exit 2'
+  # shellcheck disable=SC2016
+  local __dump_outer='exec 2>&1; unshare -m /bin/sh -c "$3" pve-config "$1" "$2"; case $? in 0) exit 0 ;; 3) exit 1 ;; esac; exit 2'
+
+  target_capture "${__dump_var}" "${__dump_target}" /bin/sh -c \
+    "${__dump_outer}" pve-config "${GUEST_ADMIN_SSHD_CHECK_ETC}" \
+    "${GUEST_ADMIN_SSHD_ETC}" "${__dump_inner}" || __dump_rc=$?
+  case ${__dump_rc} in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+# The dump, or a message and a stopped run.
+_guest_admin_sshd_effective() {
+  local __eff_var=$1 __eff_target=$2 __eff_rc=0
+  _guest_admin_sshd_dump "${__eff_var}" "${__eff_target}" || __eff_rc=$?
+  case ${__eff_rc} in
+    0) return 0 ;;
+    1)
+      die "sshd in $(target_describe "${__eff_target}") will not run the configuration this hardening would give it: ${!__eff_var}"
+      ;;
+    *)
+      die "sshd in $(target_describe "${__eff_target}") could not be asked what the hardened configuration resolves to -- no sshd to ask, or no mount namespace to put the overlay in -- so there is no answer to read; refusing to harden. It said: ${!__eff_var}"
+      ;;
+  esac
+}
+
+# Every value the dump gives for one keyword, one to a line.
+#
+# Read by name, never compared whole: the set of keywords `sshd -T` prints
+# grows with every OpenSSH release, and a check that compared entire dumps
+# would start refusing containers over an upgrade that changed nothing
+# this module cares about.
+_guest_admin_sshd_values() {
+  local dump=$1 keyword=$2 line
   while IFS= read -r line || [[ -n ${line} ]]; do
-    trimmed=${line#"${line%%[![:space:]]*}"}
-    keyword=${trimmed%%[[:space:]]*}
-    # sshd reads its keywords without regard to case, so `iNcLuDe` pulls
-    # a file in exactly as `Include` does. A matcher that only knew the
-    # two usual spellings would walk straight past it.
-    [[ ${keyword,,} == include ]] || continue
-    read -r -a operands <<<"${trimmed#"${keyword}"}"
-    for operand in ${operands[@]+"${operands[@]}"}; do
-      _guest_admin_sshd_include_ok "${operand}" "${target}" "${canon_dir}" && continue
-      rm -rf -- "${dir}"
-      die "${origin} in $(target_describe "${target}") includes ${operand}, which this toolkit cannot resolve inside ${GUEST_ADMIN_SSHD_DIR}; it cannot tell what that file does to the configuration and will not harden sshd without knowing."
-    done
-  done <<<"${body}"
+    [[ ${line} == "${keyword} "* ]] || continue
+    printf '%s\n' "${line#"${keyword}" }"
+  done <<<"${dump}"
 }
 
-# Copies one directory of the container's sshd configuration into the
-# mirror, and everything below it.
+# Dies unless every setting the fragment asks for is the one sshd
+# resolved.
 #
-# Recursive because Include is: a drop-in naming
-# `/etc/ssh/sshd_config.d/site/*.conf` is a drop-in whose real policy
-# lives a directory down, and a mirror that stopped at the immediate
-# children would hold a configuration the container is not running --
-# then approve a fragment against it and lock the root password.
-_guest_admin_sshd_mirror_dir() {
-  local target=$1 dir=$2 rel=$3 depth=$4 canon_dir=$5
-  local guest="${GUEST_ADMIN_SSHD_DIR}${rel}"
-  local listing='' listing_rc=0 name body='' own
-
-  if [[ ${depth} -gt 8 ]]; then
-    rm -rf -- "${dir}"
-    die "The sshd drop-in directory in $(target_describe "${target}") nests deeper than this toolkit will follow; refusing to judge a configuration it cannot read in full."
-  fi
-
-  # A listing that failed is not an empty directory. Taking it for one
-  # would approve a fragment against a mirror that is missing whatever
-  # could not be listed.
-  # -A because a name beginning with a dot is still a name: sshd's own
-  # glob does not load one (probed against OpenSSH 10.2p1: a
-  # `.hidden.conf` beside a `normal.conf` is not picked up by
-  # `Include dir/*.conf`), but an Include naming it outright does load
-  # it, so the copy has to hold it either way.
-  target_capture listing "${target}" ls -1A -- "${guest}" || listing_rc=$?
-  if [[ ${listing_rc} -ne 0 ]]; then
-    rm -rf -- "${dir}"
-    die "Unable to list ${guest} in $(target_describe "${target}"); refusing to judge a configuration that cannot be read in full."
-  fi
-
-  # A name with a newline in it is two lines in `ls -1` output and two
-  # names to `read`, neither of which exists -- so the file would be
-  # skipped and the mirror would be approved without it, while sshd
-  # loads it through `*.conf` as happily as any other. The count below
-  # cannot be fooled that way: one character per entry, whatever the
-  # name contains. Supporting such a name rather than refusing it needs
-  # a NUL-safe way to carry a guest command's output back (issue #26);
-  # until then this fails in the recoverable direction.
-  local marks='' marks_rc=0
-  target_capture marks "${target}" \
-    find "${guest}" -mindepth 1 -maxdepth 1 -printf . || marks_rc=$?
-  if [[ ${marks_rc} -ne 0 ]]; then
-    rm -rf -- "${dir}"
-    die "Unable to count the entries of ${guest} in $(target_describe "${target}"); refusing to judge a configuration that cannot be read in full."
-  fi
-  marks=${marks//[^.]/}
-
-  # A name with a control character in it cannot survive the trip out of
-  # the container, and the count above cannot see one whose newline sits
-  # at either end: an empty line is skipped and a trailing one is eaten
-  # by the capture. This asks the container about the names themselves,
-  # so it holds whatever the name happens to be.
-  local control='' control_rc=0
-  target_capture control "${target}" \
-    find "${guest}" -mindepth 1 -maxdepth 1 -regextype posix-extended \
-    -regex '.*[[:cntrl:]].*' -printf . || control_rc=$?
-  if [[ ${control_rc} -ne 0 ]]; then
-    rm -rf -- "${dir}"
-    die "Unable to examine the entry names of ${guest} in $(target_describe "${target}"); refusing to judge a configuration that cannot be read in full."
-  fi
-  control=${control//[^.]/}
-  if [[ -n ${control} ]]; then
-    rm -rf -- "${dir}"
-    die "${guest} in $(target_describe "${target}") holds an entry whose name contains a control character; nothing here can carry that name out of the container intact (issue #26), so the configuration cannot be copied or judged."
-  fi
-
-  own=$(basename -- "${GUEST_ADMIN_SSHD_PATH}")
-  local parsed=0
-  while IFS= read -r name; do
-    [[ -n ${name} ]] || continue
-    parsed=$((parsed + 1))
-    # A plain name, or nothing. A quote, a space or a backslash in a
-    # drop-in filename turns every later step -- the glob an Include
-    # resolves, the path pushed back into the container -- into a guess
-    # about somebody else's parser. Issue #30 removes the need to guess.
-    if [[ ${name} == *[!A-Za-z0-9._-]* || ${name} == -* ]]; then
-      rm -rf -- "${dir}"
-      die "${guest}/${name} in $(target_describe "${target}") has a name this toolkit will not reason about; rename it to letters, digits, dots, dashes and underscores, or remove it, before hardening sshd."
-    fi
-    [[ -z ${rel} && ${name} == "${own}" ]] && continue
-    if target_test "${target}" d "${guest}/${name}"; then
-      mkdir -p -- "${dir}${guest}/${name}" || {
-        rm -rf -- "${dir}"
-        die "Unable to stage ${guest}/${name} from $(target_describe "${target}")"
-      }
-      _guest_admin_sshd_mirror_dir "${target}" "${dir}" "${rel}/${name}" \
-        "$((depth + 1))" "${canon_dir}"
-      continue
-    fi
-    target_test "${target}" f "${guest}/${name}" || continue
-    target_slurp body "${target}" "${guest}/${name}" || body=''
-    # A drop-in can include too, and sshd resolves what it names from
-    # the container's filesystem. One naming a path outside the
-    # mirrored directory is a file this host never copied and never
-    # judged.
-    _guest_admin_sshd_includes_local "${body}" "${guest}/${name}" \
-      "${target}" "${dir}" "${canon_dir}"
-    printf '%s' "${body}" >"${dir}${guest}/${name}" || {
-      rm -rf -- "${dir}"
-      die "Unable to stage ${guest}/${name} from $(target_describe "${target}")"
-    }
-  done <<<"${listing}"
-
-  if [[ ${parsed} -ne ${#marks} ]]; then
-    rm -rf -- "${dir}"
-    die "${guest} in $(target_describe "${target}") holds ${#marks} entries but only ${parsed} of them have names this toolkit can read back; a name with a newline in it cannot be carried across (issue #26), and a configuration that cannot be copied in full cannot be judged."
-  fi
-}
-
-# Copies the container's sshd configuration onto this host, and prints the
-# directory it put it in.
-#
-# Everything that judges an sshd configuration in this toolkit reads it
-# from a filesystem, under $(sysroot). A container's is read out through
-# pct, so it is staged here and $(sysroot) is pointed at the staging
-# directory for the duration: the container is then judged by the host's
-# code, on the container's own bytes.
-#
-# A file that exists and cannot be read aborts the run rather than being
-# treated as absent, in target_slurp.
-_guest_admin_sshd_mirror() {
-  local target=$1 fragment=$2 __dir_var=$3
-  local dir main_body=''
-
-  dir=$(_validation_dir) ||
-    die "Unable to create a directory to examine the sshd configuration of $(target_describe "${target}")"
-  mkdir -p -- "${dir}${GUEST_ADMIN_SSHD_DIR}" || {
-    rm -rf -- "${dir}"
-    die "Unable to stage the sshd configuration of $(target_describe "${target}")"
-  }
-
-  if target_test "${target}" f "${GUEST_ADMIN_SSHD_MAIN}"; then
-    target_slurp main_body "${target}" "${GUEST_ADMIN_SSHD_MAIN}" || main_body=''
-  fi
-
-  # Asked whether the directory is there or not: `readlink -f` resolves a
-  # path whose last component does not exist yet, and a container that
-  # has not been given the directory still ships an sshd_config that
-  # includes it. Resolving both sides the same way is what makes the
-  # containment check below a comparison of paths rather than of strings.
-  local canon_dir=''
-  canon_dir=$(_guest_admin_sshd_dir_canon "${target}") || {
-    rm -rf -- "${dir}"
-    die "Unable to resolve ${GUEST_ADMIN_SSHD_DIR} in $(target_describe "${target}"); refusing to judge a configuration it cannot read in full."
-  }
-
-  _guest_admin_sshd_includes_local "${main_body}" "${GUEST_ADMIN_SSHD_MAIN}" \
-    "${target}" "${dir}" "${canon_dir}"
-
-  # Every file in the directory, not only *.conf, and every directory
-  # under it: an Include naming `site-policy`, `*.cfg` or `site/*.conf`
-  # pulls in whatever it names.
-  if target_test "${target}" d "${GUEST_ADMIN_SSHD_DIR}"; then
-    _guest_admin_sshd_mirror_dir "${target}" "${dir}" '' 0 "${canon_dir}"
-  fi
-
-  printf '%s' "${fragment}" >"${dir}${GUEST_ADMIN_SSHD_PATH}" || {
-    rm -rf -- "${dir}"
-    die "Unable to stage the sshd fragment for $(target_describe "${target}")"
-  }
-
-  # The Include is added to the container only after the fragment has
-  # validated and installed, exactly as phase 1 does it on the host. Here
-  # it stands in for the configuration sshd will read once that has
-  # happened.
-  if ! grep -Eq "${GUEST_ADMIN_SSHD_INCLUDE_MATCH}" <<<"${main_body}"; then
-    main_body="${GUEST_ADMIN_SSHD_INCLUDE}"$'\n'"${main_body}"
-  fi
-  printf '%s' "${main_body}" >"${dir}${GUEST_ADMIN_SSHD_MAIN}" || {
-    rm -rf -- "${dir}"
-    die "Unable to stage ${GUEST_ADMIN_SSHD_MAIN} from $(target_describe "${target}")"
-  }
-
-  printf -v "${__dir_var}" '%s' "${dir}"
+# The fragment is read here; the container's configuration is not. The
+# fragment is this module's own file, with a shape this module chose, and
+# what the container holds is only ever asked of sshd.
+_guest_admin_sshd_takes_effect() {
+  local target=$1 dump=$2 fragment=$3
+  local line keyword value canon actual seen
+  while IFS= read -r line || [[ -n ${line} ]]; do
+    line=${line#"${line%%[![:space:]]*}"}
+    [[ -z ${line} || ${line} == '#'* ]] && continue
+    keyword=${line%%[[:space:]]*}
+    value=${line#"${keyword}"}
+    value=${value#"${value%%[![:space:]]*}"}
+    keyword=$(_sshd_canonical_keyword "${keyword}")
+    # sshd accumulates these rather than letting one occurrence win, so
+    # there is no single resolved value to compare one against. Who they
+    # admit is judged by _guest_admin_sshd_admits instead.
+    case ${keyword} in
+      allowusers | denyusers | allowgroups | denygroups) continue ;;
+    esac
+    canon=$(_sshd_canonical_value "${value}")
+    seen=0
+    while IFS= read -r actual; do
+      seen=1
+      [[ $(_sshd_canonical_value "${actual}") == "${canon}" ]] && continue
+      die "sshd in $(target_describe "${target}") resolves ${keyword} to '${actual}' rather than the '${value}' this hardening asks for; something it reads first wins. Resolve that before hardening."
+    done < <(_guest_admin_sshd_values "${dump}" "${keyword}")
+    [[ ${seen} -eq 1 ]] ||
+      die "sshd in $(target_describe "${target}") reports no ${keyword} in the configuration it resolved; refusing to harden against a configuration this cannot read."
+  done <<<"${fragment}"
+  return 0
 }
 
 # Dies unless the only port this container's sshd answers on is the one
@@ -1204,76 +1199,149 @@ _guest_admin_sshd_mirror() {
 # Only asked where the restriction is what makes the container safe to
 # harden: with the LAN admitted there is no claim being made about which
 # ports answer it.
+#
+# Only listenaddress is read, and Port is not. The dump reports every
+# listener the daemon will bind as host:port with an IPv6 address
+# bracketed, so the port of each one is the text after its last colon and
+# there is no bare-IPv6 address to mistake for a port. Reading Port as
+# well would add a value that may describe no listener at all.
 _guest_admin_sshd_ports_guard() {
-  local target=$1 mirror=$2 access=${PVE_GUEST_ADMIN_SSH_ACCESS:-lan}
+  local target=$1 dump=$2 access=${PVE_GUEST_ADMIN_SSH_ACCESS:-lan}
   [[ ${access} == tailnet ]] || return 0
 
-  local main="${mirror}${GUEST_ADMIN_SSHD_MAIN}"
-  [[ -f ${main} ]] || return 0
-
-  local file criteria keyword value port display
-  while IFS=$'\x1f' read -r file criteria keyword value; do
-    port=''
-    case ${keyword} in
-      port) port=${value%%[[:space:]]*} ;;
-      listenaddress)
-        # ListenAddress is `host`, `host:port`, `[v6]:port`, each with an
-        # optional `rdomain NAME` after it. A bare IPv6 address has
-        # colons and no port, which is why the bracketed form is the only
-        # one a colon is read as a port separator in.
-        local operand=${value%%[[:space:]]*}
-        case ${operand} in
-          \[*\]:*) port=${operand##*]:} ;;
-          *:*:*) port='' ;;
-          *:*) port=${operand##*:} ;;
-        esac
-        ;;
-      *) continue ;;
-    esac
-    [[ -n ${port} ]] || continue
+  local entry port seen=0
+  while IFS= read -r entry; do
+    seen=1
+    port=${entry%%[[:space:]]*}
+    port=${port##*:}
     [[ ${port} == "${GUEST_ADMIN_SSH_PORT}" ]] && continue
-    display=${file#"${mirror}"}
-    if [[ -n ${criteria} ]]; then
-      die "${display} in $(target_describe "${target}") puts sshd on port ${port} under 'Match ${criteria}', which the tailnet restriction does not cover; refusing to report it restricted."
-    fi
-    die "${display} in $(target_describe "${target}") puts sshd on port ${port}, which the tailnet restriction does not cover; refusing to report it restricted."
-  done < <(_sshd_config_directives "${main}" "${mirror}" "${mirror}")
+    die "sshd in $(target_describe "${target}") listens on ${entry}, so it answers on port ${port}, which the tailnet restriction does not cover; refusing to report it restricted."
+  done < <(_guest_admin_sshd_values "${dump}" listenaddress)
+  [[ ${seen} -eq 1 ]] ||
+    die "sshd in $(target_describe "${target}") reports no listener at all; refusing to report it restricted to the tailnet."
   return 0
 }
 
-# Dies unless this fragment would leave every administrator able to log in.
+# Dies unless this fragment would leave every administrator able to log
+# in.
 #
-# Asked of the whole assembled configuration rather than of the fragment,
-# because an AllowUsers or an AuthorizedKeysFile somewhere else in the
-# container's configuration decides the answer and the fragment cannot see
-# it. The mirror is this host's copy of the container's files, so the paths
-# in any complaint are rewritten back to the ones the container knows.
+# Asked of the whole configuration sshd resolved rather than of the
+# fragment, because an AllowUsers or an AuthorizedKeysFile somewhere else
+# in the container's configuration decides the answer and the fragment
+# cannot see it.
 _guest_admin_sshd_admits() {
-  local target=$1 mirror=$2
-  local main="${mirror}${GUEST_ADMIN_SSHD_MAIN}" user groups raw reason
-  local -a pairs=()
+  local target=$1 dump=$2
+  shift 2
 
+  local display
+  display="sshd in $(target_describe "${target}")"
+
+  local value operand method ok
+  while IFS= read -r value; do
+    ok=0
+    for operand in ${value}; do
+      operand=${operand#'%h/'}
+      [[ ${operand} == '.ssh/authorized_keys' ]] && ok=1
+    done
+    [[ ${ok} -eq 1 ]] && continue
+    die "${display} resolves AuthorizedKeysFile to '${value}', so the keys installed for the administrators would be ignored."
+  done < <(_guest_admin_sshd_values "${dump}" authorizedkeysfile)
+
+  while IFS= read -r value; do
+    ok=0
+    # sshd takes alternatives separated by spaces and requirements
+    # separated by commas, and succeeds when one alternative is satisfied
+    # in full: `publickey,password` is not an alternative a key alone
+    # finishes, `publickey password` is.
+    for method in ${value}; do
+      [[ ${method} == any || ${method} == publickey ]] && ok=1
+    done
+    [[ ${ok} -eq 1 ]] && continue
+    die "${display} requires 'AuthenticationMethods ${value}', which no key alone satisfies; hardening would leave every administrator unable to finish authenticating."
+  done < <(_guest_admin_sshd_values "${dump}" authenticationmethods)
+
+  local -a allow_users=() deny_users=() allow_groups=() deny_groups=()
+  mapfile -t allow_users < <(_guest_admin_sshd_values "${dump}" allowusers)
+  mapfile -t deny_users < <(_guest_admin_sshd_values "${dump}" denyusers)
+  mapfile -t allow_groups < <(_guest_admin_sshd_values "${dump}" allowgroups)
+  mapfile -t deny_groups < <(_guest_admin_sshd_values "${dump}" denygroups)
+
+  local user pattern group admitted
+  local -a groups=()
+  while [[ $# -gt 0 ]]; do
+    user=$1
+    IFS=',' read -r -a groups <<<"${2:-}"
+    shift 2
+
+    for pattern in ${deny_users[@]+"${deny_users[@]}"}; do
+      if _ssh_name_matches "${user}" "${pattern}"; then
+        die "${display} denies ${user} with 'DenyUsers ${pattern}', so hardening would leave them unable to log in."
+      fi
+    done
+    if [[ ${#allow_users[@]} -gt 0 ]]; then
+      admitted=0
+      for pattern in "${allow_users[@]}"; do
+        _ssh_name_matches "${user}" "${pattern}" && admitted=1
+      done
+      if [[ ${admitted} -ne 1 ]]; then
+        die "${display} admits only '${allow_users[*]}', which does not include ${user}; hardening would leave them unable to log in."
+      fi
+    fi
+
+    [[ ${#deny_groups[@]} -gt 0 || ${#allow_groups[@]} -gt 0 ]] || continue
+    for pattern in ${deny_groups[@]+"${deny_groups[@]}"}; do
+      for group in ${groups[@]+"${groups[@]}"}; do
+        if _ssh_name_matches "${group}" "${pattern}"; then
+          die "${display} denies ${user}'s group ${group} with 'DenyGroups ${pattern}', so hardening would leave them unable to log in."
+        fi
+      done
+    done
+    if [[ ${#allow_groups[@]} -gt 0 ]]; then
+      admitted=0
+      for pattern in "${allow_groups[@]}"; do
+        for group in ${groups[@]+"${groups[@]}"}; do
+          _ssh_name_matches "${group}" "${pattern}" && admitted=1
+        done
+      done
+      if [[ ${admitted} -ne 1 ]]; then
+        die "${display} admits only the groups '${allow_groups[*]}', none of which ${user} is in; hardening would leave them unable to log in."
+      fi
+    fi
+  done
+  return 0
+}
+
+# Dies unless the configuration the container's sshd would run, with this
+# fragment in it, still lets every administrator in.
+#
+# The dump is the global one, with no -C. What it answers is the
+# question this module exists to answer: can an administrator log in with
+# a key, with password authentication off. A Match block that alters
+# behaviour for some other user or some other address is deliberately not
+# analysed -- it does not touch that question, and refusing it was
+# strictness nobody asked for.
+_guest_admin_sshd_judge() {
+  local target=$1 fragment=$2
+  local -a pairs=()
+  local dump='' user raw groups
+
+  # Not a subshell: a group file that cannot be read is a die, and a die
+  # in a subshell is a message nobody acts on and a run that carries on
+  # hardening. An AllowGroups judged against an empty list admits
+  # everybody, which is the answer that disables password authentication.
   while IFS= read -r user; do
     [[ -n ${user} ]] || continue
-    # A group file that cannot be read is not an account with no groups.
-    # Taking it for one would have an AllowGroups or a DenyGroups judged
-    # against an empty list, which admits every administrator no matter
-    # what the configuration says about them.
     raw=$(target_user_groups "${target}" "${user}") ||
       die "Unable to read the groups ${user} belongs to in $(target_describe "${target}"); refusing to judge who its sshd would admit."
     groups=$(printf '%s\n' "${raw}" | paste -sd, -)
     pairs+=("${user}" "${groups}")
   done < <(_guest_admin_users)
 
-  _guest_admin_sshd_ports_guard "${target}" "${mirror}"
-
-  if ! reason=$(sshd_authorized_keys_problem "${main}" "${mirror}" "${mirror}" "${mirror}"); then
-    die "In $(target_describe "${target}"): ${reason}"
-  fi
-  if ! reason=$(sshd_admission_problem "${main}" "${mirror}" "${mirror}" "${mirror}" \
-    ${pairs[@]+"${pairs[@]}"}); then
-    die "In $(target_describe "${target}"): ${reason}"
-  fi
+  _guest_admin_sshd_effective dump "${target}"
+  _guest_admin_sshd_takes_effect "${target}" "${dump}" "${fragment}"
+  _guest_admin_sshd_ports_guard "${target}" "${dump}"
+  _guest_admin_sshd_admits "${target}" "${dump}" ${pairs[@]+"${pairs[@]}"}
+  return 0
 }
 
 # Dies unless sudo's agent authentication can still reach an agent.
@@ -1282,32 +1350,38 @@ _guest_admin_sshd_admits() {
 # plus sudo authenticated by the forwarded agent. sshd refusing to forward
 # the agent takes the second half away: the administrators can log in and
 # none of them can become root. That is only a question for the lock,
-# which is why it is asked here and not with the hardening -- a container
+# which is why it is asked there and not with the hardening -- a container
 # whose root password is still set has lost nothing.
+#
+# Both keywords are read. DisableForwarding yes turns agent forwarding off
+# without changing what AllowAgentForwarding resolves to, so either one
+# alone answers half the question.
 _guest_admin_sshd_forwarding_guard() {
-  local target=$1 mirror=$2
-  local main="${mirror}${GUEST_ADMIN_SSHD_MAIN}"
-  [[ -f ${main} ]] || return 0
+  local target=$1 dump=$2
+  local display
+  display="sshd in $(target_describe "${target}")"
 
-  local file criteria keyword value setting display
-  while IFS=$'\x1f' read -r file criteria keyword value; do
-    case ${keyword} in
-      allowagentforwarding | disableforwarding) ;;
-      *) continue ;;
-    esac
-    setting=${value%%[[:space:]]*}
-    setting=${setting,,}
-    case ${keyword}:${setting} in
-      allowagentforwarding:no | disableforwarding:yes) ;;
-      *) continue ;;
-    esac
-    display=${file#"${mirror}"}
-    if [[ -n ${criteria} ]]; then
-      die "${display} in $(target_describe "${target}") sets ${keyword} ${setting} under 'Match ${criteria}', and sudo there authenticates with a forwarded agent key; refusing to lock the root password."
-    fi
-    die "${display} in $(target_describe "${target}") sets ${keyword} ${setting}, so no administrator can forward the agent key sudo authenticates with; refusing to lock the root password."
-  done < <(_sshd_config_directives "${main}" "${mirror}" "${mirror}")
+  local value
+  while IFS= read -r value; do
+    [[ ${value,,} == yes ]] && continue
+    die "${display} resolves allowagentforwarding ${value,,}, so no administrator can forward the agent key sudo authenticates with; refusing to lock the root password."
+  done < <(_guest_admin_sshd_values "${dump}" allowagentforwarding)
+  while IFS= read -r value; do
+    [[ ${value,,} == no ]] && continue
+    die "${display} resolves disableforwarding ${value,,}, so no administrator can forward the agent key sudo authenticates with; refusing to lock the root password."
+  done < <(_guest_admin_sshd_values "${dump}" disableforwarding)
   return 0
+}
+
+# Dies unless the running configuration still carries a forwarded agent,
+# for every administrator.
+_guest_admin_sshd_forwarding_confirmed() {
+  local target=$1 fragment=$2 dump=''
+
+  _guest_admin_sshd_stage "${target}" "${fragment}"
+  _guest_admin_sshd_effective dump "${target}"
+  _guest_admin_sshd_forwarding_guard "${target}" "${dump}"
+  _guest_admin_sshd_unstage "${target}"
 }
 
 # Dies unless every administrator's configured key is installed, active and
@@ -1335,21 +1409,16 @@ _guest_admin_keys_live() {
   done < <(_guest_admin_users)
 }
 
-# Installs the fragment with sshd's own judgement of the configuration the
-# container will be running.
+# Installs the fragment.
 #
-# Everything in this toolkit that judges an sshd configuration reads it
-# from a filesystem under $(sysroot). The mirror is the container's
-# configuration on this host, so sysroot is pointed at it for the duration
-# of the install: the container is then judged by the host's code, on the
-# container's own bytes, by the host's sshd binary. The assignment is a
-# local, so it is the container's for exactly as long as this call.
+# The judgement this file gets is sshd's own, made inside the container by
+# _guest_admin_sshd_judge before anything is written. There is nothing
+# left for this host's sshd to say about a configuration it cannot
+# assemble: the Includes in it name the container's filesystem.
 _guest_admin_sshd_install() {
-  local target=$1 fragment=$2 mirror=$3
-  # shellcheck disable=SC2034  # read by sysroot, in everything called below
-  local PVE_CONFIG_ROOT=${mirror}
-  target_install_validated "${target}" "${GUEST_ADMIN_SSHD_PATH}" \
-    "${fragment}" 0644 validate_sshd_config
+  local target=$1 fragment=$2
+  _target_refuse_symlink "${target}" "${GUEST_ADMIN_SSHD_PATH}"
+  target_write_file "${target}" "${GUEST_ADMIN_SSHD_PATH}" "${fragment}" 0644
 }
 
 # Whether publishing the hardening would change what sshd reads.
@@ -1366,14 +1435,17 @@ _guest_admin_sshd_publish_changes() {
   target_slurp installed "${target}" "${GUEST_ADMIN_SSHD_PATH}" || return 0
   [[ ${installed} == "${fragment}" ]] || return 0
   target_slurp main_body "${target}" "${GUEST_ADMIN_SSHD_MAIN}" || return 0
-  grep -Eq "${GUEST_ADMIN_SSHD_INCLUDE_MATCH}" <<<"${main_body}" || return 0
+  local wanted=''
+  _guest_admin_sshd_main_with_include wanted "${main_body}" \
+    "${GUEST_ADMIN_SSHD_INCLUDE}"
+  [[ ${wanted} == "${main_body}" ]] || return 0
   return 1
 }
 
 # Installs the hardening fragment, having first established that doing so
 # leaves every administrator able to get in.
 guest_admin_sshd_converge() {
-  local target=$1 fragment mirror='' changed=0 state include_state=unchanged
+  local target=$1 fragment changed=0 state include_state=unchanged
 
   fragment=$(guest_admin_sshd_fragment) ||
     die "Unable to decide who $(target_describe "${target}") should admit."
@@ -1383,15 +1455,17 @@ guest_admin_sshd_converge() {
     changed=1
   fi
 
-  _guest_admin_sshd_mirror "${target}" "${fragment}" mirror
-
   # The gate. Nothing below this point can be undone from outside the
   # container, so everything that could refuse has already refused.
   if dry_run_enabled; then
-    log_info "would check that every administrator can log in to $(target_describe "${target}") with a key before disabling passwords"
+    # The overlay cannot be built in the container, because a dry run
+    # writes nothing to it, and sshd there has nothing to be asked about.
+    log_info "would ask sshd in $(target_describe "${target}") what the hardened configuration resolves to, and check that every administrator can log in with a key before disabling passwords"
   else
     _guest_admin_keys_live "${target}"
-    _guest_admin_sshd_admits "${target}" "${mirror}"
+    _guest_admin_sshd_stage "${target}" "${fragment}"
+    _guest_admin_sshd_judge "${target}" "${fragment}"
+    _guest_admin_sshd_unstage "${target}"
     # And that the container is only reachable where it was meant to be.
     # Hardening a container that is still exposed to the LAN would leave
     # the exposure in place behind a configuration that claims otherwise.
@@ -1423,24 +1497,25 @@ guest_admin_sshd_converge() {
 
   # Not a subshell: a refusal in there is a die, and a die in a subshell
   # is a message nobody acts on and a run that carries on hardening.
-  state_of state _guest_admin_sshd_install "${target}" "${fragment}" "${mirror}"
-  rm -rf -- "${mirror}"
+  state_of state _guest_admin_sshd_install "${target}" "${fragment}"
   if [[ ${state} == changed ]]; then
     changed=1
   fi
 
   # sshd only reads a fragment when the main configuration includes one,
   # and the Include is added after the fragment is in place: publishing it
-  # first would make every other file in that directory live.
-  local main_body=''
-  target_slurp main_body "${target}" "${GUEST_ADMIN_SSHD_MAIN}" || main_body=''
-  if ! grep -Eq "${GUEST_ADMIN_SSHD_INCLUDE_MATCH}" <<<"${main_body}"; then
-    state_of include_state target_ensure_exact_line "${target}" \
-      "${GUEST_ADMIN_SSHD_MAIN}" "${GUEST_ADMIN_SSHD_INCLUDE_MATCH}" \
-      "${GUEST_ADMIN_SSHD_INCLUDE}" prepend
-    if [[ ${include_state} == changed ]]; then
-      changed=1
-    fi
+  # first would make the fragment live before it holds the hardening.
+  #
+  # Added whatever the container already includes. Its own glob may or
+  # may not cover this file, and working out which is reading OpenSSH's
+  # syntax; naming the file is the question with one answer. The same
+  # transformation built the overlay sshd was asked about, so the file
+  # this writes is the file that was judged.
+  state_of include_state target_ensure_exact_line "${target}" \
+    "${GUEST_ADMIN_SSHD_MAIN}" "${GUEST_ADMIN_SSHD_INCLUDE_MATCH}" \
+    "${GUEST_ADMIN_SSHD_INCLUDE}" "${GUEST_ADMIN_SSHD_INCLUDE_POSITION}"
+  if [[ ${include_state} == changed ]]; then
+    changed=1
   fi
 
   state_of state target_service_enable "${target}" "${GUEST_ADMIN_SSH_UNIT}"
@@ -1539,8 +1614,11 @@ _guest_admin_access_confirmed() {
     die "${GUEST_ADMIN_SSHD_PATH} in $(target_describe "${target}") is not the hardening this run installed; refusing to lock the root password."
 
   target_slurp main_body "${target}" "${GUEST_ADMIN_SSHD_MAIN}" || main_body=''
-  grep -Eq "${GUEST_ADMIN_SSHD_INCLUDE_MATCH}" <<<"${main_body}" ||
-    die "${GUEST_ADMIN_SSHD_MAIN} in $(target_describe "${target}") does not include ${GUEST_ADMIN_SSHD_DIR}, so sshd never reads the hardening; refusing to lock the root password."
+  local wanted_main=''
+  _guest_admin_sshd_main_with_include wanted_main "${main_body}" \
+    "${GUEST_ADMIN_SSHD_INCLUDE}"
+  [[ ${wanted_main} == "${main_body}" ]] ||
+    die "${GUEST_ADMIN_SSHD_MAIN} in $(target_describe "${target}") does not include ${GUEST_ADMIN_SSHD_PATH} the way this run installs it, so sshd never reads the hardening; refusing to lock the root password."
 
   # sudo is the other half of the access being confirmed: an administrator
   # who can log in and cannot become root has not replaced the root
@@ -1560,10 +1638,7 @@ _guest_admin_access_confirmed() {
   _guest_admin_keys_live "${target}"
 
   # And that a login can still carry the agent key sudo asks for.
-  local mirror=''
-  _guest_admin_sshd_mirror "${target}" "${fragment}" mirror
-  _guest_admin_sshd_forwarding_guard "${target}" "${mirror}"
-  rm -rf -- "${mirror}"
+  _guest_admin_sshd_forwarding_confirmed "${target}" "${fragment}"
 }
 
 # Locks root's password, once key-based access has been confirmed working.

@@ -817,41 +817,113 @@ directory may flush the ruleset or take this toolkit's table away.
 Either stops the run: a boot sequence this cannot account for is not one
 to lock a root password on the strength of.
 
-Before it hardens anything, the toolkit copies the container's
-`sshd_config` and the whole of `/etc/ssh/sshd_config.d` -- subdirectories
-included -- and works out who that configuration admits. An `Include`
-naming anything the copy does not hold, or a path that resolves outside
-that directory, stops the run: a configuration this node cannot reproduce
-is one it cannot judge, and disabling passwords against a guess is how
-operators get locked out.
+Before it hardens anything, the toolkit asks the container's own `sshd`
+what configuration it would run. It copies the container's `/etc/ssh`
+to `/run/pve-config/sshd-check/etc-ssh`, writes into that copy the two
+files converge is about to write for real, mounts the copy over
+`/etc/ssh` inside a mount namespace of its own, and runs `sshd -T` --
+with no `-f` at all, so sshd opens `/etc/ssh/sshd_config` exactly as the
+daemon will. The dump that comes back holds the configuration that
+remains once the parser which will follow them for real has followed
+every `Include`, and a configuration sshd will not run exits non-zero
+and stops the run. Nothing here reads an sshd configuration file: a
+quoted operand, a nested `Include`, a path that climbs out of the
+drop-in directory, a keyword spelled `iNcLuDe`, a drop-in whose name
+holds a newline are all sshd's to resolve, and it resolves them.
+
+Copying rather than constructing is the point. Earlier versions built a
+candidate `sshd_config` and asked sshd about that, and three rounds of
+review found three ways for the candidate to resolve differently from
+the file converge installs: a glob that did not cover the fragment, an
+`Include` naming one sibling drop-in, and a stale managed fragment the
+container's own glob pulled in ahead of the staged one. The copy has the
+real glob, the real sort order and the real pathnames, so there is
+nothing left to get wrong. `cp -a /etc/ssh/. ...` also copies the
+drop-ins without this toolkit ever naming one, which is what a filename
+holding a newline defeated when it did.
+
+The namespace belongs to the one command. Every mount in it goes when
+that command ends, whether it exits, fails or dies to a signal, and a
+process outside it reading `/etc/ssh` sees the container's own files
+throughout. The toolkit writes nothing outside `/run`, which is a tmpfs
+no daemon reads. The copy, host keys included, sits under a root-only
+directory. The toolkit deletes it once the judgement has passed; a run
+the judgement stops leaves it there until the next run or a reboot, and
+the next run removes it before making a fresh one -- or stops, if it
+cannot, rather than judge a drop-in the container no longer has. A
+container that refuses the namespace or the mount, or has no `sshd` in
+it, stops the run as well: only sshd itself refusing the configuration
+counts as an answer, and neither outcome hardens anything.
+
+Two files go into the copy. The fragment, at its real name, replacing
+any fragment an earlier run installed; and the container's
+`sshd_config` with one line changed, which is the line converge is about
+to prepend to the real file: an `Include` naming
+`/etc/ssh/sshd_config.d/99-pve-config-admin.conf` outright, replacing
+any earlier copy of that same line. One piece of code makes that change
+for the copy and for the real file, so what sshd judged and what sshd
+ends up running cannot drift apart.
+
+The managed `Include` names the file rather than the directory, and goes
+in whatever the container already includes. A container that pulls the
+drop-in directory in by a glob which does not cover this file --
+`*.cfg`, or one drop-in by name -- mentions the directory without
+reading the fragment, and a check that asked only whether the directory
+appeared would disable password authentication on the strength of a file
+the daemon never opens. Naming the file is the form of the question with
+one answer. A second `Include` of a fragment some other glob already
+covers costs nothing: sshd reads it twice, a list keyword gains a
+duplicate entry that admits the same people, and a scalar keeps its
+first value.
+
+It goes at the top because that is the one position that cannot be
+inside a `Match` block without reading OpenSSH's syntax to find out. One
+consequence is deliberate: the hardening is now read before whatever the
+container sets lower down, so where the two conflict the hardening wins.
+Earlier versions stopped the run instead.
+
+`Match` blocks are no longer analysed. The toolkit takes the global dump
+and nothing else, so a block keyed on a user, a group or an address does
+not reach it -- `sshd -T` with no `-C` resolves such a block to the
+global value. The question this guards is whether an administrator can
+log in with a key and whether passwords are off, and a block that alters
+something for one connection answers neither. Earlier versions refused
+any container with a conflicting conditional setting. Dropping that strictness
+costs nothing, and the owner asked for it.
+
+A container with no `sshd` in it stops the run as surely as a bad
+configuration does, and says so differently: there is nothing to ask, and
+"nothing to ask" is not an answer. So does a container that will not give
+the run a mount namespace, or will not let it mount the copy -- the
+toolkit judges by exit status alone and never by what a tool printed,
+and only sshd itself reading a configuration and refusing it counts as a
+refusal. Everything else stops the run. A dry run cannot copy or mount
+anything, so it skips the check and says so.
 
 Two settings in that configuration stop the run outright. An
 `AuthenticationMethods` value no alternative of which a key alone
 satisfies -- `publickey,password`, where the comma means *and* -- would
 leave every administrator unable to finish authenticating once passwords
-go away. And `AllowAgentForwarding no` or `DisableForwarding yes`, in the
-main file or under a `Match`, blocks the root lock: `sudo` in the
+go away. And `AllowAgentForwarding no` or `DisableForwarding yes` blocks
+the root lock: `sudo` in the
 container authenticates with the forwarded agent key, so a daemon that
 will not carry one is not access worth giving the root password up for.
 
-That reading is deliberately narrow, and it refuses two things sshd
-itself accepts:
+Earlier versions of this toolkit read those files themselves, and refused
+an `Include` operand holding a quote, a backslash or whitespace, and a
+drop-in filename holding anything beyond letters, digits, dots, dashes
+and underscores. Neither restriction remains: they existed only because
+this toolkit had to reproduce a corner of OpenSSH's parser to list the
+files one by one, and nothing lists them any more. What
+remains is a refusal to read a container file holding a NUL byte, which
+is about this toolkit reading bytes rather than about sshd reading
+configuration.
 
-- an `Include` operand holding a quote, a backslash, whitespace or a
-  control character -- `Include "/etc/ssh/sshd_config.d/*.conf"` stops
-  the run, although sshd reads it;
-- a drop-in filename with anything in it beyond letters, digits, dots,
-  dashes and underscores, including one with a newline in the name.
-
-Both abort with a message naming the file. Rename the file, or write the
-`Include` unquoted, and the run proceeds. The narrowness is the point:
-each of these is a place where this toolkit would otherwise have to
-reproduce a corner of OpenSSH's own parser, and a wrong guess there is a
-lockout rather than a failed run. Issue #30 replaces the whole reading
-with `sshd -T` -- sshd's parser answering for itself -- and lifts these
-restrictions. The copy keeps a filename that begins with a dot rather
-than refusing it: `Include .../*.conf` does not load one, but an
-`Include` naming it outright does.
+Worth knowing, because it decides what the daemon loads rather than what
+this toolkit does: `Include .../*.conf` does not match a name beginning
+with a dot, so an editor's swap file beside the drop-ins is not
+configuration; and it does not match `policy.conf` followed by a newline
+either, because that name does not end in `.conf`.
 
 Treat the container-side filter as hardening, not as a boundary against
 the container itself. Root inside the container can flush the table; a

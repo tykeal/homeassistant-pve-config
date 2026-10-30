@@ -749,7 +749,10 @@ mark_pmxcfs() {
 }
 
 @test "install_validated accepts the canonical spelling of a value" {
-  # sshd reports PermitRootLogin prohibit-password as without-password.
+  # Probed against OpenSSH 10.2p1: PermitRootLogin without-password and
+  # prohibit-password both come back as prohibit-password. The toolkit
+  # reads either as the same answer, so this passes whichever spelling
+  # the binary of the day reports.
   mkdir -p "${PVE_CONFIG_ROOT}/etc/ssh/sshd_config.d"
   printf 'Include %s/etc/ssh/sshd_config.d/*.conf\n' \
     "${PVE_CONFIG_ROOT}" >"${PVE_CONFIG_ROOT}/etc/ssh/sshd_config"

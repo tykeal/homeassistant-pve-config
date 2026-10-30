@@ -69,6 +69,24 @@ MOCK_READ_ONLY_PATTERNS=(
   # command that follows TERM=dumb is what keeps this a list of read-only
   # invocations rather than a licence for pct exec.
   '^pct exec [0-9]+ --keep-env 0 -- /bin/sh -c .* TERM=dumb (test|stat|ls -1A?|find|readlink|sha256sum|dpkg-query|sysctl -n|tailscale status|systemctl is-active|systemctl is-enabled|passwd -S|nft list|nft -c) .*$'
+  # Asking the container's own sshd what its configuration resolves to
+  # means building an overlay for it to read, which is a write. Named
+  # down to the path so this stays a licence for one scratch directory
+  # on a tmpfs no daemon reads rather than for writing into a container.
+  # The copy and the mount reach /etc/ssh, so they are spelled out whole
+  # rather than left to a wildcard: a bind whose target were /etc/ssh
+  # outside a namespace would be a mutation, and must not pass here.
+  '^pct exec [0-9]+ --keep-env 0 -- /bin/sh -c .* TERM=dumb mkdir -p -- /run/pve-config/sshd-check(/etc-ssh(/sshd_config\.d)?)?$'
+  '^pct exec [0-9]+ --keep-env 0 -- /bin/sh -c .* TERM=dumb chmod -- 0[0-9]+ /run/pve-config/sshd-check(/etc-ssh(/sshd_config\.d)?)?$'
+  '^pct exec [0-9]+ --keep-env 0 -- /bin/sh -c .* TERM=dumb rm -rf -- /run/pve-config/sshd-check$'
+  '^pct exec [0-9]+ --keep-env 0 -- /bin/sh -c .* TERM=dumb cp -a /etc/ssh/\. /run/pve-config/sshd-check/etc-ssh/$'
+  '^pct push [0-9]+ [^ ]+ /run/pve-config/sshd-check/etc-ssh/[^ ]+ --perms 0[0-7]+$'
+  '^pct exec [0-9]+ --keep-env 0 -- /bin/sh -c .* TERM=dumb /bin/sh -c .*unshare -m .*pve-config /run/pve-config/sshd-check/etc-ssh /etc/ssh mount --bind .*sshd -T.*$'
+  # The same dump as the namespace and mount mocks record it from inside
+  # the container. The bind is only read-only because it happens in the
+  # private namespace unshare opened, so both are named down to paths.
+  '^unshare -m /bin/sh -c mount --bind .*sshd -T.* pve-config /run/pve-config/sshd-check/etc-ssh /etc/ssh$'
+  '^mount --bind /run/pve-config/sshd-check/etc-ssh /etc/ssh$'
 )
 
 assert_no_mutating_calls() {
