@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: 2026 Andrew Grimberg <tykeal@bardicgrove.org>
+# SPDX-License-Identifier: Apache-2.0
+
+[Unit]
+Description=Send Zulip boot notification
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/zulip-notify.sh boot
+
+[Install]
+WantedBy=multi-user.target

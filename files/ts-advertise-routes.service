@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: 2026 Andrew Grimberg <tykeal@bardicgrove.org>
+# SPDX-License-Identifier: Apache-2.0
+
+# Re-advertise the container's connected subnet(s) to Tailscale on every
+# boot, so a host moved to a different network advertises the new LAN.
+[Unit]
+Description=Advertise the local subnet(s) to Tailscale
+After=network-online.target tailscaled.service
+Wants=network-online.target tailscaled.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ts-advertise-routes.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

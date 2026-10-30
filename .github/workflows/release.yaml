@@ -16,9 +16,7 @@
 # /archive/refs/tags/ endpoint. GitHub generates that source archive on
 # demand, which excludes it from both immutable-release protection and the
 # release attestation, so it cannot be verified with 'gh release
-# verify-asset'. Only an explicitly uploaded asset is covered. 'git
-# archive' is not used either, for the reason given on the build step: it
-# reads the object store and would ship the unstamped version placeholder.
+# verify-asset'. Only an explicitly uploaded asset is covered.
 #
 # This workflow deliberately does NOT use actions/attest-build-provenance
 # and holds no 'id-token'/'attestations' permission. That is the separate
@@ -313,33 +311,10 @@ jobs:
           ASSET="pve-config-${TAG}.tar.gz"
           PREFIX="pve-config-${TAG}"
 
-          # Stamp the version into the working tree. The committed tree
-          # always reads 0.0.0; only the released artefact carries a real
-          # version. The anchor on '^PVE_CONFIG_VERSION=' keeps the
-          # substitution from reaching anything else in the file.
-          sed -i "s|^PVE_CONFIG_VERSION=.*|PVE_CONFIG_VERSION='${VERSION}'|" \
-            lib/version.sh
-
-          # Verify the rewrite landed. Immutable releases cannot be
-          # amended, so a tarball that silently shipped 0.0.0 could never
-          # be corrected in place; fail the job loudly instead.
-          STAMPED=$(sed -n "s|^PVE_CONFIG_VERSION='\\(.*\\)'$|\\1|p" \
-            lib/version.sh)
-          if [ "${STAMPED}" != "${VERSION}" ]; then
-            echo "::error::version stamp failed: lib/version.sh reads" \
-              "'${STAMPED}', expected '${VERSION}'"
-            exit 1
-          fi
-          echo "lib/version.sh stamped with ${STAMPED}"
-
           mkdir -p dist
 
-          # 'tar' rather than 'git archive'. DO NOT switch this back:
-          # git archive exports from the object store and would ship the
-          # committed 0.0.0 placeholder, ignoring the sed above
-          # entirely. The file list still comes from git, so the archive
-          # holds exactly the tracked tree and nothing the runner left
-          # lying around.
+          # The file list comes from git, so the archive holds exactly
+          # the tracked tree and nothing the runner left lying around.
           #
           # The whole tracked tree ships, tests and CI configuration
           # included: this is a source distribution an operator may want
@@ -419,16 +394,15 @@ jobs:
           # no path in the filename column.
           sha256sum -c "${ASSET}.sha256"
 
-          # Exactly one top-level directory, and the stamped version
-          # survives into the archive.
+          # Exactly one top-level directory holding both scripts.
           TOPLEVEL=$(tar tzf "${ASSET}" \
             | cut -d/ -f1 | sort -u)
           if [ "${TOPLEVEL}" != "pve-config-${TAG}" ]; then
             echo "::error::unexpected top level in ${ASSET}: ${TOPLEVEL}"
             exit 1
           fi
-          tar xzOf "${ASSET}" "pve-config-${TAG}/lib/version.sh" \
-            | grep -q "^PVE_CONFIG_VERSION='${TAG#v}'$"
+          tar tzf "${ASSET}" "pve-config-${TAG}/pve-baseline.sh" \
+            "pve-config-${TAG}/pve-guests.sh" >/dev/null
 
       - name: 'Upload tarball artefact'
         # yamllint disable-line rule:line-length

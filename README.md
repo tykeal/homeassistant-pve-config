@@ -5,1499 +5,205 @@ SPDX-License-Identifier: Apache-2.0
 
 # pve-config
 
-A toolkit of bash scripts that configure a bare-metal Proxmox VE host into a
-Home Assistant platform. You run it as `root` from a Proxmox VE shell.
+Two bash scripts that take a freshly installed Proxmox VE host to a known
+baseline before it ships to its site:
 
-## What this is and what it builds
+- `pve-baseline.sh` sets up the host: hostname, DHCP bridge, repositories,
+  admin user, SSH and Zulip notifications.
+- `pve-guests.sh` adds the web UI certificate, a Home Assistant OS VM, a
+  Tailscale subnet router container and a Frigate container.
 
-`pve-config` converges a freshly installed Proxmox VE host into a known
-system:
+This is a one-time setup, not configuration management. Each script runs
+once, in order, on a fresh install. Final configuration happens later,
+remotely, over Tailscale. Re-running either script on a configured host
+will fail part way (the user, guests and plugin already exist); reinstall
+Proxmox instead.
 
-- a Proxmox VE host with its hostname, management bridge, apt sources,
-  administrators and SSH policy set
-- a Home Assistant OS VM
-- a Tailscale LXC
-- a Frigate LXC
+## Usage
 
-The toolkit handles **more than one customer**. The code carries no customer
-value:
-each deployment supplies its own configuration file, so the same toolkit
-builds every site. The toolkit also stays **idempotent**. Each stage
-converges rather than asserts, so a second run against a configured host
-changes nothing.
+On the freshly installed host, logged in as `root` on the **local
+console** (the baseline switches the network to DHCP, which drops SSH
+sessions):
 
-Phase 1 (the host) ships today. Phase 2 ships its certificate stage; the
-guests do not. See [Status](#status).
+```bash
+mkdir -p /root/pve-config && cd /root/pve-config
+curl -fsSL https://github.com/tykeal/homeassistant-pve-config/archive/refs/heads/main.tar.gz \
+  | tar xz --strip-components=1
+cp pve-config.env.example pve-config.env
+chmod 0600 pve-config.env
+nano pve-config.env              # fill in every CHANGEME
 
-## Prerequisites
+./pve-baseline.sh
+reboot
 
-- A freshly installed Proxmox VE host. The stages refuse to run on a machine
-  that has no `pveversion`, `pvesh` or `pvecm`.
-- A root shell on that host, over the console or SSH. Keep console or
-  out-of-band access available: phase 1 rewrites the networking and the SSH
-  policy of the machine you are probably sitting on.
-- `curl`, `tar` and `sha256sum` on the host, which a stock Proxmox install
-  carries.
-- **A DHCP reservation for the host.** The management bridge takes its
-  address from DHCP by design, so the host needs a stable lease. Create the
-  reservation against the MAC of the NIC that carries the uplink before you
-  start. Without one the address moves, and `/etc/hosts`, the certificate
-  and the guests all end up pointing at the wrong place.
-
-The toolkit also accepts a static address through
-`PVE_BRIDGE_MODE='static'`, but DHCP with a reservation remains the
-documented path.
-
-## Bootstrap
-
-Install the toolkit with one command on the host:
-
-```shell
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/tykeal/homeassistant-pve-config/main/bootstrap.sh)"
-```
-
-The installer unpacks the latest published release into `/root/pve-config`
-and stops. Running the configuration takes a separate, deliberate act.
-
-The installer:
-
-- resolves the latest published release by following the redirect of
-  `https://github.com/tykeal/homeassistant-pve-config/releases/latest`,
-  which needs no API token and spends no API rate limit
-- downloads `pve-config-<tag>.tar.gz` and `pve-config-<tag>.tar.gz.sha256`
-  from that release, checks that the checksum holds one record naming that
-  one asset and no path of its own, then checks the tarball with
-  `sha256sum -c` and stops before it unpacks anything if the two disagree
-- rejects any archive whose entries escape the extraction root or carry a
-  link
-- assembles `pve-config.sh`, `bootstrap.sh`, `lib/`, `stages/` and
-  `examples/` into a staging tree beside the install directory
-- carries `pve-config.conf`, `secrets.env`, `state/` and `keys/` across from
-  an existing install, so an upgrade keeps your configuration, your
-  credentials and the record of what has already run
-- marks the driver and the stages executable, creates `state/`, then swaps
-  the tree into place by rename
-
-### What the checksum proves
-
-The published checksum comes from the same release as the tarball, so on its
-own it rules out a corrupted or truncated download rather than a hostile
-one. It carries more weight here because this repository has GitHub
-immutable releases turned on: once a release publishes, GitHub locks its
-tag and its uploaded assets, so nobody can swap the pair afterwards. That is why
-the project attaches its own tarball. GitHub excludes the auto-generated
-`/archive/refs/tags/<tag>.tar.gz` from immutability, and the installer never
-uses it.
-
-This is not a signature. An operator who wants a check that does not trust
-the download at all reads the digest somewhere else and passes it as
-`PVE_CONFIG_SHA256`, which the installer treats as the authority. Setting
-that variable to an empty string stops the install, because a pin that
-never got a value proves nothing.
-
-### Settings
-
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `PVE_CONFIG_RELEASE` | the latest release | Release tag to install, for example `v0.1.0` |
-| `PVE_CONFIG_SHA256` | unset | Expected sha256 of the tarball, 64 hex characters. Takes precedence over the published checksum and applies in every mode. An empty value is an error, not an absent pin |
-| `PVE_CONFIG_REF` | unset | Git ref to install from codeload. No checksum covers it, so it needs `PVE_CONFIG_SHA256` or the opt-in below |
-| `PVE_CONFIG_ALLOW_UNVERIFIED` | unset | Set to `1`, or pass `--allow-unverified`, to permit an unverified `PVE_CONFIG_REF` install |
-| `PVE_CONFIG_DIR` | `/root/pve-config` | Install directory |
-| `PVE_CONFIG_REPO` | `tykeal/homeassistant-pve-config` | Source repository |
-| `PVE_CONFIG_BOOTSTRAP_ARCHIVE` | unset | Install from a local tarball instead of downloading one |
-
-Setting both `PVE_CONFIG_RELEASE` and `PVE_CONFIG_REF` is a configuration
-error, and the installer stops naming both.
-
-### How each combination behaves
-
-| Settings | Source | Verified against |
-| --- | --- | --- |
-| none | the latest release | the published checksum |
-| `PVE_CONFIG_RELEASE=v0.1.0` | that release | the published checksum |
-| `PVE_CONFIG_RELEASE` and `PVE_CONFIG_SHA256` | that release | your digest; the published checksum is not fetched |
-| `PVE_CONFIG_REF` alone | refused | — |
-| `PVE_CONFIG_REF` and `PVE_CONFIG_ALLOW_UNVERIFIED=1` | codeload | nothing, and the run says so twice |
-| `PVE_CONFIG_REF` and `PVE_CONFIG_SHA256` | codeload | your digest, so the opt-in does not apply |
-| `PVE_CONFIG_BOOTSTRAP_ARCHIVE` | your file | your digest, when you set one |
-
-A local archive needs no opt-in. The installer downloaded nothing, so no
-remote origin needs authenticating; the bytes are ones the operator already
-chose. Set `PVE_CONFIG_SHA256` as well to confirm the file is the one you
-meant.
-
-To install a specific release:
-
-```shell
-PVE_CONFIG_RELEASE=v0.1.0 bash -c "$(curl -fsSL https://raw.githubusercontent.com/tykeal/homeassistant-pve-config/main/bootstrap.sh)"
-```
-
-### Pinning a digest
-
-Read the digest on your workstation, from the checksum asset of the release
-you intend to install:
-
-```shell
-curl -fsSL https://github.com/tykeal/homeassistant-pve-config/releases/download/v0.1.0/pve-config-v0.1.0.tar.gz.sha256
-```
-
-Then pass it to the host:
-
-```shell
-PVE_CONFIG_RELEASE=v0.1.0 \
-PVE_CONFIG_SHA256=ab64ab65fa9e049a621f7fb181722b90bb6b60e4d3e42a06c001875bef8ac59d \
-  bash -c "$(curl -fsSL https://raw.githubusercontent.com/tykeal/homeassistant-pve-config/main/bootstrap.sh)"
-```
-
-On a workstation with gh 2.81.0 or newer you can also run
-`gh release verify-asset`, which checks the asset against the attestation
-GitHub holds rather than against a checksum from the same download. That is
-a workstation-side step: Debian trixie, the base of Proxmox VE 9,
-ships gh 2.46.0, and that version has no `verify-asset` subcommand.
-
-### Installing a branch during development
-
-```shell
-PVE_CONFIG_REF=feat/my-branch PVE_CONFIG_ALLOW_UNVERIFIED=1 \
-  bash -c "$(curl -fsSL https://raw.githubusercontent.com/tykeal/homeassistant-pve-config/main/bootstrap.sh)"
-```
-
-Codeload publishes no checksum, so nothing verifies this install. The run prints
-a warning before it starts and again after it finishes. A ref containing a
-slash works; the installer percent-encodes it.
-
-`bootstrap.sh --help` prints usage and skips the root check.
-
-## Configuration model
-
-Two files live in `/root/pve-config`:
-
-- `pve-config.conf`, mode 0644, holds everything other than a credential
-- `secrets.env`, mode 0600 and root-owned, holds the credentials
-
-Both use `KEY="value"` assignments. The toolkit **parses** them rather than
-sourcing them, so loading a file runs no command out of it. Anything other
-than a blank line, a `#` comment or a quoted literal assignment aborts the
-run and names the file and the line. Single and double quotes both work; a
-double quoted value may not contain anything the shell would expand.
-
-Parsing covers the load. Downstream, a stage that bakes a configured value
-into a script it generates writes that value as a single-quoted assignment
-the generated script reads back as a literal, so nothing in a config file
-reaches those scripts as shell syntax. The driver also holds `PVE_HOSTNAME`
-and `PVE_FQDN` to the DNS label rules, and `PVE_NETWORK_WAIT_SECONDS` to a
-count of seconds, whatever the value came from. Keep both files at the
-permissions the toolkit sets.
-
-Name every config key `PVE_*`, in capitals, digits and underscores. The
-loader does not skip any other name: it treats the assignment as a line it
-refuses to interpret and aborts the run, naming the file and the line. That
-is what stops a config file from exporting `PATH` or `BASH_ENV`. The toolkit
-reserves the `PVE_CONFIG_*` prefix for the directories it reads and writes,
-and rejects those from a file the same way; set them in the environment
-instead. Keep unrelated shell assignments out of these files.
-
-### Precedence
-
-For each key the driver takes the first of:
-
-1. **Environment** — an exported variable wins, even when you export it
-   empty. An explicit export means a deliberate override.
-2. **Config file** — the value a previous run stored. An empty value here
-   means "work it out", because the shipped example carries blank
-   placeholders.
-3. **Prompt** — pre-filled with the derived default. `--non-interactive`
-   skips this step.
-4. **Derived default** — read off the host.
-
-A stored key counts as answered even when it holds an empty string, which
-differs from a key the file omits. For a required key with no derivation —
-`PVE_DOMAIN` and `PVE_ADMIN_USERS` — an empty stored value skips the
-prompt and aborts the run with `Missing required configuration`. Fill
-the key in, or clear the stored answers with `--reconfigure`.
-
-The driver resolves the whole schema before any stage runs, then writes the
-answers back. Stages run as child processes, so a value a stage resolved
-could never reach the driver for saving; resolving up front makes every run
-after the first unattended.
-
-Deriving a default is not the same as skipping a question. An interactive
-first run, with no config file to read, prompts for every schema key in
-turn. The derivation decides how much of that work you do: the hostname,
-FQDN, Debian suite, uplink NIC and the plain yes/no settings all arrive
-pre-filled, so you press return through them, while the domain, the
-administrators and their key start blank because no machine can know them.
-A later run finds the stored answers and asks nothing.
-
-### Schema keys
-
-The driver resolves these keys on every run.
-
-| Key | Required | Default or derivation | Meaning |
-| --- | --- | --- | --- |
-| `PVE_HOSTNAME` | yes | the running short hostname | Short hostname for this host, as a DNS label |
-| `PVE_DOMAIN` | yes | none, so the driver asks | DNS domain for this deployment |
-| `PVE_FQDN` | yes | `PVE_HOSTNAME`.`PVE_DOMAIN`, else the resolver's answer | Fully qualified domain name, starting with `PVE_HOSTNAME` |
-| `PVE_ADMIN_USERS` | yes | none, so the driver asks | Space separated admin usernames to create |
-| `PVE_ADMIN_KEY_SOURCE` | no | none | SSH public key shared by every admin: a literal `ssh-...` string, or a path to a file holding one or more keys |
-| `PVE_SUITE` | yes | `VERSION_CODENAME` from `/etc/os-release` | Debian suite for the Proxmox apt sources |
-| `PVE_BRIDGE_PORTS` | yes | the single NIC carrying the default route | Physical interfaces to enslave to `vmbr0`, space separated |
-| `PVE_BRIDGE_MODE` | yes | `dhcp` | Addressing for `vmbr0`: `dhcp` or `static` |
-| `PVE_BRIDGE_ADDRESS` | no | none | Static CIDR address for `vmbr0`; the stage reads it only in `static` mode |
-| `PVE_BRIDGE_GATEWAY` | no | none | Default gateway; the stage reads it only in `static` mode |
-| `PVE_NETWORK_WAIT_SECONDS` | yes | `60` | Seconds to wait for `vmbr0` to pick up an address, from 0 to 86400 |
-| `PVE_NO_SUBSCRIPTION` | yes | `yes` | Use the no-subscription repository and suppress the subscription notice |
-| `PVE_SUDO_SSH_AGENT` | yes | `yes` | Let `sudo` accept a forwarded SSH agent key |
-| `PVE_GUEST_ADMIN_SSH_ACCESS` | yes | `lan` | Where the administrators mirrored into a container may reach its sshd from: `lan` admits anything that can route to it, `tailnet` restricts it to the tunnel in the container's packet filter |
-| `PVE_GUEST_ADMIN_TAILNET_IFACE` | yes | `tailscale0` | Interface a container's tunnel traffic arrives on, which the `tailnet` restriction binds its accepts to |
-| `PVE_GUEST_ADMIN_ROOT_LOCK` | yes | `no` | Lock the root password of a container this toolkit mirrors the administrators into |
-| `PVE_ZULIP_ENABLED` | yes | `no` | Send boot and shutdown notices to Zulip |
-| `PVE_ZULIP_STREAM` | no | the stage falls back to `infrastructure` | Zulip stream for the notices |
-| `PVE_ZULIP_TOPIC` | no | the notifier falls back to the host FQDN | Zulip topic for the notices |
-| `PVE_ACME_ENABLED` | yes | `no` | Order a Let's Encrypt certificate for `PVE_FQDN` over the DNS-01 challenge |
-| `PVE_ACME_ENVIRONMENT` | yes | `staging` | ACME directory to order from: `staging` or `production` |
-| `PVE_ACME_EMAIL` | no | none | Contact address for the ACME account and for expiry warnings |
-| `PVE_ACME_DNS_PLUGIN` | yes | `dnsmadeeasy` | DNS-01 plugin name. DNS Made Easy is the only supported provider, so `dnsmadeeasy` is the only accepted value |
-| `PVE_ACME_ACCEPT_TOS` | yes | `no` | Accept the CA terms of service, which registering an account requires |
-| `PVE_ACME_FORCE_ORDER` | yes | `no` | Order a certificate even when the host holds a current one. Staging only |
-| `PVE_TAILSCALE_ENABLED` | yes | `no` | Build the Tailscale subnet router container |
-| `PVE_TAILSCALE_HOSTNAME` | yes | `ts-`*shorthostname* | Hostname of the subnet router container, and its name in the tailnet |
-| `PVE_TAILSCALE_CTID` | no | first free | Container ID for the router. Unset means 100 when free, otherwise `pvesh get /cluster/nextid` |
-| `PVE_TAILSCALE_ROUTES` | no | detected | Comma-separated subnets to advertise. Unset means the IPv4 subnet of the management bridge (`vmbr0`) |
-| `PVE_TAILSCALE_STORAGE` | no | detected | Fallback storage for both the template and the root disk. It has to accept both content types |
-| `PVE_TAILSCALE_TEMPLATE_STORAGE` | no | detected | Storage for the container template. Unset means `PVE_TAILSCALE_STORAGE`, then the node's only `vztmpl` storage |
-| `PVE_TAILSCALE_CONTAINER_STORAGE` | no | detected | Storage for the root disk. Unset means `PVE_TAILSCALE_STORAGE`, then the node's only `rootdir` storage |
-| `PVE_TAILSCALE_ADOPT_EXISTING` | yes | `no` | Allow `PVE_TAILSCALE_CTID` to point at a container this toolkit did not build |
-| `PVE_TAILSCALE_KEYRING_SHA256` | no | pinned | SHA-256 the Tailscale repository signing key must have. Set this only when Tailscale rotates it |
-| `PVE_TAILSCALE_RAM_MB` | no | scaled | Container memory. Unset means host RAM / 64, clamped to 256..1024 |
-| `PVE_TAILSCALE_CORES` | no | scaled | Container cores. Unset means 1, or 2 on a host with eight or more |
-| `PVE_TAILSCALE_DISK_GB` | no | `2` | Container root disk size |
-| `PVE_HAOS_ENABLED` | yes | `no` | Build the Home Assistant OS virtual machine |
-| `PVE_HAOS_HOSTNAME` | yes | `haos` | Name of the appliance, as Proxmox and the LAN see it |
-| `PVE_HAOS_VMID` | no | first free | Guest ID for the appliance. Unset means 200 when free, otherwise `pvesh get /cluster/nextid` |
-| `PVE_HAOS_ADOPT_EXISTING` | yes | `no` | Allow `PVE_HAOS_VMID` to point at a virtual machine this toolkit did not build |
-| `PVE_HAOS_STORAGE` | no | detected | Storage for the EFI and root disks. Unset means the node's only storage that accepts `images` |
-| `PVE_HAOS_RAM_MB` | no | scaled | Appliance memory. Unset means host RAM / 8, clamped to 2048..8192 |
-| `PVE_HAOS_CORES` | no | scaled | Appliance cores. Unset means host cores / 4, clamped to 2..4 |
-| `PVE_HAOS_DISK_GB` | no | `32` | Appliance disk size. The published image is 32 GiB and `qm` does not shrink a disk, so the stage refuses anything smaller |
-| `PVE_HAOS_VERSION` | no | pinned | Home Assistant OS release to install. Set it with `PVE_HAOS_IMAGE_SHA256`, never alone |
-| `PVE_HAOS_IMAGE_SHA256` | no | pinned | SHA-256 the disk image must have, from the release's own `SHA256SUMS` asset |
-
-Derivation of `PVE_BRIDGE_PORTS` fails when the host has no default route,
-or carries more than one. The driver then names what it found and asks,
-rather than guessing and taking the host off the network.
-
-`PVE_HOSTNAME` must be a DNS label, and `PVE_FQDN` a dotted name whose
-labels are DNS labels and whose first label is `PVE_HOSTNAME`. Both names
-reach `/etc/hosts` and a hook that root runs on every DHCP lease.
-`PVE_NETWORK_WAIT_SECONDS` must be a whole number of seconds, because the
-stages compare it arithmetically. The driver checks each of them whatever
-the value came from, and names the one it refused.
-
-### Keys the stages and the example read
-
-The schema omits these, so the driver never prompts for them. Set them in
-the config file or the environment when you need them.
-
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `PVE_NETWORK_TAKEOVER` | `no` | Let the network stage replace an `/etc/network/interfaces` that describes more than `lo`, the bridge ports and `vmbr0` |
-| `PVE_ADMIN_KEY_<USERNAME>` | none | Per-user key source, overriding `PVE_ADMIN_KEY_SOURCE`. Uppercase the username and turn any `-` into `_` |
-
-The shipped `examples/pve-config.conf.example` also carries two keys that
-the Frigate stage will read. They do nothing today, and the driver
-preserves them across a rewrite: `PVE_FRIGATE_HOSTNAME` and
-`PVE_FRIGATE_CTID`.
-
-The community-scripts pins are not among them. They belong to the toolkit
-rather than to a deployment, so they live in `lib/community-scripts.sh`.
-See [Community-scripts pins](#community-scripts-pins).
-
-### Secret keys
-
-`examples/secrets.env.example` lists the credentials. Phase 1 reads the
-Zulip three. Stage `10-acme` reads the DNS Made Easy pair. Stage
-`20-tailscale` reads the Tailscale key.
-
-| Key | Used by | Meaning |
-| --- | --- | --- |
-| `PVE_ZULIP_SITE` | phase 1 | Zulip server URL for the notifier |
-| `PVE_ZULIP_BOT_EMAIL` | phase 1 | Zulip bot address |
-| `PVE_ZULIP_BOT_API_KEY` | phase 1 | Zulip bot API key |
-| `PVE_DNSMADEEASY_KEY` | `10-acme` | DNS Made Easy API key for the ACME DNS-01 challenge |
-| `PVE_DNSMADEEASY_SECRET` | `10-acme` | DNS Made Easy API secret |
-| `PVE_TAILSCALE_AUTHKEY` | `20-tailscale` | Tailscale pre-authentication key for the subnet router LXC |
-
-Enabling Zulip without all three of its values aborts the stage. A
-deployment that opts out with `PVE_ZULIP_ENABLED='no'` passes quietly.
-
-## Running it
-
-```shell
+# after the reboot, as root on the console, or over SSH as the admin:
+#   ssh -A admin@host
+#   sudo -i
 cd /root/pve-config
-./pve-config.sh --list
-./pve-config.sh --dry-run
-./pve-config.sh
+./pve-guests.sh
 ```
 
-### The two phases
-
-Phase 1 configures the host and ends with a reboot you perform. Phase 2
-orders the ACME certificate, and will create the guests.
-
-When phase 1 first reaches completion the driver prints a summary — hostname,
-`vmbr0` address, node directory, the state of `pve-cluster`, `pveproxy`,
-`pvedaemon` and `pvestatd`, the apt suite and the administrators — then asks
-you to reboot. It reads that summary back off the host rather than echoing
-the values that went in.
-
-Reboot, then run `./pve-config.sh` again to continue.
-
-### Why the driver enforces the reboot
-
-The driver records the kernel's boot id when phase 1 finishes. Before
-starting phase 2 it compares that id against the running one. Equal means
-the host has not rebooted since, and the driver refuses with a message
-telling you to reboot. The boot id changes on a reboot and on nothing else,
-which distinguishes "the operator rebooted" from "the operator ran the
-driver twice". A host where the driver cannot read a boot id never hits the
-gate.
-
-### Flags
-
-| Flag | Effect |
-| --- | --- |
-| `--list` | Print every discovered stage with its phase and `done`/`pending` status. Needs no root and touches nothing |
-| `--phase N` | Run only the stages in phase `N` |
-| `--stage NAME` | Run one stage. `NAME` is the basename with or without `.sh`, or the qualified `phase1__NAME` or `phase1/NAME` when the basename exists in more than one phase. The driver rejects an ambiguous bare name |
-| `--force` | Re-run the selected stages even when their markers say done |
-| `--reconfigure` | Prompt again for the schema keys. Every other key in the file survives the rewrite untouched. It changes no marker, so pair it with `--force` to apply the answers |
-| `--dry-run` | Run the stages and change nothing. Needs no root |
-| `--config PATH` | Use an alternate configuration file instead of `pve-config.conf` |
-| `--non-interactive` | Never prompt. A required value with no default aborts the run, and the driver reports all such keys at once |
-| `-h`, `--help` | Print usage |
-| `--version` | Print the toolkit version and exit. Needs no root |
-
-With no flag the driver picks the lowest phase that still has pending
-stages, and runs that whole phase. Once every stage reaches `done` the
-driver reports that and exits.
-
-`--force` on its own means "re-run what I would have run". That means the
-current phase, and while the reboot phase 1 asked for remains owed, the
-current phase is phase 1 rather than phase 2. When every stage already says
-`done`, bare `--force` re-runs the last phase rather than doing nothing.
-
-`--reconfigure` re-asks the questions; it does not re-run anything. On a
-host whose stages all say `done` the driver reports that and exits before it
-ever reaches configuration resolution, so `--reconfigure` on its own has no
-effect there. To change an answer and apply it, name the work as well:
-
-```shell
-./pve-config.sh --reconfigure --force --phase 1
-```
-
-`--force` does **not** open the reboot gate on its own. Only a phase or a
-stage you name explicitly — `--force --phase 2` or `--force --stage ...` —
-overrides the gate, and the driver warns when it does.
-
-## The phase-1 stages
-
-| Stage | Converges |
-| --- | --- |
-| `10-hostname` | Sets the kernel hostname to the FQDN, writes the short name to `/etc/hostname`, and points Postfix `myhostname` at the FQDN on a host that runs Postfix |
-| `20-network` | Writes `/etc/network/interfaces` describing `lo`, the bridge ports and `vmbr0`; installs a dhclient exit hook that keeps `/etc/hosts` on the leased address; reloads, then waits for an address |
-| `30-pve-cluster` | Holds `pve-cluster` until `vmbr0` has an address `/etc/hosts` knows, starts it, renames the stale node directory to the new hostname, then starts `pvedaemon`, `pveproxy` and `pvestatd` |
-| `40-repos` | Drops the enterprise apt sources, installs the `pve-no-subscription` source for the running suite, migrates an enterprise Ceph source to its public counterpart, then refreshes the indexes |
-| `50-no-nag` | Installs a patch script and an apt post-invoke hook that suppress the subscription notice, and re-apply it after every `proxmox-widget-toolkit` upgrade |
-| `60-admin-users` | Creates each administrator, adds them to `sudo`, installs their keys, then registers them in Proxmox as `user@pam` with the `PVEAdmin` role on `/` |
-| `70-ssh-sudo` | Confirms every administrator can already log in with a key, then turns off password and keyboard-interactive authentication and restricts root to keys; optionally wires `sudo` to `pam_ssh_agent_auth` |
-| `80-root-shell` | Writes a `/root/.bashrc` with coloured `ls`, interactive `rm`/`cp`/`mv` aliases and a backspace fix that stays out of the way of `scp` |
-| `90-zulip` | Optional. Installs a notifier, a 0600 credentials file and systemd units that announce the host coming up and going down |
-
-Stages 40 and 50 exit early unless `PVE_NO_SUBSCRIPTION` says `yes`. Stage
-90 exits early unless `PVE_ZULIP_ENABLED` says `yes`.
-
-## The phase-2 stages
-
-| Stage | Converges |
-| --- | --- |
-| `10-acme` | Optional. Writes the DNS Made Easy credentials to a 0600 file, registers the plugin and the ACME account for the selected directory, points the node at both, then orders a certificate for `PVE_FQDN` when the host lacks a current one |
-| `20-tailscale` | Optional. Builds an unprivileged Debian LXC, installs Tailscale from its own repository, turns on IPv4 forwarding, joins the tailnet and advertises the LAN as a subnet router |
-| `40-haos` | Optional. Verifies the pinned Home Assistant OS image against its digest, builds the appliance virtual machine with `qm` and resources scaled to the node, tags it as this toolkit's and starts it |
-
-Stage 20 exits early unless `PVE_TAILSCALE_ENABLED` says `yes`, and stage
-40 unless `PVE_HAOS_ENABLED` says `yes`. Stage 30 belongs to Frigate.
-
-Stage 10 exits early unless `PVE_ACME_ENABLED` says `yes`. It orders from
-the Let's Encrypt staging directory until `PVE_ACME_ENVIRONMENT` says
-`production`, because the production directory counts failed orders against
-a weekly limit. Each directory gets its own account — `staging` and
-`production` — so promoting a deployment registers the second account and
-leaves the first in place.
-
-The order is the step that costs a rate limit, so the stage skips it when
-`pvenode cert info` already shows a `pveproxy-ssl.pem` whose SAN covers
-`PVE_FQDN`, issued by the Let's Encrypt directory you selected, and more
-than 30 days from expiry. When that inspection cannot answer — the command
-failed, said nothing, or answered with something the toolkit cannot read —
-the stage stops rather than ordering, because an order it did not need
-spends a rate limit and would do so again on every run.
-`PVE_ACME_FORCE_ORDER='yes'` orders anyway; the toolkit refuses that
-combination against production.
-
-Which command runs follows what the host holds, because `pvenode` draws
-the same distinctions. A host with nothing to serve gets `acme cert
-order`. One already serving a certificate for this name from this
-directory, inside the renewal window, gets `acme cert renew`: `acme cert
-order` declines to overwrite a certificate that already exists, so asking
-for one here leaves a host that never converges. One serving a
-certificate for another name, or from the other directory, gets `acme
-cert order --force 1`, since that overwrite is the only way a deployment
-promoted to production stops serving its staging certificate. That
-replacement is not the forced order `PVE_ACME_FORCE_ORDER` controls: the
-knob asks for an order the host does not need, and stays staging only.
-
-The stage reads what `pvenode` reports with `perl` and `JSON::PP`, a core
-module every Proxmox host already carries, rather than picking JSON apart
-in the shell. The decoder takes the document on standard input, straight
-from the command that printed it, and takes the field names as
-parameters, so nothing the host says is ever code and a NUL byte cannot
-vanish on the way. Any field of the wrong shape — a `null` or a number
-where a string belongs, bytes that are not UTF-8, a filename listed twice
-— counts as an answer the toolkit did not get.
-
-The stage compares the plugin on two things: the credentials `pvenode`
-stored, and the provider that plugin names. A plugin naming another
-provider gets rewritten rather than accepted, because the provider
-chooses which DNS hook runs with these credentials, and `pvenode acme
-cert order` orders afresh on every ask. A node left naming the wrong
-provider would order and fail on every run.
-
-Every reading of the host works the same way, and tells three answers
-apart: yes, no, and "could not tell". Only a `no` the toolkit actually
-read leads to a change. A listing, an account, a plugin configuration or
-a node setting it could not read stops the stage, because registering,
-reconfiguring or ordering on the strength of an unanswered question is
-how a transient failure turns into a duplicate account or a spent rate
-limit. An empty answer is not an unreadable one: a fresh host, with no
-accounts, no plugin and no ACME certificate, reads as "nothing here yet"
-and converges normally.
-
-Registration accepts the CA terms of service, and `pvenode` asks for that
-answer rather than taking it as an option. The stage stops before
-registering until `PVE_ACME_ACCEPT_TOS` says `yes`, so the acceptance is
-yours.
-
-### The Tailscale subnet router
-
-Stage `20-tailscale` exits early unless `PVE_TAILSCALE_ENABLED` says
-`yes`, because the container it builds advertises your LAN into a tailnet
-and that is not a thing to start doing by default.
-
-It builds the container with community-scripts `ct/debian.sh` at the
-pinned SHA, with `mode=default` set explicitly. The mode matters: the
-engine falls back to a silent run only on the update path, and a create
-with no mode puts a whiptail settings menu on a screen that an unattended
-run does not have. For the same reason the stage resolves the storages
-first and writes them into `/usr/local/community-scripts/default.vars`,
-which is where the engine looks before it offers a menu of its own.
-
-The container runs unprivileged, with nesting on and IPv6 off, and it
-needs `/dev/net/tun`. `var_tun` is a hint to the builder and not a `pct`
-feature, so the stage also converges the two lines that actually grant the
-device into `/etc/pve/lxc/<ctid>.conf`:
-
-```text
-lxc.cgroup2.devices.allow: c 10:200 rwm
-lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file
-```
-
-Converging them covers a container built before this stage existed as well
-as one the builder just made. The stage reboots a running container that
-lacked them once, because the device appears at start. `/etc/pve` is
-pmxcfs, which forces `root:www-data` and `0640` whatever anyone asks for,
-and refuses the usual write-and-rename: the stage appends, as upstream
-does.
-
-#### Which container the stage works on
-
-The stage marks the container it builds with the Proxmox tag
-`pve-config-tailscale`. A tag survives a reboot, a restore and a release
-upgrade, and the stage checks for it before the first change it makes. No
-container it did not build gets a reboot, `/dev/net/tun`, a package
-install or a place on your tailnet.
-
-It picks an id in this order: `PVE_TAILSCALE_CTID` when you pin one; the
-tagged container on this node; 100 when nothing holds it, which is the
-convention; otherwise `pvesh get /cluster/nextid`.
-
-A pinned id whose container exists but carries no tag stops the stage,
-with a message naming the tag. Set `PVE_TAILSCALE_ADOPT_EXISTING=yes` to
-adopt that container deliberately: the stage warns, tags it, and treats
-it as the router from then on. The stage adopts nothing silently.
-
-The search is cluster-wide. The stage reads `pvesh get /cluster/resources
---type vm` and stops when a tagged router already runs on another node,
-because two routers advertising the same subnet is a routing conflict
-rather than a spare. A listing it cannot read or decode stops the stage
-as well: it will not build a router while unable to tell whether one
-exists.
-
-#### Storage
-
-The stage resolves template storage and root-disk storage apart, because
-the common Proxmox layout keeps templates on `local` and root disks on
-`local-lvm` or a ZFS pool, and no single storage serves both there. It
-takes each from its own key, then from `PVE_TAILSCALE_STORAGE`, then from
-the node's only storage accepting that content type. It checks a name you
-give against `pvesm status -content <type>` before starting any work, so
-an impossible pair gives you a message rather than a half-built
-container.
-
-The community-scripts builder reads its answers from
-`/usr/local/community-scripts/default.vars`. The stage puts its own file
-there for the length of the build and puts yours back afterwards, so the
-storages it chose do not become the default for every later
-community-scripts build on the node.
-
-#### The repository signing key
-
-The stage pins the SHA-256 of the Tailscale repository signing key and
-checks the key it downloads against it, and checks the key already in
-`/usr/share/keyrings/tailscale.gpg` the same way on every run. A key that
-does not match goes in the bin rather than into apt's trust store: apt
-installs packages as root, and a key trusted for being present is a key
-nobody verified. When
-Tailscale rotates the key, verify the new one yourself and set
-`PVE_TAILSCALE_KEYRING_SHA256`.
-
-The stage persists forwarding in
-`/etc/sysctl.d/99-tailscale-forwarding.conf` rather than appending to
-`/etc/sysctl.conf`, and sets it at runtime only when the running value
-differs.
-
-Advertisement is a helper and a unit rather than a one-off argument.
-`/usr/local/bin/ts-advertise-route.sh` runs from
-`ts-advertise-route.service`, a oneshot ordered after
-`network-online.target` and `tailscaled.service`. With
-`PVE_TAILSCALE_ROUTES` set it advertises exactly that list; with it unset
-it derives the connected subnet of whichever interface carries the default
-route, refusing a `tailscale*` interface so the router cannot come to
-advertise its own tunnel. That is what keeps the advertisement right
-across a reboot or a DHCP change, instead of leaving a stale subnet
-advertised to the whole tailnet.
-
-Where the routes came from decides which of those two the helper does. The
-stage bakes a list you configured into the helper, which then advertises
-exactly that, because a list somebody chose is not one to re-derive
-behind their back. A detected list it bakes in nowhere: the helper works
-the subnet out in the container
-at every boot, and the subnet the host detected only gets the first
-advertisement up before the unit has ever run. In that case the two
-values come from two derivations, which is intentional. They agree on any
-node where the router shares the management LAN, and the container's
-answer is the live one — that is exactly what lets a LAN renumber take
-effect without running this toolkit again.
-
-A daemon that holds an identity but has stopped — `tailscale down`, or a
-backend that fell over — is a subnet router routing nothing, so the stage
-does not call it converged. It runs `tailscale up` again with the route
-arguments and **no auth key**, which is what the CLI offers for a machine
-that is already a tailnet member, and reports the run as changed. That
-path never asks for a key, so a spent key you revoked does not block it.
-
-You still have to approve subnet routes in the Tailscale admin console
-before any peer uses them. The stage cannot do that and says so.
-
-#### Key expiry
-
-Neither can it disable key expiry: that is an admin console or API
-setting with no command-line twin. A node whose key expires drops
-off the tailnet months later, with nothing on the node to show why, so
-the stage prints a reminder after a first join. Use a reusable,
-non-ephemeral key and turn key expiry off for the node.
-
-Every configuration key the stage reads is in the schema, so a bad value
-stops the run before the stage builds anything: a container ID that is not a
-number, a route that is not an IPv4 CIDR, a storage name Proxmox would
-reject, a keyring digest that is not a SHA-256, and an
-`PVE_TAILSCALE_ADOPT_EXISTING` that is neither `yes` nor `no`. That last
-one is a gate on a destructive action, so `true` is an error naming the
-value rather than a quiet `no`.
-
-A tailnet with device approval turned on parks the new machine in
-`NeedsMachineAuth`. The stage stops there and says so rather than
-retrying, because another `tailscale up` would spend another key without
-changing anything.
-
-### The Home Assistant OS appliance
-
-Stage `40-haos` exits early unless `PVE_HAOS_ENABLED` says `yes`. It
-builds the appliance Home Assistant publishes, as a virtual machine, with
-`qm` directly.
-
-The stage converges nothing inside it. Home Assistant OS is a closed appliance
-with its own onboarding, its own authentication and its own updates: it
-has no package manager this toolkit could drive and no account model it
-could add an administrator to. The admins phase 1 creates on the host do
-not reach into it, and the stage does not pretend otherwise.
-
-#### The virtual machine path is not the container path
-
-The container stages drive the community-scripts helpers, which build a
-guest from a Proxmox template the node already trusts. The virtual
-machine path has no such property: it boots a disk image off the public
-internet, and the upstream `vm/haos-vm.sh` at the pinned SHA checks that
-image by unpacking it and by nothing else. No digest, no signature. It
-also creates and starts the machine in one step, tagging it
-`community-script`, which leaves a window where an interruption strands a
-machine this stage cannot recognise as its own on a rerun.
-
-This stage owns the build instead. It downloads the pinned image, checks
-the SHA-256 before anything opens it, creates the machine carrying its
-own tag in the `qm create` itself, gives it its disks, and starts it only
-once every one of those steps holds. The recipe ports the upstream one: a q35
-machine on OVMF firmware with a 4 MB EFI disk, a virtio-scsi controller,
-the image imported as `scsi0` with `ssd=1,discard=on`, `boot order=scsi0`,
-a socket on `serial0` for the Proxmox console, the guest agent enabled,
-and `onboot 1`. Two things differ deliberately: the tag, and a MAC
-address Proxmox picks rather than the script.
-
-`qm` is a local administrative tool, and runs with the environment this
-toolkit runs with. The download and the unpack do not: they run under
-`env -i` with a short allowlist, so a credential the caller exported
-reaches neither.
-
-#### The disk image
-
-This toolkit pins the release and its SHA-256, downloads the image
-itself, and checks the digest before the image becomes a disk. A download
-that does not match the pin goes no further, and leaves no machine
-behind. Every run checks a cached file again rather than trusting it for
-existing, and a symlink at that path stops the stage outright.
-
-What the stage unpacks is the file it checked, not the name it checked.
-It holds the image open from the digest until `qm` has the disk, and
-reads it through that open file. A cached entry that something else
-replaces meanwhile leaves the stage holding the bytes it verified.
-
-Set `PVE_HAOS_VERSION` and `PVE_HAOS_IMAGE_SHA256` together, from the
-release's own `SHA256SUMS` asset, to install a release this toolkit has
-not caught up with. Setting either alone stops the stage and names both
-keys: a release with somebody else's digest never matches, and a digest
-on its own describes an image the stage is not fetching.
-
-#### Which machine the stage works on
-
-The stage marks the machine it builds with the Proxmox tag
-`pve-config-haos`, and checks for it before the first change it makes.
-The tag goes on in the `qm create`, so the machine carries it from the
-moment it exists: a run interrupted between creating the machine and
-giving it a disk leaves something the next run recognises and finishes,
-rather than a second appliance alongside the first.
-
-Finishing one takes a handful of steps, and each of them reads the
-machine for itself: the root disk, the EFI disk, the boot order, the serial
-console, the guest agent and the disk size. A machine whose disk got
-attached and never grown is still a machine with something to do, so an
-attached disk is not read as proof that the rest of the build happened.
-
-A machine with no root disk and more than one unused volume stops the
-stage. Which of those volumes holds Home Assistant is not something this
-node can tell, and booting the appliance off another guest's disk is the
-cost of guessing. Attach the right one by hand, or remove the ones that
-do not belong, and run again.
-
-It picks an id in this order: `PVE_HAOS_VMID` when you pin one; the
-tagged machine on this node; 200 when nothing in the cluster holds it,
-which is the convention; otherwise `pvesh get /cluster/nextid`. Guest ids
-are unique across a cluster and across both guest types, so a container
-numbered 200 is enough to move the appliance.
-
-A pinned id whose machine exists but carries no tag stops the stage. Set
-`PVE_HAOS_ADOPT_EXISTING=yes` to adopt it deliberately: the stage warns,
-tags it and treats it as the appliance from then on. Adoption without
-`PVE_HAOS_VMID` stops the stage, because an unaimed adoption would take
-over whatever happened to sit at the default id.
-
-An untagged machine with no `scsi0` is not adopted at all. Once tagged it
-would read as a build of this stage's own that stopped before the import,
-and the next run would import a fresh image and point the boot order at
-it, past whatever is on `virtio0`, `sata0` or `ide0`. Aim `PVE_HAOS_VMID`
-at an unused id, or move the root disk to `scsi0`, and run again.
-
-The search is cluster-wide, and a listing the stage cannot read or decode
-stops it rather than letting it build: two Home Assistant installations
-driving one house share no state and fight over the same devices. The
-same rule governs starting the machine: a `qm status` the stage cannot
-decode ends the run instead of authorising a `qm start` on a guess.
-
-#### Resources
-
-Unset memory and cores scale to the node: an eighth of its RAM held
-between 2048 MB and 8192 MB, a quarter of its cores held between two and
-four. Home Assistant is not a subnet router — it runs an application
-server, a database, a supervisor and whatever add-ons the household
-collects — so the share is far larger than the router's, and upstream's
-own defaults of 4096 MB and two cores sit inside the band rather than at
-its top. The ceiling is there because the other
-guests on the node still have to fit, and because an appliance given
-32 GB does not use 32 GB, it leaves it unavailable.
-
-The disk defaults to 32 GB, which is the size of the published image.
-`qm` does not shrink a disk, so the stage refuses a smaller figure rather
-than ignoring it, and a resize it asks for and does not get stops the
-run.
-
-The stage applies the resources as it creates the machine. On a machine
-that already exists the stage reports a configured value disagreeing with
-the machine's and leaves it alone, because writing one would mean
-rebooting a running Home Assistant to apply a number.
-### Administrators in a container
-
-Every container this toolkit builds gets the administrators named by
-`PVE_ADMIN_USERS`, with the same keys, the same sshd policy and the same
-`pam_ssh_agent_auth` sudo the host has. One library does the work for both,
-so host and container share the reasoning and differ only in plumbing: the
-host path writes files, the container path reaches through `pct`.
-
-What a container ends up with:
-
-- `sudo`, `openssh-server`, `libpam-ssh-agent-auth` and `nftables`;
-- an account per administrator, in `sudo`, with their own
-  `~/.ssh/authorized_keys`;
-- `/etc/security/authorized_keys` at `0600` holding every administrator's
-  key, and exactly one `pam_ssh_agent_auth` line in `/etc/pam.d/sudo`;
-- a `0440` sudoers drop-in keeping `SSH_AUTH_SOCK` across `sudo`, which
-  `visudo -c` on the host approves before the push;
-- sshd with `PasswordAuthentication no` and `KbdInteractiveAuthentication
-  no`, in a drop-in the host's `sshd -t` judges against a copy of the
-  container's own configuration;
-- `TERM` set for the sessions `pct enter` starts;
-- where `PVE_GUEST_ADMIN_ROOT_LOCK` is `yes`, a locked root password,
-  once the toolkit has read every one of those back out of the container
-  and found them working. The default is `no`: a root password that is
-  still set is one more way in that does not depend on this toolkit
-  having got the keys right, and giving that up is the operator's call.
-
-`PVE_GUEST_ADMIN_SSH_ACCESS` decides where that sshd answers. `lan`, the
-default, lets anything that can route to the container reach sshd.
-`tailnet` restricts it two ways: an `AllowUsers` qualified with the
-tailnet's address space, and a small nftables table in the container that
-drops port 22 from anywhere else. The nftables rule is the one that bounds
-exposure, because `AllowUsers` still talks to a LAN client and only then
-declines to authenticate it. sshd's own `ListenAddress` cannot do the job:
-the tailnet address does not exist until the container joins the tunnel,
-and sshd refuses to start without it. Moving a container from `tailnet`
-to `lan` takes the table away again on the next run.
-
-The accepts name the interface the tunnel's traffic arrives on rather
-than matching its source address alone: `100.64.0.0/10` is ordinary
-address space, and the table would otherwise admit a LAN host that holds
-an address out of it. `PVE_GUEST_ADMIN_TAILNET_IFACE` names that interface and
-defaults to `tailscale0`. A container that has no such interface stops
-the run, because the table it would get there drops ssh from everywhere,
-the tunnel included -- bring the tunnel up first, or set the
-key to the name it uses.
-
-Under `tailnet` the toolkit also refuses a container whose configuration
-puts sshd on any port other than 22, or adds a listener on one: the
-table it writes covers port 22, and a second port would be reachable
-from the LAN while every check here reported the container restricted.
-
-The toolkit also checks that the restriction survives a reboot, because
-one restricted now and open after a restart is the worst of both. That
-means `/etc/nftables.conf` and everything it includes still loading --
-one malformed file in `/etc/nftables.d` takes the whole boot
-configuration down -- and that nothing replays over the top of it
-afterwards. `/etc/nftables.conf` may hold comments and nothing else past
-the include of `/etc/nftables.d`, and no other fragment in that
-directory may flush the ruleset or take this toolkit's table away.
-Either stops the run: a boot sequence this cannot account for is not one
-to lock a root password on the strength of.
-
-Before it hardens anything, the toolkit asks the container's own `sshd`
-what configuration it would run. It copies the container's `/etc/ssh`
-to `/run/pve-config/sshd-check/etc-ssh`, writes into that copy the two
-files converge is about to write for real, mounts the copy over
-`/etc/ssh` inside a mount namespace of its own, and runs `sshd -T` --
-with no `-f` at all, so sshd opens `/etc/ssh/sshd_config` exactly as the
-daemon will. The dump that comes back holds the configuration that
-remains once the parser which will follow them for real has followed
-every `Include`, and a configuration sshd will not run exits non-zero
-and stops the run. Nothing here reads an sshd configuration file: a
-quoted operand, a nested `Include`, a path that climbs out of the
-drop-in directory, a keyword spelled `iNcLuDe`, a drop-in whose name
-holds a newline are all sshd's to resolve, and it resolves them.
-
-Copying rather than constructing is the point. Earlier versions built a
-candidate `sshd_config` and asked sshd about that, and three rounds of
-review found three ways for the candidate to resolve differently from
-the file converge installs: a glob that did not cover the fragment, an
-`Include` naming one sibling drop-in, and a stale managed fragment the
-container's own glob pulled in ahead of the staged one. The copy has the
-real glob, the real sort order and the real pathnames, so there is
-nothing left to get wrong. `cp -a /etc/ssh/. ...` also copies the
-drop-ins without this toolkit ever naming one, which is what a filename
-holding a newline defeated when it did.
-
-The namespace belongs to the one command. Every mount in it goes when
-that command ends, whether it exits, fails or dies to a signal, and a
-process outside it reading `/etc/ssh` sees the container's own files
-throughout. The toolkit writes nothing outside `/run`, which is a tmpfs
-no daemon reads. The copy, host keys included, sits under a root-only
-directory. The toolkit deletes it once the judgement has passed; a run
-the judgement stops leaves it there until the next run or a reboot, and
-the next run removes it before making a fresh one -- or stops, if it
-cannot, rather than judge a drop-in the container no longer has. A
-container that refuses the namespace or the mount, or has no `sshd` in
-it, stops the run as well: only sshd itself refusing the configuration
-counts as an answer, and neither outcome hardens anything.
-
-Two files go into the copy. The fragment, at its real name, replacing
-any fragment an earlier run installed; and the container's
-`sshd_config` with one line changed, which is the line converge is about
-to prepend to the real file: an `Include` naming
-`/etc/ssh/sshd_config.d/99-pve-config-admin.conf` outright, replacing
-any earlier copy of that same line. One piece of code makes that change
-for the copy and for the real file, so what sshd judged and what sshd
-ends up running cannot drift apart.
-
-The managed `Include` names the file rather than the directory, and goes
-in whatever the container already includes. A container that pulls the
-drop-in directory in by a glob which does not cover this file --
-`*.cfg`, or one drop-in by name -- mentions the directory without
-reading the fragment, and a check that asked only whether the directory
-appeared would disable password authentication on the strength of a file
-the daemon never opens. Naming the file is the form of the question with
-one answer. A second `Include` of a fragment some other glob already
-covers costs nothing: sshd reads it twice, a list keyword gains a
-duplicate entry that admits the same people, and a scalar keeps its
-first value.
-
-It goes at the top because that is the one position that cannot be
-inside a `Match` block without reading OpenSSH's syntax to find out. One
-consequence is deliberate: the hardening is now read before whatever the
-container sets lower down, so where the two conflict the hardening wins.
-Earlier versions stopped the run instead.
-
-`Match` blocks are no longer analysed. The toolkit takes the global dump
-and nothing else, so a block keyed on a user, a group or an address does
-not reach it -- `sshd -T` with no `-C` resolves such a block to the
-global value. The question this guards is whether an administrator can
-log in with a key and whether passwords are off, and a block that alters
-something for one connection answers neither. Earlier versions refused
-any container with a conflicting conditional setting. Dropping that strictness
-costs nothing, and the owner asked for it.
-
-A container with no `sshd` in it stops the run as surely as a bad
-configuration does, and says so differently: there is nothing to ask, and
-"nothing to ask" is not an answer. So does a container that will not give
-the run a mount namespace, or will not let it mount the copy -- the
-toolkit judges by exit status alone and never by what a tool printed,
-and only sshd itself reading a configuration and refusing it counts as a
-refusal. Everything else stops the run. A dry run cannot copy or mount
-anything, so it skips the check and says so.
-
-Two settings in that configuration stop the run outright. An
-`AuthenticationMethods` value no alternative of which a key alone
-satisfies -- `publickey,password`, where the comma means *and* -- would
-leave every administrator unable to finish authenticating once passwords
-go away. And `AllowAgentForwarding no` or `DisableForwarding yes` blocks
-the root lock: `sudo` in the
-container authenticates with the forwarded agent key, so a daemon that
-will not carry one is not access worth giving the root password up for.
-
-Earlier versions of this toolkit read those files themselves, and refused
-an `Include` operand holding a quote, a backslash or whitespace, and a
-drop-in filename holding anything beyond letters, digits, dots, dashes
-and underscores. Neither restriction remains: they existed only because
-this toolkit had to reproduce a corner of OpenSSH's parser to list the
-files one by one, and nothing lists them any more. What
-remains is a refusal to read a container file holding a NUL byte, which
-is about this toolkit reading bytes rather than about sshd reading
-configuration.
-
-Worth knowing, because it decides what the daemon loads rather than what
-this toolkit does: `Include .../*.conf` does not match a name beginning
-with a dot, so an editor's swap file beside the drop-ins is not
-configuration; and it does not match `policy.conf` followed by a newline
-either, because that name does not end in `.conf`.
-
-Treat the container-side filter as hardening, not as a boundary against
-the container itself. Root inside the container can flush the table; a
-later run reads the running ruleset back and notices, but between runs
-nothing stops it. It shrinks what the LAN can reach, and it does not make
-a container's root account somebody you can distrust.
-
-The ordering carries the safety. The toolkit turns password authentication
-off only after reading every administrator's key back out of the container
-and finding one sshd would accept. A configuration that turns the root
-lock on gets it only after the hardened sshd runs, the restriction holds,
-and a second check confirms that access. A run interrupted between writing the hardening and
-reloading sshd leaves a marker in the container, so the next run reloads
-the daemon rather than reading the files, finding them right, and locking
-root against a daemon still serving the old policy. Anything it cannot
-read aborts the run rather than counting as a `no`. `pct enter` from the
-node survives every step and remains the recovery path.
-
-One thing this deliberately avoids: linking `/etc/pam.d/sudo-i` to
-`/etc/pam.d/sudo`. Debian ships both files and they differ -- `sudo` ends
-with `@include common-session-noninteractive` and `sudo-i` with `@include
-common-session`, which is what gives a `sudo -i` login shell its logind
-session -- so the toolkit converges the agent line into each of them
-instead. Where somebody has already linked `sudo-i` to `sudo`, it changes
-nothing.
-
-## Idempotency and safety
-
-Every stage converges. A second run finds the host already in the desired
-state and reports `unchanged`. The helpers compare before they write, so
-they leave a file whose content already matches alone, mtime intact.
-
-The safeguards below work to keep you from locking yourself out. They are
-checks, not a guarantee. The network stage judges success by whether
-`vmbr0` holds an address, which it can do while a wrong static gateway
-leaves an off-subnet SSH session cut off, and no check can prove a route
-you cannot test from the host. Have console or out-of-band access to hand
-before you let a run touch networking or SSH policy.
-
-- **It validates sshd and sudoers before install.** `install_validated`
-  writes the candidate into a root-only scratch directory, runs `sshd -t -f`
-  or `visudo -c -f` against it, then installs it atomically only on a pass.
-  No path skips this check.
-- **It verifies SSH keys before turning passwords off.** Stage 70 checks,
-  for every administrator, that the account exists, that their
-  `authorized_keys` carries the configured key as an active entry, and that
-  at least one entry for that key carries no `from=`, `command=`, `restrict`,
-  `no-pty` or `no-agent-forwarding` restriction the stage cannot verify a
-  login through. `no-agent-forwarding` matters as much as the rest: the
-  agent key is what `sudo` authenticates with. It also
-  checks that no `AuthorizedKeysFile` directive — global or under a `Match`
-  — points anywhere other than `~/.ssh/authorized_keys`, and that
-  `AllowUsers`, `DenyUsers`, `AllowGroups` and `DenyGroups` still admit
-  every administrator. Any of these checks failing aborts the stage while
-  passwords still work.
-- **It reloads sshd rather than restarting it.** You are likely configuring
-  the host over the connection a restart would drop.
-- **The network stage rolls back.** It captures `/etc/network/interfaces`
-  and `/etc/hosts` before activating the new description, and arms an exit
-  trap. If `ifreload` fails, or `vmbr0` takes no address within
-  `PVE_NETWORK_WAIT_SECONDS`, or anything else ends the stage inside that
-  window, the trap puts the previous files back and reloads onto them. It
-  disarms only once the bridge holds an address and `/etc/hosts` agrees
-  with it.
-- **The network stage refuses a destructive takeover.** It writes only `lo`,
-  the bridge ports and `vmbr0`. When the existing file also describes a
-  storage port, a VLAN or a second bridge, the stage stops and names them.
-  Move them into `/etc/network/interfaces.d`, or set
-  `PVE_NETWORK_TAKEOVER='yes'` to replace the file anyway.
-- **It keeps the originals of the three files it rewrites wholesale.**
-  Before first editing `/etc/network/interfaces`, `/etc/hosts` or
-  `/root/.bashrc`, the toolkit copies the original to `<path>.pve-config.bak`.
-  Stage 20 copies `/etc/hosts` aside before it installs the dhclient hook
-  and before it reloads the network, so a lease arriving mid-run cannot get
-  into the copy.
-  A file that did not exist gets an empty `<path>.pve-config.absent`
-  tombstone, so a later run cannot mistake the toolkit's own output for what
-  you had. No other file carries this guarantee: stage 10 rewrites
-  `/etc/hostname` and stage 70 rewrites its sshd fragment with no backup
-  copy. Take your own backup of a host that holds anything you care about
-  before provisioning it.
-- **The driver writes completion markers last and clears them first.** It
-  removes the marker of a forced stage before running it, so a stage that
-  dies part way comes back as pending rather than keeping a stale claim of
-  completion.
-
-## Networking caveat
-
-By default the driver enslaves only the NIC carrying the default route to
-`vmbr0`. `PVE_BRIDGE_PORTS` overrides that when you need something else.
-
-Bridging every port a machine happens to have is not safe. Two live ports in
-one bridge with STP off give you an L2 loop and a broadcast storm — and the
-stage writes `bridge-stp off`, as Proxmox does. On a multi-NIC host it also
-merges networks you deliberately kept apart: a storage or WAN port would end
-up on the management bridge.
-
-When the host already carries a default route on `vmbr0` — the state of a
-host this toolkit has configured — detection resolves the bridge back to the
-ports it holds, so a re-run derives the same answer it did the first time.
-
-Convention fixes the bridge name at `vmbr0`, and the toolkit offers no way
-to change it. Every Proxmox document and support answer says `vmbr0`. The
-stages read the name from a variable the prelude sets and deliberately does
-not export, which keeps it out of reach of the config file.
-
-## Secrets handling
-
-`/root/pve-config/secrets.env` is the credential **input**. The driver
-writes resolved secret values there at mode 0600 and skips them when writing
-`pve-config.conf`, so a credential can never land in the world-readable
-file.
-
-A stage that needs a credential at runtime keeps its own copy. Stage 90
-writes the Zulip site, bot address, bot API key, stream and topic to
-`/etc/pve-config/zulip.env` at mode 0600, inside a 0700 directory, because
-the notifier systemd starts has to read them. Stage `10-acme` writes the
-DNS Made Easy key and secret the same way, to
-`/etc/pve-config/dnsmadeeasy.conf`, and hands `pvenode` that path rather
-than the values: `pvenode acme plugin set --data` reads the file itself, so
-the command line carries a path and nothing else. The file stays out of
-`/etc/pve`, where pmxcfs serves every file as `root:www-data` 0640 and
-ignores `chmod`. The stage checks the owner of both the directory and the
-file before it writes and again after, and refuses a path root does not
-own: a mode protects nothing when somebody else can change it back.
-Editing or emptying `secrets.env` leaves those copies as
-they stand; re-run the stage to rewrite one, and rotate the credential at
-its provider when you retire it.
-
-The toolkit checks the file before reading it. It hard-fails when the file
-is a symlink, when the path names something other than a regular file, when
-any permission bit opens it to group or other, or — under root — when the
-owner is anyone other than root. Fix the permissions rather than working
-around the check:
-
-```shell
-chmod 600 /root/pve-config/secrets.env
-chown root:root /root/pve-config/secrets.env
-```
-
-The toolkit registers every secret value for redaction, so the commands it
-logs show a mask in place of the credential. It suspends shell tracing
-around secret handling, because `set -x` would print a credential that
-redaction never sees. Stages that write credentials to disk — the Zulip
-environment file, for one — write them at 0600 under a 0700 directory.
-
-The driver exports the secrets it loads, so every command a stage runs
-inherits them. Stage `10-acme` reads the DNS Made Easy pair through its own
-loader, which exports nothing. It takes the exported pair into plain shell
-variables and unsets it before it sources a library, because sourcing one
-starts a child process of its own. Neither `pvenode` nor the DNS hook it
-calls sees a credential in its environment. The stage also replaces `PS4`,
-the prefix `set -x` prints, since an inherited `PS4` can name a variable
-and print what it holds. `PVE_CONFIG_TRACE_PREFIX` gives an operator their
-own prefix back for ordinary stages, and this one ignores it.
-
-`PVE_DNSMADEEASY_KEY` and `PVE_DNSMADEEASY_SECRET` set in the environment
-win over the same keys in `secrets.env`, so a rotation that has not reached
-the file yet still reaches the provider. The driver then writes that value
-into `secrets.env`, so exporting one is how a credential gets in rather
-than a way to keep it out. Setting either to an empty value stops the
-stage rather than falling back to the file: an empty credential is a
-mistake worth hearing about.
-
-You can also supply any secret as an environment variable. That does not
-keep it off disk. When `secrets.env` already names the key, the driver
-records your exported value and writes it back to that file; stage 90
-copies the Zulip credentials to `/etc/pve-config/zulip.env` whichever way
-they arrived; and stage `10-acme` writes
-`/etc/pve-config/dnsmadeeasy.conf` and leaves `pvenode` holding a base64
-copy under `/etc/pve/priv/acme/plugins.cfg`. Rotate a credential at its
-provider to retire it. An environment override stays off disk only for a
-key that appears in neither file and that no stage persists.
-
-## Dry run
-
-`--dry-run` runs every selected stage for real and mutates nothing. It sets
-`PVE_CONFIG_DRY_RUN=1`, which the helpers honour by logging the intended
-change and making none, and the driver writes no completion marker.
-Read-only validators still run, because their verdict is the point of
-calling them. A dry run needs no root.
-
-Preview a deployment this way:
-
-```shell
-./pve-config.sh --dry-run
-```
-
-## Troubleshooting
-
-### State markers
-
-`/root/pve-config/state` holds one `phase<N>__<stage>.done` file per
-completed stage, each carrying its completion timestamp, plus a
-`phase1.bootid` recording the boot phase 1 finished under and a `version`
-file naming the release that last configured the host.
-
-```shell
-./pve-config.sh --list          # phase, stage and status for every stage
-ls -l /root/pve-config/state    # the markers themselves
-cat /root/pve-config/state/phase1__20-network.done
-```
-
-### Re-running one stage
-
-```shell
-./pve-config.sh --stage 20-network --force
-./pve-config.sh --stage 20-network --force --dry-run
-```
-
-Deleting a marker by hand has the same effect as `--force` for that stage.
-
-### A stage failed
-
-The driver stops at the first failure and leaves later stages untouched. Fix
-the cause and re-run `./pve-config.sh`; it skips the completed stages and
-picks up where it stopped.
-
-### Tracing a run
-
-```shell
-bash -x ./pve-config.sh --stage 10-acme --force
-```
-
-Stages run as child processes, and each one starts with `PS4`, the prefix
-`set -x` prints, set to bash's own `+ `. Bash expands `PS4` before every
-traced command, so a prefix naming a variable prints what that variable
-holds, and a stage handling a credential would print it.
-
-Set `PVE_CONFIG_TRACE_PREFIX` to keep a prefix of your own:
-
-```shell
-PVE_CONFIG_TRACE_PREFIX='+${BASH_SOURCE##*/}:${LINENO}: ' \
-  bash -x ./pve-config.sh --stage 20-network --force
-```
-
-That switch belongs to one run rather than to the configuration: it
-changes nothing about the host, and a debugging prefix belongs in neither
-`pve-config.conf` nor the state the driver writes back.
-
-The override stops at the stages that handle credentials. Stage `10-acme`
-normalises `PS4` itself whatever you set, and leaves it normalised while a
-credential is reachable, so the override cannot re-open that hole.
-
-One case stays outside what the stage can defend. A shell that already has
-tracing on before `10-acme` starts — `SHELLOPTS=xtrace` in the
-environment, say — traces the first command of the stage with whatever
-`PS4` it inherited, and that happens before any line of the stage runs.
-If the DNS credentials arrived in the environment as well, that first
-trace line has already seen them.
-
-The stage refuses that combination. Tracing already on, plus
-`PVE_DNSMADEEASY_KEY` or `PVE_DNSMADEEASY_SECRET` in the environment, stops
-the run before it configures anything, and tells you to rotate those
-credentials. Reaching that point takes control of the environment of the
-root shell, which also hands an attacker `PATH`, `BASH_ENV` and
-`LD_PRELOAD`; the refusal exists to stop the leak repeating on every
-remaining command, and to say out loud what already happened.
-
-Credentials in the 0600 secrets file avoid this entirely, which is one
-more reason to supply them that way. A traced run reads
-them from the file into variables the stage keeps out of every trace, and
-nothing exposes them to a prefix.
-
-### Bootstrap failed mid-swap
-
-The installer moves the old tree to `/root/pve-config.old` before renaming
-the new one into place, and each error message names the location:
-
-- A message that the installer restored the previous install means the old
-  tree sits back at `/root/pve-config`. Nothing more to do.
-- A message that no previous installation existed means you lost no tree.
-  Run the bootstrap again.
-- A message demanding manual recovery names `/root/pve-config.old`. Move it
-  back yourself:
-
-  ```shell
-  mv /root/pve-config.old /root/pve-config
-  ```
-
-A later bootstrap run refuses to start while `/root/pve-config.old` exists,
-because that directory may hold the only copy of an installation. Move it
-back or delete it first.
-
-### Configuration errors
-
-- `expected PVE_KEY='value'; refusing to interpret this line` — the config
-  file holds something the parser will not accept. The message names the
-  file and the line.
-- `Missing required configuration: ...` — a `--non-interactive` run has keys
-  with no value and no default. Set them in the config file or the
-  environment, or drop `--non-interactive`.
-- `This does not look like a Proxmox VE host` — the stages found no
-  `pveversion`, `pvesh` or `pvecm`.
-
-## Community-scripts pins
-
-Phase 2 creates its guests with the community-scripts helpers. Upstream
-keeps those helpers in two repositories and versions them apart:
-
-| Repository | Holds | Tags |
-| --- | --- | --- |
-| `community-scripts/ProxmoxVE` | the scripts: `ct/`, `vm/`, `install/`, `tools/` | a dated tag most days, lightweight, so upstream can move one |
-| `community-scripts/core` | the engine: `core/build.func`, `ui/*.func`, `pve/backend.func`, `pve/vm-core.func` | none at all |
-
-Both pins live in `lib/community-scripts.sh`, and that file holds nothing
-else. The stage prelude `lib/stage.sh` sources it, so both variables are in
-the environment of every stage, which is what a stage hands to the upstream
-script it shells out to. They are a property of the toolkit rather than of
-a deployment: a given release has to build the same guest at every site, so
-the pins ship with the code and move when someone tests the code against a
-newer pair.
-
-**Both pins are commit SHAs.** A dated tag is a label a human can read, and
-`lib/community-scripts.sh` keeps the one that named the ProxmoxVE commit
-for that reason, but upstream can move a lightweight tag onto another
-commit and can move no SHA anywhere. Both URLs name a SHA, and one
-procedure below covers both repositories.
-
-A `ct/*.sh` script is three lines of preamble that source
-`core/build.func` out of `community-scripts/core`, and that engine then
-fetches the matching `install/*.sh` back out of
-`community-scripts/ProxmoxVE`. The two fetches read two separate
-variables, `COMMUNITY_SCRIPTS_URL` for the scripts and
-`COMMUNITY_SCRIPTS_CORE_URL` for the engine, and each falls back to the tip
-of `main` when its variable is unset. **Pinning the script repository alone
-pins nothing.** The engine would still come from whatever upstream pushed
-that morning, and the engine is what creates the container.
-
-`lib/community-scripts.sh` exports both variables, keeping any value
-already in the environment, so exporting one by hand before a run points
-that run at a fork or at an unreleased branch without an edit.
-
-### Bumping the pins
-
-Both repositories move, and they move at different times. Review them
-together, and treat a bump as one change covering both. A pin is a commit
-SHA in both cases, so one procedure covers the pair. The commands below run
-as written, and set the `NEW_` values themselves.
-
-Start from the SHAs already in `lib/community-scripts.sh`, then pick the
-candidates. The script repository is easiest to read through its dated
-tags, so resolve the chosen tag to the commit it names and carry that
-commit forward; the engine has no tags, so take the tip of `main`:
-
-```shell
-OLD_PVE_SHA=$(sed -n "s/^COMMUNITY_SCRIPTS_PROXMOXVE_COMMIT='\(.*\)'$/\1/p" \
-  lib/community-scripts.sh)
-OLD_CORE_SHA=$(sed -n "s/^COMMUNITY_SCRIPTS_CORE_COMMIT='\(.*\)'$/\1/p" \
-  lib/community-scripts.sh)
-
-# The dated tags on the script repository, newest first. Pick one.
-gh api repos/community-scripts/ProxmoxVE/tags --jq '.[].name' | head -5
-PVE_TAG='2026-10-26'
-
-# The commit that tag names today. This SHA is the pin; the tag goes in
-# the file beside it as a label, because upstream can move the tag.
-NEW_PVE_SHA=$(gh api "repos/community-scripts/ProxmoxVE/commits/${PVE_TAG}" \
-  --jq '.sha')
-
-# The engine's candidate, with the commit it sits on.
-gh api repos/community-scripts/core/commits/main \
-  --jq '.sha, .commit.committer.date, .commit.message'
-NEW_CORE_SHA=$(gh api repos/community-scripts/core/commits/main --jq '.sha')
-```
-
-Review what changed between the SHA in the tree and the candidate SHA, for
-both repositories:
-
-```shell
-gh api "repos/community-scripts/ProxmoxVE/compare/${OLD_PVE_SHA}...${NEW_PVE_SHA}" \
-  --jq '.commits[].commit.message' | head -40
-
-gh api "repos/community-scripts/core/compare/${OLD_CORE_SHA}...${NEW_CORE_SHA}" \
-  --jq '.files[].filename'
-```
-
-Read the engine diff with care. A change to `pve/backend.func` or
-`core/build.func` changes how every container gets built, and upstream
-makes those changes without a release to announce them.
-
-Then edit `lib/community-scripts.sh`, replacing both commit SHAs, the
-ProxmoxVE tag label and the verification date beside each. Confirm that
-each new SHA exists and still carries the paths the guest stages ask for:
-
-```shell
-for url in \
-  "https://raw.githubusercontent.com/community-scripts/core/${NEW_CORE_SHA}/core/build.func" \
-  "https://raw.githubusercontent.com/community-scripts/ProxmoxVE/${NEW_PVE_SHA}/ct/frigate.sh" \
-  "https://raw.githubusercontent.com/community-scripts/ProxmoxVE/${NEW_PVE_SHA}/install/frigate-install.sh" \
-  "https://raw.githubusercontent.com/community-scripts/ProxmoxVE/${NEW_PVE_SHA}/vm/haos-vm.sh" \
-  "https://raw.githubusercontent.com/community-scripts/ProxmoxVE/${NEW_PVE_SHA}/tools/addon/add-tailscale-lxc.sh"; do
-  curl -fsSI -o /dev/null -w "%{http_code} ${url}\n" "${url}"
-done
-```
-
-Five `200` lines mean both commits resolve and still carry the paths.
-Confirm the toolkit now hands those SHAs on:
-
-```shell
-env -u COMMUNITY_SCRIPTS_URL -u COMMUNITY_SCRIPTS_CORE_URL bash -c \
-  'source lib/community-scripts.sh
-   printf "%s\n%s\n" "${COMMUNITY_SCRIPTS_URL}" "${COMMUNITY_SCRIPTS_CORE_URL}"'
-```
-
-Neither URL may end on a branch or tag name. Run the test suite, then
-rebuild a guest on a host you can afford to lose before the bump reaches a
-customer.
-
-### What the pins do not pin
-
-A pinned pair fixes the scripts that run, not the software they install.
-The install scripts fetch packages from Debian, from upstream project
-releases and from container registries, and none of those carry a version
-this repository controls. Two deployments built from the same pins weeks
-apart get the same procedure and different package versions inside the
-guest. Treat the pins as reproducibility of the build, and the guest
-contents as current as of the day you built the guest.
-
-One upstream script carries a further exception, in script code rather
-than in packages. This toolkit does not run it — see below — but anyone
-bumping the pins should know why. `tools/addon/add-tailscale-lxc.sh` runs
-its
-Debian and Ubuntu branch through `pct exec "$CTID" -- bash -c '...'`, and
-that block sources `core/core.func` and `lib/tools.func` from the engine
-repository a second time, from inside the container. The block is single
-quoted, so the expansion happens in the container, where
-`COMMUNITY_SCRIPTS_CORE_URL` is not set: `pct exec` carries no environment
-across, and a non-interactive `bash -c` reads no profile. Those two sources
-fall back to `core/main` whatever this toolkit exports on the host, so the
-engine helpers that run inside the container can differ between two runs of
-the same pin.
-
-The pin cannot reach that far by exporting harder.
-
-Stage `20-tailscale` sidesteps the problem by not running that script.
-It could not run it in any case: the addon blocks on a `read -rp` y/n
-prompt and then on a whiptail radiolist of container IDs, with no way to
-answer either from the environment. The stage installs Tailscale inline
-instead — the repository keyring and sources file, `apt-get install
-tailscale`, the service, the forwarding setting and the join — which also
-means nothing re-sources the engine from `core/main` inside the
-container. The only thing it fetches from upstream is `ct/debian.sh`,
-through the same pinned URL as every other stage. Whoever bumps the pins
-should still re-read the addon, because upstream may fix it and the
-inline flow may be worth retiring.
-
-### Telemetry
-
-The community-scripts engine posts a record of each guest build to the
-community-scripts API. This toolkit sends no opt-out of its own and
-changes no telemetry setting, because the project is free and the counts
-are what tell upstream which scripts people still use. Running unattended
-still settles the question for you: the engine's prompt cannot reach a
-screen, and its else branch records `DIAGNOSTICS=no`. That is an
-accident of the execution mode, not a choice this toolkit makes, and the
-section below says where the toolkit warns you about it. Read what the
-payload carries and decide for the host.
-
-The payload, built in `api/telemetry.func` at the pinned engine commit,
-carries at least a random id and an execution id for the run, the
-application name, the build method and type, disk size, core count, RAM
-size and speed, CPU vendor and model, GPU vendor, model and passthrough
-setting, architecture, platform, kernel version, OS type and version,
-installed application version, Proxmox version, the repository the scripts
-came from, the install duration, an exit code and the result. A failed
-build also carries an error category, the error text, the failing command
-and the line number it came from. That list is representative rather than
-exhaustive; read `api/telemetry.func` at the pinned commit for the field
-set a given pin sends. **Error text and command lines can carry
-host-specific detail**, such as a path, a hostname or an argument the
-script carried.
-
-The two guest paths ask about telemetry differently, and the difference is
-upstream's rather than ours.
-
-The LXC path prompts. `diagnostics_check` runs before a container build,
-and with no `/usr/local/community-scripts/diagnostics` file present it asks
-with a whiptail dialog and writes the answer to that file. Later container
-builds read the file and ask nothing.
-
-An unattended run has no terminal for that dialog, so it fails and the
-engine takes its else branch, which records `DIAGNOSTICS=no`. The answer
-comes from the absence of a screen rather than from a decision, so an
-unattended host opts out by default. Stage `20-tailscale` warns before it
-builds when the file is absent, so that the first container build is not
-also the moment this was quietly settled. Write `DIAGNOSTICS=yes` into
-`/usr/local/community-scripts/diagnostics` to opt in deliberately.
-
-The VM path never prompts. `pve/vm-core.func` calls no `diagnostics_check`,
-and `post_to_api_vm` reads the diagnostics file if one exists. With no
-file, the setting stays unset, the engine treats that as `no`, and the VM
-build reports nothing. A host that has only ever built the Home Assistant
-OS VM has sent nothing, whatever it would have answered.
-
-Writing the file before the first guest build is the only thing that
-settles both paths at once, in either direction. To opt a host out:
-
-```shell
-mkdir -p /usr/local/community-scripts
-printf 'DIAGNOSTICS=no\n' >/usr/local/community-scripts/diagnostics
-```
-
-`DIAGNOSTICS=yes` in the same file opts in, which is also what makes a VM
-build report. The engine reads the file on every run, so the same edit
-changes the answer on a host that already has one.
-
-## Status
-
-- **Phase 1 — implemented.** The nine host stages above.
-- **Phase 2 — partly implemented.** Stage `10-acme` orders the node
-  certificate, stage `20-tailscale` builds the subnet router and stage
-  `40-haos` builds the Home Assistant OS appliance. The Frigate guest
-  remains a later effort. Its configuration keys already appear in the
-  example file and survive a rewrite, but no stage reads them yet.
-
-## Releases
-
-Release notes assemble themselves. Release Drafter reads the title of every
-pull request that lands on `main` and keeps a draft release current with the
-next version number. It never publishes.
-
-Pushing a signed semver tag (`vX.Y.Z`) publishes that draft. The release
-workflow checks the tag signature, builds a source tarball from the tagged
-commit, attaches the tarball to the still-draft release, then promotes the
-draft to a published release.
-
-The signature check is strict: the tag must carry a GPG or SSH signature the
-workflow can verify against a key the repository owner publishes on GitHub.
-A signature it cannot verify, or one made with anybody else's key, stops the
-release before the build starts.
-
-Every release carries two assets:
-
-- `pve-config-<tag>.tar.gz` — a reproducible archive of the tagged commit,
-  unpacking into a single `pve-config-<tag>/` directory.
-- `pve-config-<tag>.tar.gz.sha256` — the checksum, in `sha256sum` format.
-
-Verify and unpack a download from the directory holding both files:
+A published release tarball works the same way; download
+`pve-config-<tag>.tar.gz` and its `.sha256` from the releases page, check
+it with `sha256sum -c`, and unpack it.
+
+Both scripts read `pve-config.env` from their own directory, or the file
+given with `--config PATH`. They stop at the first error.
+
+## What pve-baseline.sh does
+
+1. Sets the hostname to `<installer short name>.<DOMAIN>`.
+2. Removes every apt source pointing at `enterprise.proxmox.com` (PVE and
+   Ceph) and adds `pve-no-subscription` for the installed Debian release.
+3. Removes the subscription nag and installs an apt hook that re-applies
+   that after upgrades.
+4. Runs `apt-get full-upgrade` and installs `isc-dhcp-client`, `sudo`,
+   `libpam-ssh-agent-auth` and `curl`.
+5. Writes `/etc/network/interfaces` with every wired NIC as a port of
+   `vmbr0` and `vmbr0` on DHCP, so whichever port gets plugged in at the
+   site works.
+6. Adds a dhclient hook keeping `/etc/hosts` in step with the DHCP address.
+7. Sets the Postfix `myhostname`.
+8. Restarts networking and waits for a lease.
+9. Rewrites `/etc/hosts` with the leased address.
+10. Makes `pve-cluster` wait at boot until `vmbr0` has its address.
+11. Restarts `pve-cluster`, renames the node directory if needed, restarts
+    the remaining Proxmox services.
+12. Creates `ADMIN_USER` with `ADMIN_PUBKEYS`, in the `sudo` group and as a
+    Proxmox `PVEAdmin` on `/`.
+13. Sets sshd to keys only (`PermitRootLogin prohibit-password`).
+14. Sets up passwordless `sudo` through the forwarded SSH agent
+    (`pam_ssh_agent_auth`); connect with `ssh -A`.
+15. Writes root's `.bashrc` (colours, safe aliases, backspace fix).
+16. Installs the Zulip notifier (see below).
+
+It finishes with a short verification summary.
+
+## What pve-guests.sh does
+
+1. **ACME** (skipped when `DME_API_KEY` is blank): adds the DNS Made Easy
+   plugin, registers a Let's Encrypt account (staging with
+   `ACME_STAGING=1`), sets `acmedomain0` to the host FQDN and orders the
+   certificate. Proxmox renews it automatically.
+2. **Home Assistant OS VM** with community-scripts `vm/haos-vm.sh` in its
+   unattended mode: VMID `HAOS_VMID` (200), CPU type `host`, the current
+   stable release, started and set to start on boot.
+3. **Tailscale container** with community-scripts `ct/debian.sh`: CTID
+   `TS_CTID` (100), unprivileged, nesting and `/dev/net/tun`, no IPv6,
+   1 core / 512 MB / 2 GB. Inside it installs Tailscale, enables IPv4
+   forwarding, joins the tailnet with `TS_AUTHKEY` (`--accept-routes`),
+   installs the boot-time route advertiser (see below), and creates
+   `ADMIN_USER` with the same key-only SSH and SSH-agent `sudo` as the host.
+4. **Frigate container** with community-scripts `ct/frigate.sh`: CTID
+   `FRIGATE_CTID` (101), privileged, GPU passthrough when `/dev/dri`
+   exists. Unless set, it gets a quarter of the host RAM (2048-6144 MB)
+   and half the cores (2-8).
+
+It finishes with a summary of guest IDs, addresses and what remains.
+
+## Configuration
+
+Everything lives in `pve-config.env`; `pve-config.env.example` documents
+each setting. Required:
+
+| Setting | Used by | Meaning |
+| ------- | ------- | ------- |
+| `DOMAIN` | baseline | DNS domain of the host |
+| `ADMIN_USER` | both | admin login on the host and the Tailscale container |
+| `ADMIN_PUBKEYS` | both | that user's SSH public keys, one per line |
+| `TS_AUTHKEY` | guests | Tailscale auth key |
+
+Optional: `BRIDGE_PORTS`, the `ZULIP_*` and ACME settings, guest IDs,
+names and sizes, storage names, and the community-scripts pins
+(`COMMUNITY_SCRIPTS_REF`, `COMMUNITY_SCRIPTS_CORE_REF`; set both to `main`
+to follow upstream).
+
+Never commit `pve-config.env`; `.gitignore` excludes it.
+
+## Zulip notifications
+
+`pve-baseline.sh` always installs `/usr/local/bin/zulip-notify.sh` and the
+`zulip-boot-notify` and `zulip-shutdown-notify` services. The credentials
+go in `/etc/zulip-notify.env` (mode 0600). With the `ZULIP_*` settings
+filled in, the baseline enables the services straight away. With them
+blank, the notifier does nothing and the services stay disabled.
+
+To turn it on later:
 
 ```bash
-sha256sum -c pve-config-v1.0.0.tar.gz.sha256
-tar xzf pve-config-v1.0.0.tar.gz
+nano /etc/zulip-notify.env       # fill in all four values
+systemctl enable zulip-boot-notify.service
+systemctl enable --now zulip-shutdown-notify.service
+/usr/local/bin/zulip-notify.sh boot
 ```
 
-### Versioning
+## Tailscale subnet routes
 
-`lib/version.sh` in the committed tree always reads `0.0.0`. The release
-workflow rewrites that assignment from the pushed tag (`v1.2.3` becomes
-`1.2.3`) while it builds the tarball, so only a released artefact carries a
-real version. A test guards the placeholder, and the workflow fails the
-build if the rewrite does not take.
+The host ships to a network whose subnet is unknown at setup time, so the
+Tailscale container never hard-codes its routes. A small service,
+`ts-advertise-routes.service`, runs
+`/usr/local/sbin/ts-advertise-routes.sh` on every boot. It waits for `eth0`
+to hold a DHCP address and for Tailscale to be up, reads the connected
+subnets with `ip -4 route show dev eth0 proto kernel scope link`, and runs
+`tailscale set --advertise-routes=<those subnets>`, replacing whatever the
+setup site advertised.
 
-Ask an installed copy for its version:
+Tailscale does not use a newly advertised route until somebody approves it.
+Either approve it in the admin console after the host comes up at its
+site, or add an `autoApprovers` rule to the tailnet policy covering the
+subnets and the router's tag, for example:
+
+```json
+"autoApprovers": {
+  "routes": { "10.0.0.0/8": ["tag:pve-router"], "192.168.0.0/16": ["tag:pve-router"] }
+}
+```
+
+Use a **tagged** auth key (for example `tag:pve-router`). Tagged nodes have
+key expiry turned off, so the router does not drop off the tailnet after
+the default expiry period. With an untagged key, turn off key expiry for
+the node in the admin console.
+
+## community-scripts and prompts
+
+The guests come from
+[community-scripts](https://github.com/community-scripts/ProxmoxVE),
+pinned to the commits in `pve-config.env.example`. The scripts run them
+without a terminal:
+
+- `vm/haos-vm.sh` runs with `VM_UNATTENDED=1` and `VM_*` overrides.
+- The container scripts run with `mode=default` and `var_*` settings.
+- `/usr/local/community-scripts/default.vars` gets the storage choices,
+  and `/usr/local/community-scripts/diagnostics` gets
+  `DIAGNOSTICS=no` unless it already exists, so no menus appear.
+- The builders run under `setsid` with stdin from `/dev/null`. Their
+  remaining prompts, such as Frigate's GPU choice (`read -t 60 </dev/tty`),
+  then fail at once and take their default: all detected GPUs.
+
+## Not handled
+
+- Home Assistant onboarding or backup restore. Home Assistant releases
+  from 2026.7 may default to port 80; move it back to 8123 if Nginx Proxy
+  Manager is in use.
+- Frigate configuration, cameras and recording storage.
+- Approving Tailscale routes and key expiry (see above).
+- Static addressing, VLANs, extra bridges, clustering, ZFS layout.
+- Re-running on a configured host.
+
+## Tests
 
 ```bash
-./pve-config.sh --version
+bats tests/
 ```
 
-Each run that touches the host also writes that version to `state/version`.
-An operator can then tell which release configured the machine. A dry run
-writes nothing.
-
-GitHub immutable releases lock a release the moment it publishes. Nobody can
-edit, replace or delete an asset afterwards. Correcting a mistake means
-tagging a new version. `bootstrap.sh` installs from these assets, which is
-what makes the published checksum worth checking; see
-[What the checksum proves](#what-the-checksum-proves).
+The tests cover the small pure helpers (NIC detection, Frigate sizing) and
+the two installed helper scripts. Everything else touches a real Proxmox
+host, so only a hardware run can verify it.
 
 ## Contributing
 
-Read [AGENTS.md](AGENTS.md) for commit conventions, coding standards and the
-test and review workflow, and [stages/README.md](stages/README.md) for the
-stage contract.
+Read [AGENTS.md](AGENTS.md) for commit conventions and the development
+workflow.
 
 ## License
 
