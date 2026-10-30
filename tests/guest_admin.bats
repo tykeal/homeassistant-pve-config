@@ -566,6 +566,19 @@ DenyUsers alice
   [ ! -e "${ROOT}/etc/ssh/sshd_config.d/99-pve-config-admin.conf" ]
 }
 
+@test "a DenyUsers wildcard stops the hardening" {
+  # Run from a directory with files in it, so a pattern that reached
+  # pathname expansion would turn into their names and deny nobody.
+  seed_guest_file /etc/ssh/sshd_config 'Include /etc/ssh/sshd_config.d/*.conf
+DenyUsers *
+'
+  cd "${ROOT}"
+  run converge
+  [ "${status}" -ne 0 ]
+  [[ ${output} == *'denies'* ]]
+  [ ! -e "${ROOT}/etc/ssh/sshd_config.d/99-pve-config-admin.conf" ]
+}
+
 @test "an AuthorizedKeysFile pointing elsewhere stops the hardening" {
   seed_guest_file /etc/ssh/sshd_config 'Include /etc/ssh/sshd_config.d/*.conf
 AuthorizedKeysFile /etc/ssh/keys/%u

@@ -366,7 +366,7 @@ match_criteria() {
 }
 
 record() {
-  local key=$1 value=$2 word
+  local key=$1 value=$2 word words
   case ${key} in
     port) ports+=("${value%%[[:space:]]*}") ;;
     listenaddress) listens+=("${value}") ;;
@@ -382,12 +382,16 @@ record() {
           match_list_block[${key}]=${match_block_no}
         fi
         [[ ${match_list_block[${key}]} -eq ${match_block_no} ]] || return 0
-        for word in ${value}; do
+        # read -a splits without pathname expansion, so a pattern such
+        # as `*` stays a pattern rather than becoming filenames.
+        read -ra words <<<"${value}"
+        for word in "${words[@]}"; do
           match_list_lines+=("${key} ${word}")
         done
         return 0
       fi
-      for word in ${value}; do
+      read -ra words <<<"${value}"
+      for word in "${words[@]}"; do
         list_lines+=("${key} ${word}")
       done
       ;;
