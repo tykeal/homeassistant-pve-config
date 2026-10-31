@@ -190,9 +190,12 @@ without a terminal:
 ## Frigate
 
 The Frigate container runs the official Docker image with Docker
-Compose from `/opt/frigate`. On first start it writes a default
-config and creates an `admin` user with a random password, printed in
-its log:
+Compose from `/opt/frigate`. When the container has an Intel iGPU, the
+script seeds `/opt/frigate/config/config.yml` so detection runs on the
+iGPU through OpenVINO and video decodes with VAAPI; change either later
+in the UI or in `config.yml`. Without a GPU, Frigate writes its own CPU
+starter config. On first start Frigate creates an `admin` user with
+a random password, printed in its log:
 
 ```bash
 pct exec 101 -- docker logs frigate 2>&1 | grep -i password

@@ -226,17 +226,41 @@ setup_frigate() {
     var_ipv6_method=none
   pct config "${ctid}" >/dev/null
 
+  pct exec "${ctid}" -- mkdir -p /opt/frigate/config /opt/frigate/storage
   local devices=""
   if [[ "${gpu}" == yes ]]; then
     if pct exec "${ctid}" -- test -c /dev/dri/renderD128; then
       devices=$'    devices:\n      - /dev/dri/renderD128:/dev/dri/renderD128\n'
+      # Mirrors Frigate 0.18's own starter config, with GPU in place of CPU.
+      ct_write "${ctid}" /opt/frigate/config/config.yml 0644 <<'EOF'
+mqtt:
+  enabled: False
+
+ffmpeg:
+  hwaccel_args: preset-vaapi
+
+detectors:
+  ov:
+    type: openvino
+    device: GPU
+
+model:
+  width: 300
+  height: 300
+  input_tensor: nhwc
+  input_pixel_format: bgr
+  path: /openvino-model/ssdlite_mobilenet_v2.xml
+  labelmap_path: /openvino-model/coco_91cl_bkgr.txt
+
+cameras: {}  # No cameras defined, UI wizard should be used
+version: 0.18-0
+EOF
     else
       echo "WARNING: no /dev/dri/renderD128 in container ${ctid}; Frigate runs without a GPU" >&2
     fi
   fi
 
   log "Frigate: starting ghcr.io/blakeblackshear/frigate:${FRIGATE_IMAGE_TAG}; the first pull takes a while"
-  pct exec "${ctid}" -- mkdir -p /opt/frigate/config /opt/frigate/storage
   ct_write "${ctid}" /opt/frigate/docker-compose.yml 0644 <<EOF
 services:
   frigate:
