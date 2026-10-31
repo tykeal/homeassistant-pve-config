@@ -94,10 +94,16 @@ It finishes with a short verification summary.
    forwarding, joins the tailnet with `TS_AUTHKEY` (`--accept-routes`),
    installs the boot-time route advertiser (see below), and creates
    `ADMIN_USER` with the same key-only SSH and SSH-agent `sudo` as the host.
-4. **Frigate container** with community-scripts `ct/frigate.sh`: CTID
-   `FRIGATE_CTID` (101), privileged, GPU passthrough when `/dev/dri`
-   exists. Unless set, it gets a quarter of the host RAM (2048-6144 MB)
-   and half the cores (2-8).
+4. **Frigate container** with community-scripts `ct/docker.sh`: CTID
+   `FRIGATE_CTID` (101), Debian 13, privileged with nesting, Docker and
+   the Compose plugin from Docker's repository, GPU passthrough when
+   `/dev/dri` exists. Unless set, it gets a quarter of the host RAM
+   (2048-6144 MB) and half the cores (2-8). It then writes
+   `/opt/frigate/docker-compose.yml` for the official
+   `ghcr.io/blakeblackshear/frigate:<FRIGATE_IMAGE_TAG>` image (config in
+   `/opt/frigate/config`, recordings in `/opt/frigate/storage`, ports
+   8971, 8554 and 8555, plus `/dev/dri/renderD128` when passed through)
+   and starts it.
 
 It finishes with a summary of guest IDs, addresses and what remains.
 
@@ -177,15 +183,38 @@ without a terminal:
   and `/usr/local/community-scripts/diagnostics` gets
   `DIAGNOSTICS=no` unless it already exists, so no menus appear.
 - The builders run under `setsid` with stdin from `/dev/null`. Their
-  remaining prompts, such as Frigate's GPU choice (`read -t 60 </dev/tty`),
-  then fail at once and take their default: all detected GPUs.
+  remaining prompts, such as the GPU type choice on a host with both
+  Intel and NVIDIA GPUs (`read -t 60 </dev/tty`), then fail at once and
+  take their default: all detected GPUs.
+
+## Frigate
+
+The Frigate container runs the official Docker image with Docker
+Compose from `/opt/frigate`. On first start it writes a default
+config and creates an `admin` user with a random password, printed in
+its log:
+
+```bash
+pct exec 101 -- docker logs frigate 2>&1 | grep -i password
+```
+
+The web UI is `https://<frigate-ip>:8971` with a self-signed
+certificate. Change the admin password after the first login.
+
+To upgrade to the newest image for the tag:
+
+```bash
+pct enter 101
+cd /opt/frigate
+docker compose pull && docker compose up -d
+```
 
 ## Not handled
 
 - Home Assistant onboarding or backup restore. Home Assistant releases
   from 2026.7 may default to port 80; move it back to 8123 if Nginx Proxy
   Manager is in use.
-- Frigate configuration, cameras and recording storage.
+- Frigate configuration, cameras and recording storage (see above).
 - Approving Tailscale routes and key expiry (see above).
 - Static addressing, VLANs, extra bridges, clustering, ZFS layout.
 - Re-running on a configured host.

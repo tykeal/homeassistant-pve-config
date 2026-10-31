@@ -8,7 +8,8 @@
 #   a. ACME certificate for the web UI (DNS Made Easy), when configured
 #   b. Home Assistant OS VM         (community-scripts vm/haos-vm.sh)
 #   c. Tailscale subnet router LXC  (community-scripts ct/debian.sh)
-#   d. Frigate NVR LXC              (community-scripts ct/frigate.sh)
+#   d. Frigate NVR LXC              (community-scripts ct/docker.sh and the
+#                                    official Frigate image)
 
 set -euo pipefail
 
@@ -53,8 +54,7 @@ load_config() {
 }
 
 # Frigate's share of the host: "<ram_mb> <cores>". A quarter of the RAM
-# (2048-6144 MB) and half the cores (2-8); upstream's own default is
-# 6144 MB and 8 cores whatever the host.
+# (2048-6144 MB) and half the cores (2-8).
 frigate_size() {
   local host_mb="$1" host_cores="$2" ram cores
   ram=$((host_mb / 4))
@@ -206,19 +206,60 @@ setup_frigate() {
     gpu=no
     [[ -d /dev/dri ]] && gpu=yes
   fi
-  log "Frigate: building privileged container ${ctid} (${FRIGATE_CORES} cores, ${FRIGATE_RAM_MB} MB, GPU ${gpu}); this takes a while"
-  run_builder ct/frigate.sh \
+  log "Frigate: building privileged Docker container ${ctid} (${FRIGATE_CORES} cores, ${FRIGATE_RAM_MB} MB, GPU ${gpu})"
+  # var_gpu=yes makes the engine add a devN: entry for every Intel/AMD
+  # /dev/dri node it finds. var_docker_socket=n answers the install's
+  # "expose the Docker TCP socket?" question.
+  run_builder ct/docker.sh \
     mode=default \
+    var_os=debian \
     var_ctid="${ctid}" \
     var_hostname="${FRIGATE_HOSTNAME}" \
     var_unprivileged=0 \
+    var_nesting=1 \
     var_gpu="${gpu}" \
+    var_docker_socket=n \
     var_cpu="${FRIGATE_CORES}" \
     var_ram="${FRIGATE_RAM_MB}" \
     var_disk="${FRIGATE_DISK_GB}" \
     var_net=dhcp \
     var_ipv6_method=none
   pct config "${ctid}" >/dev/null
+
+  local devices=""
+  if [[ "${gpu}" == yes ]]; then
+    if pct exec "${ctid}" -- test -c /dev/dri/renderD128; then
+      devices=$'    devices:\n      - /dev/dri/renderD128:/dev/dri/renderD128\n'
+    else
+      echo "WARNING: no /dev/dri/renderD128 in container ${ctid}; Frigate runs without a GPU" >&2
+    fi
+  fi
+
+  log "Frigate: starting ghcr.io/blakeblackshear/frigate:${FRIGATE_IMAGE_TAG}; the first pull takes a while"
+  pct exec "${ctid}" -- mkdir -p /opt/frigate/config /opt/frigate/storage
+  ct_write "${ctid}" /opt/frigate/docker-compose.yml 0644 <<EOF
+services:
+  frigate:
+    container_name: frigate
+    image: ghcr.io/blakeblackshear/frigate:${FRIGATE_IMAGE_TAG}
+    restart: unless-stopped
+    stop_grace_period: 30s
+    shm_size: "${FRIGATE_SHM_SIZE}"
+${devices}    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /opt/frigate/config:/config
+      - /opt/frigate/storage:/media/frigate
+      - type: tmpfs
+        target: /tmp/cache
+        tmpfs:
+          size: 1000000000
+    ports:
+      - "8971:8971"
+      - "8554:8554"
+      - "8555:8555/tcp"
+      - "8555:8555/udp"
+EOF
+  pct exec "${ctid}" -- docker compose -f /opt/frigate/docker-compose.yml up -d --quiet-pull
 }
 
 main() {
@@ -252,6 +293,7 @@ main() {
   : "${HAOS_VMID:=200}" "${HAOS_HOSTNAME:=homeassistant}" "${HAOS_CORES:=2}" "${HAOS_RAM_MB:=4096}"
   : "${TS_CTID:=100}" "${TS_HOSTNAME:=ts-$(hostname -s)}" "${TS_CORES:=1}" "${TS_RAM_MB:=512}" "${TS_DISK_GB:=2}"
   : "${FRIGATE_CTID:=101}" "${FRIGATE_HOSTNAME:=frigate}" "${FRIGATE_DISK_GB:=25}" "${FRIGATE_GPU:=auto}"
+  : "${FRIGATE_IMAGE_TAG:=stable}" "${FRIGATE_SHM_SIZE:=512mb}"
   : "${GUEST_STORAGE:=$(first_storage rootdir)}" "${TEMPLATE_STORAGE:=$(first_storage vztmpl)}"
   [[ -n "${GUEST_STORAGE}" ]] || die "no storage for guest disks found; set GUEST_STORAGE"
   [[ -n "${TEMPLATE_STORAGE}" ]] || die "no storage for container templates found; set TEMPLATE_STORAGE"
@@ -291,14 +333,17 @@ HAOS VM:        ${HAOS_VMID} (${HAOS_HOSTNAME}) ${haos_ip:-IP not reported yet; 
 Tailscale CT:   ${TS_CTID} (${TS_HOSTNAME}) $(ct_ip "${TS_CTID}")
                 tailnet IP $(pct exec "${TS_CTID}" -- tailscale ip -4 2>/dev/null || echo '?')
                 advertising ${ts_routes} (re-derived on every boot)
-Frigate CT:     ${FRIGATE_CTID} (${FRIGATE_HOSTNAME}) http://$(ct_ip "${FRIGATE_CTID}"):5000
+Frigate CT:     ${FRIGATE_CTID} (${FRIGATE_HOSTNAME}) https://$(ct_ip "${FRIGATE_CTID}"):8971
+                admin password, once Frigate has started:
+                pct exec ${FRIGATE_CTID} -- docker logs frigate 2>&1 | grep -i password
 
 Still to do, remotely over Tailscale:
   - approve the advertised subnet route in the Tailscale admin console
     (unless an autoApprovers rule covers it) and disable key expiry for
     ${TS_HOSTNAME} if the auth key was not tagged
   - Home Assistant onboarding or backup restore at http://<haos-ip>:8123
-  - Frigate cameras and storage at http://<frigate-ip>:5000
+  - Frigate cameras and storage at https://<frigate-ip>:8971 (self-signed
+    certificate; log in as admin and change the generated password)
 EOF
 }
 
