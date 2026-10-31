@@ -9,12 +9,15 @@
 #   b. Home Assistant OS VM         (community-scripts vm/haos-vm.sh)
 #   c. Tailscale subnet router LXC  (community-scripts ct/debian.sh)
 #   d. Frigate NVR LXC              (community-scripts ct/docker.sh and the
-#                                    official Frigate image)
+#                                    official Frigate image, with an acme.sh
+#                                    certificate when ACME is configured)
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CS_DIR="/usr/local/community-scripts"
+# Set by setup_frigate when Frigate got a Let's Encrypt certificate.
+FRIGATE_CERT_FQDN=""
 
 usage() {
   cat <<EOF
@@ -117,6 +120,32 @@ setup_acme() {
   echo y | pvenode acme account register default "${ACME_EMAIL}" --directory "${directory}"
   pvenode config set --acmedomain0 "${fqdn},plugin=dnsmadeeasy"
   pvenode acme cert order
+}
+
+# Installs acme.sh in a container, issues a certificate for $2 through
+# DNS Made Easy and installs it where Frigate's compose file mounts it.
+# acme.sh keeps the API key in its account.conf and renews from cron.
+frigate_cert() {
+  local ctid="$1" fqdn="$2" server=letsencrypt
+  [[ "${ACME_STAGING:-0}" == 1 ]] && server=letsencrypt_test
+  log "Frigate: issuing a certificate for ${fqdn} with acme.sh ${ACME_SH_REF} (${server})"
+  # shellcheck disable=SC2016 # $1/$2 expand in the container's shell
+  pct exec "${ctid}" -- apt-get update -qq &&
+    pct exec "${ctid}" -- env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq cron &&
+    pct exec "${ctid}" -- env HOME=/root sh -c '
+      mkdir -p /root/acme.sh-src &&
+        curl -fsSL "https://github.com/acmesh-official/acme.sh/archive/refs/tags/$1.tar.gz" |
+        tar -xz --strip-components=1 -C /root/acme.sh-src &&
+        cd /root/acme.sh-src && ./acme.sh --install -m "$2"
+      rc=$?
+      rm -rf /root/acme.sh-src
+      exit "${rc}"' sh "${ACME_SH_REF}" "${ACME_EMAIL}" &&
+    pct exec "${ctid}" -- env HOME=/root ME_Key="${DME_API_KEY}" ME_Secret="${DME_API_SECRET}" \
+      /root/.acme.sh/acme.sh --issue --dns dns_me -d "${fqdn}" --server "${server}" &&
+    pct exec "${ctid}" -- mkdir -p /opt/frigate/certs &&
+    pct exec "${ctid}" -- env HOME=/root /root/.acme.sh/acme.sh --install-cert -d "${fqdn}" \
+      --key-file /opt/frigate/certs/privkey.pem \
+      --fullchain-file /opt/frigate/certs/fullchain.pem
 }
 
 setup_haos() {
@@ -281,6 +310,21 @@ ${cameras}
 version: 0.18-0
 EOF
 
+  # Frigate serves /etc/letsencrypt/live/frigate when it holds a
+  # certificate and makes its own self-signed one otherwise, so the mount
+  # is only added once acme.sh has filled it.
+  local certs=""
+  if [[ -n "${DME_API_KEY:-}" ]]; then
+    local fqdn
+    fqdn="$(hostname -s)-frigate.${DOMAIN}"
+    if frigate_cert "${ctid}" "${fqdn}"; then
+      certs=$'      - /opt/frigate/certs:/etc/letsencrypt/live/frigate:ro\n'
+      FRIGATE_CERT_FQDN="${fqdn}"
+    else
+      echo "WARNING: no certificate for ${fqdn}; Frigate uses its self-signed one" >&2
+    fi
+  fi
+
   log "Frigate: starting ghcr.io/blakeblackshear/frigate:${FRIGATE_IMAGE_TAG}; the first pull takes a while"
   ct_write "${ctid}" /opt/frigate/docker-compose.yml 0644 <<EOF
 services:
@@ -294,7 +338,7 @@ ${devices}    volumes:
       - /etc/localtime:/etc/localtime:ro
       - /opt/frigate/config:/config
       - /opt/frigate/storage:/media/frigate
-      - type: tmpfs
+${certs}      - type: tmpfs
         target: /tmp/cache
         tmpfs:
           size: 1000000000
@@ -331,14 +375,14 @@ main() {
   load_config "${config}" ADMIN_USER ADMIN_PUBKEYS TS_AUTHKEY \
     COMMUNITY_SCRIPTS_REF COMMUNITY_SCRIPTS_CORE_REF
   if [[ -n "${DME_API_KEY:-}" ]]; then
-    load_config "${config}" ACME_EMAIL DME_API_KEY DME_API_SECRET
+    load_config "${config}" DOMAIN ACME_EMAIL DME_API_KEY DME_API_SECRET
   fi
   [[ -f /etc/zulip-notify.env ]] || die "pve-baseline.sh has not run on this host"
 
   : "${HAOS_VMID:=200}" "${HAOS_HOSTNAME:=homeassistant}" "${HAOS_CORES:=2}" "${HAOS_RAM_MB:=4096}"
   : "${TS_CTID:=100}" "${TS_HOSTNAME:=ts-$(hostname -s)}" "${TS_CORES:=1}" "${TS_RAM_MB:=512}" "${TS_DISK_GB:=2}"
   : "${FRIGATE_CTID:=101}" "${FRIGATE_HOSTNAME:=frigate}" "${FRIGATE_DISK_GB:=25}" "${FRIGATE_GPU:=auto}"
-  : "${FRIGATE_IMAGE_TAG:=stable}" "${FRIGATE_SHM_SIZE:=512mb}"
+  : "${FRIGATE_IMAGE_TAG:=stable}" "${FRIGATE_SHM_SIZE:=512mb}" "${ACME_SH_REF:=3.1.6}"
   : "${GUEST_STORAGE:=$(first_storage rootdir)}" "${TEMPLATE_STORAGE:=$(first_storage vztmpl)}"
   [[ -n "${GUEST_STORAGE}" ]] || die "no storage for guest disks found; set GUEST_STORAGE"
   [[ -n "${TEMPLATE_STORAGE}" ]] || die "no storage for container templates found; set TEMPLATE_STORAGE"
@@ -365,7 +409,19 @@ main() {
   setup_tailscale
   setup_frigate
 
-  local haos_ip ts_routes
+  local haos_ip ts_routes frigate_ip frigate_url frigate_todo
+  frigate_ip="$(ct_ip "${FRIGATE_CTID}")"
+  frigate_url="https://${frigate_ip}:8971"
+  frigate_todo="https://<frigate-ip>:8971 (self-signed
+    certificate; log in as admin and change the generated password)"
+  if [[ -n "${FRIGATE_CERT_FQDN}" ]]; then
+    frigate_url="https://${FRIGATE_CERT_FQDN}:8971"
+    [[ "${ACME_STAGING:-0}" == 1 ]] && frigate_url+=" (Let's Encrypt STAGING)"
+    frigate_url+="
+                create a DNS A record by hand: ${FRIGATE_CERT_FQDN} -> ${frigate_ip}"
+    frigate_todo="https://${FRIGATE_CERT_FQDN}:8971 once
+    its DNS record exists; log in as admin and change the generated password"
+  fi
   ts_routes="$(pct exec "${TS_CTID}" -- ip -4 route show dev eth0 proto kernel scope link | awk '{print $1}' | paste -sd, -)"
   haos_ip="$(qm guest cmd "${HAOS_VMID}" network-get-interfaces 2>/dev/null |
     grep -oE '"ip-address" *: *"[0-9.]+"' | grep -v '127\.0\.0\.1' | head -1 | grep -oE '[0-9.]+' || true)"
@@ -378,7 +434,7 @@ HAOS VM:        ${HAOS_VMID} (${HAOS_HOSTNAME}) ${haos_ip:-IP not reported yet; 
 Tailscale CT:   ${TS_CTID} (${TS_HOSTNAME}) $(ct_ip "${TS_CTID}")
                 tailnet IP $(pct exec "${TS_CTID}" -- tailscale ip -4 2>/dev/null || echo '?')
                 advertising ${ts_routes} (re-derived on every boot)
-Frigate CT:     ${FRIGATE_CTID} (${FRIGATE_HOSTNAME}) https://$(ct_ip "${FRIGATE_CTID}"):8971
+Frigate CT:     ${FRIGATE_CTID} (${FRIGATE_HOSTNAME}) ${frigate_url}
                 admin password, once Frigate has started:
                 pct exec ${FRIGATE_CTID} -- docker logs frigate 2>&1 | grep -i password
 
@@ -387,8 +443,7 @@ Still to do, remotely over Tailscale:
     (unless an autoApprovers rule covers it) and disable key expiry for
     ${TS_HOSTNAME} if the auth key was not tagged
   - Home Assistant onboarding or backup restore at http://<haos-ip>:8123
-  - Frigate cameras and storage at https://<frigate-ip>:8971 (self-signed
-    certificate; log in as admin and change the generated password)
+  - Frigate cameras and storage at ${frigate_todo}
 EOF
 }
 
