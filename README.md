@@ -103,7 +103,8 @@ It finishes with a short verification summary.
    `ghcr.io/blakeblackshear/frigate:<FRIGATE_IMAGE_TAG>` image (config in
    `/opt/frigate/config`, recordings in `/opt/frigate/storage`, ports
    8971, 8554 and 8555, plus `/dev/dri/renderD128` when passed through)
-   and starts it.
+   and starts it. With ACME configured it first issues Frigate's own
+   certificate (see [Frigate](#frigate)).
 
 It finishes with a summary of guest IDs, addresses and what remains.
 
@@ -114,7 +115,7 @@ each setting. Required:
 
 | Setting | Used by | Meaning |
 | ------- | ------- | ------- |
-| `DOMAIN` | baseline | DNS domain of the host |
+| `DOMAIN` | both | DNS domain of the host (guests: Frigate certificate) |
 | `ADMIN_USER` | both | admin login on the host and the Tailscale container |
 | `ADMIN_PUBKEYS` | both | that user's SSH public keys, one per line |
 | `TS_AUTHKEY` | guests | Tailscale auth key |
@@ -203,8 +204,19 @@ a random password, printed in its log:
 pct exec 101 -- docker logs frigate 2>&1 | grep -i password
 ```
 
-The web UI is `https://<frigate-ip>:8971` with a self-signed
-certificate. Change the admin password after the first login.
+The web UI is on port 8971. Change the admin password after the first
+login.
+
+With `DME_API_KEY` filled in, the script installs acme.sh (`ACME_SH_REF`)
+inside container 101 and issues a Let's Encrypt certificate (staging
+with `ACME_STAGING=1`) for `<short-hostname>-frigate.<DOMAIN>` through
+DNS Made Easy. It lands in `/opt/frigate/certs`, which the compose file
+mounts at `/etc/letsencrypt/live/frigate`; Frigate picks up renewals,
+done by acme.sh's cron job in the container, without a restart. Create
+the DNS A record for that name, pointing at the container's IP, by hand;
+the summary prints both. Without `DME_API_KEY`, or if issuance fails,
+Frigate serves its own self-signed certificate at
+`https://<frigate-ip>:8971`.
 
 To upgrade to the newest image for the tag:
 
