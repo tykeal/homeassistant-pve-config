@@ -43,7 +43,7 @@ jobs:
     # ruleset names any of them and there is no pull_request trigger, so
     # none of them gates a merge.
     # yamllint disable-line rule:line-length
-    uses: lfreleng-actions/security-workflows/.github/workflows/openssf-scorecard.yaml@ef6c0d9930feedb274067703b50eeebe5ab859b3  # v0.9.5
+    uses: lfreleng-actions/security-workflows/.github/workflows/openssf-scorecard.yaml@0f985c4a991737aefe59666bf70d94c017fa2a8b  # v0.9.6
     # The 'branch_protection_rule' trigger is low-trust, so cap what the
     # callee may request. Scorecard analyses the checked out tree and
     # caches nothing, so denying all cache access costs nothing.
