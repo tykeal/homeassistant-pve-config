@@ -369,6 +369,10 @@ EOF
   # --- 17. SMART Sniffer agent (disk health for Home Assistant) -----------
   log "Installing the SMART Sniffer agent v${SMART_SNIFFER_VERSION}"
   install_smart_sniffer "${SMART_SNIFFER_VERSION}" "${SMART_SNIFFER_TOKEN:-}"
+  local smart="not running (see the warnings above)"
+  if systemctl is-active --quiet smartha-agent; then
+    smart="active, listening on port 9099"
+  fi
 
   # --- Summary -------------------------------------------------------------
   cat <<EOF
@@ -383,7 +387,7 @@ pveproxy:     $(systemctl is-active pveproxy)
 sshd:         $(systemctl is-active ssh)
 Admin user:   ${ADMIN_USER} (PVEAdmin on /, sudo via forwarded SSH agent)
 Zulip:        ${zulip}
-SMART Sniffer: $(systemctl is-active smartha-agent 2>/dev/null), listening on port 9099
+SMART Sniffer: ${smart}
 
 /etc/hosts:
 $(cat /etc/hosts)
