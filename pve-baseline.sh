@@ -17,7 +17,8 @@ usage() {
 Usage: $(basename "$0") [--config PATH]
 
 Baseline a fresh Proxmox VE install: hostname, DHCP bridge, repositories,
-admin user with SSH-agent sudo, sshd hardening and Zulip notifications.
+admin user with SSH-agent sudo, sshd hardening, Zulip notifications and the
+SMART Sniffer disk health agent.
 
   --config PATH  settings file (default: ${SCRIPT_DIR}/pve-config.env)
   -h, --help     show this help
@@ -63,6 +64,53 @@ vmbr0_ip() {
   ip -4 -o addr show dev vmbr0 2>/dev/null | awk '{split($4, a, "/"); print a[1]; exit}'
 }
 
+# SMART Sniffer agent, laid out as upstream's install.sh does with its
+# defaults, minus the prompts, plus an API token (a random one when none is
+# given). Warns and skips the agent if the download or checksum fails.
+install_smart_sniffer() {
+  local version="$1" token="$2" dir
+  local file="smartha-agent-linux-amd64"
+  local url="https://github.com/DAB-LABS/smart-sniffer/releases/download/v${version}"
+  dir="$(mktemp -d)"
+  if ! curl -fsSL -o "${dir}/${file}" "${url}/${file}" ||
+    ! curl -fsSL -o "${dir}/checksums.txt" "${url}/checksums.txt" ||
+    ! (cd "${dir}" && grep " ${file}\$" checksums.txt | sha256sum -c --quiet -); then
+    echo "WARNING: could not download or verify the SMART Sniffer agent v${version}; skipping it" >&2
+    rm -rf "${dir}"
+    return 0
+  fi
+  install -m 0755 "${dir}/${file}" /usr/local/bin/smartha-agent
+  rm -rf "${dir}"
+
+  install -d /etc/smartha-agent
+  install -m 0600 /dev/null /etc/smartha-agent/config.yaml
+  [[ -n "${token}" ]] || token="$(openssl rand -hex 32)"
+  printf 'port: 9099\nscan_interval: 60s\ntoken: "%s"\n' "${token}" \
+    >/etc/smartha-agent/config.yaml
+
+  cat >/etc/systemd/system/smartha-agent.service <<'EOF'
+[Unit]
+Description=SMART Sniffer Agent — disk health REST API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/smartha-agent
+WorkingDirectory=/etc/smartha-agent
+User=root
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now smartha-agent
+}
+
 main() {
   local config="${SCRIPT_DIR}/pve-config.env"
   while (($#)); do
@@ -85,6 +133,7 @@ main() {
   [[ ${EUID} -eq 0 ]] || die "run as root"
   command -v pveversion >/dev/null || die "this is not a Proxmox VE host"
   load_config "${config}" DOMAIN ADMIN_USER ADMIN_PUBKEYS
+  : "${SMART_SNIFFER_VERSION:=0.9.2}"
 
   if [[ -n "${SSH_CONNECTION:-}" ]]; then
     echo "WARNING: running over SSH; the network restart below will probably cut this session" >&2
@@ -149,8 +198,10 @@ EOF
   local -a apt_opts=(-y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
   apt-get update
   apt-get "${apt_opts[@]}" full-upgrade
-  # isc-dhcp-client: ifupdown2 needs it for DHCP on vmbr0.
-  apt-get "${apt_opts[@]}" install isc-dhcp-client sudo libpam-ssh-agent-auth curl
+  # isc-dhcp-client: ifupdown2 needs it for DHCP on vmbr0. smartmontools:
+  # the SMART Sniffer agent reads the disks through smartctl.
+  apt-get "${apt_opts[@]}" install isc-dhcp-client sudo libpam-ssh-agent-auth curl \
+    smartmontools
 
   # --- 5. Network: every NIC on vmbr0, address by DHCP --------------------
   log "Writing /etc/network/interfaces"
@@ -315,6 +366,10 @@ EOF
     zulip="enabled"
   fi
 
+  # --- 17. SMART Sniffer agent (disk health for Home Assistant) -----------
+  log "Installing the SMART Sniffer agent v${SMART_SNIFFER_VERSION}"
+  install_smart_sniffer "${SMART_SNIFFER_VERSION}" "${SMART_SNIFFER_TOKEN:-}"
+
   # --- Summary -------------------------------------------------------------
   cat <<EOF
 
@@ -328,12 +383,19 @@ pveproxy:     $(systemctl is-active pveproxy)
 sshd:         $(systemctl is-active ssh)
 Admin user:   ${ADMIN_USER} (PVEAdmin on /, sudo via forwarded SSH agent)
 Zulip:        ${zulip}
+SMART Sniffer: $(systemctl is-active smartha-agent 2>/dev/null), listening on port 9099
 
 /etc/hosts:
 $(cat /etc/hosts)
 
 Test admin access from your workstation:
   ssh -A ${ADMIN_USER}@${ip} sudo whoami
+
+Disk health in Home Assistant: install the "SMART Sniffer" integration
+(v0.9+) from HACS, then add this host as ${fqdn} (or ${ip}), port 9099,
+with the agent's token. Over mDNS it may also show up under Discovered.
+Read the token with:
+  grep '^token:' /etc/smartha-agent/config.yaml
 
 Reboot now, then run pve-guests.sh:
   reboot
