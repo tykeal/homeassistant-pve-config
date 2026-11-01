@@ -31,7 +31,7 @@ host="$(hostname -f)"
 timestamp="$(date '+%Y-%m-%d %H:%M:%S %Z')"
 
 case "${1:-}" in
-  boot) content=":white_check_mark: **${host}** is up at ${timestamp}" ;;
+  boot) content=":check: **${host}** is up at ${timestamp}" ;;
   shutdown) content=":warning: **${host}** is shutting down at ${timestamp}" ;;
   *)
     echo "usage: $0 boot|shutdown" >&2
