@@ -9,7 +9,8 @@ Two bash scripts that take a freshly installed Proxmox VE host to a known
 baseline before it ships to its site:
 
 - `pve-baseline.sh` sets up the host: hostname, DHCP bridge, repositories,
-  admin user, SSH and Zulip notifications.
+  admin user, SSH, Zulip notifications and the SMART Sniffer disk health
+  agent.
 - `pve-guests.sh` adds the web UI certificate, a Home Assistant OS VM, a
   Tailscale subnet router container and a Frigate container.
 
@@ -58,7 +59,7 @@ given with `--config PATH`. They stop at the first error.
 3. Removes the subscription nag and installs an apt hook that re-applies
    that after upgrades.
 4. Runs `apt-get full-upgrade` and installs `isc-dhcp-client`, `sudo`,
-   `libpam-ssh-agent-auth` and `curl`.
+   `libpam-ssh-agent-auth`, `curl` and `smartmontools`.
 5. Writes `/etc/network/interfaces` with every wired NIC as a port of
    `vmbr0` and `vmbr0` on DHCP, so whichever port gets plugged in at the
    site works.
@@ -76,6 +77,7 @@ given with `--config PATH`. They stop at the first error.
     (`pam_ssh_agent_auth`); connect with `ssh -A`.
 15. Writes root's `.bashrc` (colours, safe aliases, backspace fix).
 16. Installs the Zulip notifier (see below).
+17. Installs the SMART Sniffer agent (see below).
 
 It finishes with a short verification summary.
 
@@ -120,8 +122,9 @@ each setting. Required:
 | `ADMIN_PUBKEYS` | both | that user's SSH public keys, one per line |
 | `TS_AUTHKEY` | guests | Tailscale auth key |
 
-Optional: `BRIDGE_PORTS`, the `ZULIP_*` and ACME settings, guest IDs,
-names and sizes, storage names, and the community-scripts pins
+Optional: `BRIDGE_PORTS`, the `ZULIP_*`, `SMART_SNIFFER_*` and ACME
+settings, guest IDs, names and sizes, storage names, and the
+community-scripts pins
 (`COMMUNITY_SCRIPTS_REF`, `COMMUNITY_SCRIPTS_CORE_REF`; set both to `main`
 to follow upstream).
 
@@ -143,6 +146,31 @@ systemctl enable zulip-boot-notify.service
 systemctl enable --now zulip-shutdown-notify.service
 /usr/local/bin/zulip-notify.sh boot
 ```
+
+## SMART Sniffer
+
+Home Assistant runs in a VM and cannot see the host's physical disks, so
+`pve-baseline.sh` installs the
+[SMART Sniffer](https://github.com/DAB-LABS/smart-sniffer) agent on the
+host itself. The agent reads every drive's SMART data with `smartctl` and
+serves it on port 9099. The layout matches upstream's `install.sh` with its
+defaults: the binary at `/usr/local/bin/smartha-agent`, the config at
+`/etc/smartha-agent/config.yaml` (mode 0600, 60 s scan interval, all
+drives, mDNS on all interfaces, no disk-usage monitoring, API token) and
+the `smartha-agent` systemd service. If the download or checksum fails, the
+baseline warns and carries on without it.
+
+Settings:
+
+- `SMART_SNIFFER_VERSION`: agent release to install (default `0.9.2`).
+- `SMART_SNIFFER_TOKEN`: API token. Blank generates one on the host with
+  `openssl rand -hex 32`. Read it back there with
+  `grep '^token:' /etc/smartha-agent/config.yaml`.
+
+In Home Assistant, install the **SMART Sniffer** integration (v0.9 or
+later) from HACS, then add this host by IP address or FQDN with port 9099
+and enter the token. The agent also announces itself over mDNS, so it may
+show up under **Discovered**.
 
 ## Tailscale subnet routes
 
