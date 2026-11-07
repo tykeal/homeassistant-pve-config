@@ -39,7 +39,7 @@ jobs:
     # result surfaces as one check run named 'Lint: lint-all', so a failure
     # has to be read from the job log rather than from the check name.
     # yamllint disable-line rule:line-length
-    uses: lfreleng-actions/generic-workflows/.github/workflows/linting.yaml@04672a980550ff9bd89d24bacd39fb03e25b0b0b  # v0.6.1
+    uses: lfreleng-actions/generic-workflows/.github/workflows/linting.yaml@2442f8a20bb9f023e57d9396f9de4278b5e84785  # v0.7.0
     with:
       # no-commit-to-branch is a purely local guard: it stops a developer
       # from committing straight to main on their workstation. In CI it
