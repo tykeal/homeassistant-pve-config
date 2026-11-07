@@ -466,7 +466,7 @@ jobs:
       # locks the asset list.
       - name: 'Attach artefacts to release'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/release-assets-action@d7b650fbf8fbca7a436f75ddada3d4cdbd36a802  # v0.1.4
+        uses: lfreleng-actions/release-assets-action@03ed16927c1f9feff71b8489825be75707d4d38c  # v0.1.5
         with:
           asset_paths: '["release-assets/**"]'
           release_tag: "${{ needs.tag-validate.outputs.tag }}"
