@@ -55,7 +55,7 @@ jobs:
       # triggers.
       - name: 'Run aislop scan'
         # yamllint disable-line rule:line-length
-        uses: lfreleng-actions/aislop-scan-action@293cd6e5dbb9d9848912c658a999ec04ca0043da  # v0.3.3
+        uses: lfreleng-actions/aislop-scan-action@e6978bd7318af5b8671ec709fd40fe7d37041829  # v0.4.2
         with:
           scan-mode: 'full'
           upload-sarif: 'true'
